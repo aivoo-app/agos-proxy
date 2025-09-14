@@ -1,0 +1,18 @@
+[package]
+name = "agos"
+version = "0.1.0"
+edition = "2021"
+description = "Self-hosted, CLI-managed AI gateway with OpenAI-compatible endpoints and automatic multi-provider failover"
+license = "MIT"
+keywords = ["ai", "gateway", "llm", "proxy", "openai"]
+categories = ["command-line-utilities", "network-programming"]
+readme = "README.md"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+
+[profile.release]
+lto = true
+strip = true
