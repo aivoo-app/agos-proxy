@@ -29,6 +29,7 @@ mod profile;
 mod provider;
 mod proxy;
 mod route;
+pub mod util;
 
 /// Top-level entry point parsed from the command line.
 #[derive(Debug, Parser)]

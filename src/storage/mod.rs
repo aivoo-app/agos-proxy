@@ -236,6 +236,23 @@ impl Store {
         Ok(())
     }
 
+    /// Generate a fresh API token for a profile, replacing the old one.
+    pub fn rotate_profile_token(&self, id: &str) -> Result<String> {
+        let new_token = fresh_token()?;
+        let now = now_millis();
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE profiles SET id = ?1, updated_at = ?2 WHERE id = ?3",
+                (&new_token, now, id),
+            )
+            .context("rotating the profile token")?;
+        if changed == 0 {
+            bail!("no profile matches id {id:?}");
+        }
+        Ok(new_token)
+    }
+
     // --- providers ----------------------------------------------------------
 
     /// Add a provider under a profile.
