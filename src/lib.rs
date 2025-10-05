@@ -12,8 +12,10 @@
 pub mod cli;
 pub mod crypto;
 pub mod domain;
+pub mod router;
 pub mod server;
 pub mod storage;
+pub mod translator;
 
 /// Version of the crate, surfaced to the CLI and HTTP `Server` header.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

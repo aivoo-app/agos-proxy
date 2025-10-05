@@ -21,7 +21,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
 
 mod config;
@@ -91,7 +91,11 @@ pub fn run(cli: Cli) -> Result<()> {
 }
 
 fn server_command() -> Result<()> {
-    // The HTTP surface is wired up in the MVP milestone. Until then there is
-    // nothing useful to bind.
-    bail!("the proxy server is not wired up yet; it lands with the next milestone")
+    // The runtime is intentionally small: open the store, build the router, and
+    // hand off to tokio. All the interesting work happens inside the handlers.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async { crate::server::serve("127.0.0.1:3000").await })?;
+    Ok(())
 }

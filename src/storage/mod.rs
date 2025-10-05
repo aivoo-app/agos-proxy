@@ -11,6 +11,7 @@
 //! wraps calls in `tokio::task::spawn_blocking`.
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use anyhow::{bail, Context as _, Result};
 use chrono::Utc;
@@ -105,9 +106,21 @@ pub struct NewProvider {
 }
 
 /// Handle to the on-disk store.
+///
+/// The connection is wrapped in a `Mutex` so the store can be shared across
+/// threads (e.g. the HTTP server's async handlers). Every method locks, does
+/// its work, and returns — no lock is ever held across an await point.
 pub struct Store {
-    conn: Connection,
+    conn: Mutex<Connection>,
     path: PathBuf,
+}
+
+impl Store {
+    /// Lock the connection and return a guard. Centralizes the poisoning
+    /// handling so every caller doesn't have to think about it.
+    fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().expect("store connection mutex poisoned")
+    }
 }
 
 impl Store {
@@ -121,7 +134,10 @@ impl Store {
         let conn = Connection::open(&path).context("opening the database file")?;
         conn.execute_batch(schema::SCHEMA)
             .context("applying the database schema")?;
-        Ok(Store { conn, path })
+        Ok(Store {
+            conn: Mutex::new(conn),
+            path,
+        })
     }
 
     /// Open an in-memory store, useful for tests.
@@ -129,7 +145,7 @@ impl Store {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(schema::SCHEMA)?;
         Ok(Store {
-            conn,
+            conn: Mutex::new(conn),
             path: PathBuf::from(":memory:"),
         })
     }
@@ -150,7 +166,7 @@ impl Store {
     ) -> Result<Profile> {
         let now = now_millis();
         let id = fresh_token()?;
-        self.conn
+        self.conn()
             .execute(
                 "INSERT INTO profiles (id, name, description, password_hash, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -169,7 +185,8 @@ impl Store {
 
     /// All profiles, ordered by name.
     pub fn list_profiles(&self) -> Result<Vec<Profile>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
             "SELECT id, name, description, password_hash, created_at, updated_at
                  FROM profiles ORDER BY name",
         )?;
@@ -192,7 +209,7 @@ impl Store {
 
     /// Look up a profile by its id/token.
     pub fn get_profile_by_id(&self, id: &str) -> Result<Option<Profile>> {
-        Ok(self.conn.query_one::<Option<Profile>, _, _>(
+        Ok(self.conn().query_one::<Option<Profile>, _, _>(
             "SELECT id, name, description, password_hash, created_at, updated_at
              FROM profiles WHERE id = ?1",
             (id,),
@@ -211,7 +228,7 @@ impl Store {
 
     /// Look up a profile by its display name.
     pub fn get_profile_by_name(&self, name: &str) -> Result<Option<Profile>> {
-        Ok(self.conn.query_one::<Option<Profile>, _, _>(
+        Ok(self.conn().query_one::<Option<Profile>, _, _>(
             "SELECT id, name, description, password_hash, created_at, updated_at
              FROM profiles WHERE name = ?1",
             (name,),
@@ -230,7 +247,7 @@ impl Store {
 
     /// Delete a profile and everything under it (cascades).
     pub fn delete_profile(&self, id: &str) -> Result<()> {
-        self.conn
+        self.conn()
             .execute("DELETE FROM profiles WHERE id = ?1", (id,))
             .context("deleting the profile")?;
         Ok(())
@@ -240,8 +257,7 @@ impl Store {
     pub fn rotate_profile_token(&self, id: &str) -> Result<String> {
         let new_token = fresh_token()?;
         let now = now_millis();
-        let changed = self
-            .conn
+        let changed = self.conn()
             .execute(
                 "UPDATE profiles SET id = ?1, updated_at = ?2 WHERE id = ?3",
                 (&new_token, now, id),
@@ -257,8 +273,7 @@ impl Store {
 
     /// Add a provider under a profile.
     pub fn create_provider(&self, profile_id: &str, spec: NewProvider) -> Result<Provider> {
-        let _ = self
-            .conn
+        let _ = self.conn()
             .execute(
                 "INSERT INTO providers (profile_id, name, description, base_url, auth_token, kind, extra_headers)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -274,7 +289,7 @@ impl Store {
             )
             .context("inserting the provider")?;
         Ok(Provider {
-            id: self.conn.last_insert_rowid(),
+            id: self.conn().last_insert_rowid(),
             profile_id: profile_id.to_string(),
             name: spec.name.clone(),
             description: spec.description.clone(),
@@ -287,7 +302,8 @@ impl Store {
 
     /// All providers belonging to a profile.
     pub fn list_providers(&self, profile_id: &str) -> Result<Vec<Provider>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
             "SELECT id, profile_id, name, description, base_url, auth_token, kind, extra_headers
              FROM providers WHERE profile_id = ?1 ORDER BY name",
         )?;
@@ -317,7 +333,7 @@ impl Store {
 
     /// A single provider by id.
     pub fn get_provider(&self, id: i64) -> Result<Option<Provider>> {
-        Ok(self.conn.query_one::<Option<Provider>, _, _>(
+        Ok(self.conn().query_one::<Option<Provider>, _, _>(
             "SELECT id, profile_id, name, description, base_url, auth_token, kind, extra_headers
              FROM providers WHERE id = ?1",
             (id,),
@@ -345,7 +361,7 @@ impl Store {
 
     /// Remove a provider.
     pub fn delete_provider(&self, id: i64) -> Result<()> {
-        self.conn
+        self.conn()
             .execute("DELETE FROM providers WHERE id = ?1", (id,))
             .context("deleting the provider")?;
         Ok(())
@@ -360,15 +376,14 @@ impl Store {
         name: &str,
         description: Option<&str>,
     ) -> Result<Proxy> {
-        let _ = self
-            .conn
+        let _ = self.conn()
             .execute(
                 "INSERT INTO proxies (profile_id, name, description) VALUES (?1, ?2, ?3)",
                 (profile_id, name, description),
             )
             .context("inserting the proxy")?;
         Ok(Proxy {
-            id: self.conn.last_insert_rowid(),
+            id: self.conn().last_insert_rowid(),
             profile_id: profile_id.to_string(),
             name: name.to_string(),
             description: description.map(|d| d.to_string()),
@@ -377,7 +392,8 @@ impl Store {
 
     /// All proxies under a profile.
     pub fn list_proxies(&self, profile_id: &str) -> Result<Vec<Proxy>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
             "SELECT id, profile_id, name, description FROM proxies WHERE profile_id = ?1 ORDER BY name",
         )?;
         let rows = stmt.query_map((profile_id,), |row| {
@@ -397,7 +413,7 @@ impl Store {
 
     /// Find a proxy by id.
     pub fn get_proxy(&self, id: i64) -> Result<Option<Proxy>> {
-        Ok(self.conn.query_one::<Option<Proxy>, _, _>(
+        Ok(self.conn().query_one::<Option<Proxy>, _, _>(
             "SELECT id, profile_id, name, description FROM proxies WHERE id = ?1",
             (id,),
             |row| {
@@ -413,7 +429,7 @@ impl Store {
 
     /// Find a proxy within a profile by name.
     pub fn get_proxy_named(&self, profile_id: &str, name: &str) -> Result<Option<Proxy>> {
-        Ok(self.conn.query_one::<Option<Proxy>, _, _>(
+        Ok(self.conn().query_one::<Option<Proxy>, _, _>(
             "SELECT id, profile_id, name, description FROM proxies WHERE profile_id = ?1 AND name = ?2",
             (profile_id, name),
             |row| {
@@ -435,15 +451,14 @@ impl Store {
         description: Option<&str>,
         strategy: RoutingStrategy,
     ) -> Result<Route> {
-        let _ = self
-            .conn
+        let _ = self.conn()
             .execute(
                 "INSERT INTO routes (proxy_id, name, description, strategy) VALUES (?1, ?2, ?3, ?4)",
                 (proxy_id, name, description, strategy_tag(strategy)),
             )
             .context("inserting the route")?;
         Ok(Route {
-            id: self.conn.last_insert_rowid(),
+            id: self.conn().last_insert_rowid(),
             proxy_id,
             name: name.to_string(),
             description: description.map(|d| d.to_string()),
@@ -453,7 +468,8 @@ impl Store {
 
     /// All routes under a proxy.
     pub fn list_routes(&self, proxy_id: i64) -> Result<Vec<Route>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
             "SELECT id, proxy_id, name, description, strategy FROM routes WHERE proxy_id = ?1 ORDER BY name",
         )?;
         let rows = stmt.query_map((proxy_id,), |row| {
@@ -475,7 +491,7 @@ impl Store {
 
     /// Find a route within a proxy by name.
     pub fn get_route_named(&self, proxy_id: i64, name: &str) -> Result<Option<Route>> {
-        Ok(self.conn.query_one::<Option<Route>, _, _>(
+        Ok(self.conn().query_one::<Option<Route>, _, _>(
             "SELECT id, proxy_id, name, description, strategy FROM routes WHERE proxy_id = ?1 AND name = ?2",
             (proxy_id, name),
             |row| {
@@ -501,8 +517,7 @@ impl Store {
         weight: f64,
         capabilities: RouteCapabilities,
     ) -> Result<RouteEntry> {
-        let _ = self
-            .conn
+        let _ = self.conn()
             .execute(
                 "INSERT INTO route_entries (route_id, provider_id, model_id, priority, weight, status, capabilities)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -518,7 +533,7 @@ impl Store {
             )
             .context("inserting the route model")?;
         Ok(RouteEntry {
-            id: self.conn.last_insert_rowid(),
+            id: self.conn().last_insert_rowid(),
             route_id,
             provider_id,
             model_id: model_id.to_string(),
@@ -531,7 +546,8 @@ impl Store {
 
     /// All model entries in a route's chain, ordered by priority.
     pub fn route_entries(&self, route_id: i64) -> Result<Vec<RouteEntry>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
             "SELECT id, route_id, provider_id, model_id, priority, weight, status, capabilities
              FROM route_entries WHERE route_id = ?1 ORDER BY priority",
         )?;
@@ -559,7 +575,7 @@ impl Store {
 
     /// Update the health state of a route entry.
     pub fn set_route_entry_status(&self, entry_id: i64, status: ModelStatus) -> Result<()> {
-        self.conn
+        self.conn()
             .execute(
                 "UPDATE route_entries SET status = ?1 WHERE id = ?2",
                 (status_tag(status), entry_id),
