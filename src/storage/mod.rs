@@ -583,6 +583,58 @@ impl Store {
             .context("updating the route model status")?;
         Ok(())
     }
+
+    /// All entries that are not Healthy and not Disabled — these are the ones
+    /// the health probe should check.
+    pub fn entries_needing_probe(&self) -> Result<Vec<(RouteEntry, Provider)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT e.id, e.route_id, e.provider_id, e.model_id, e.priority,
+                    e.weight, e.status, e.capabilities,
+                    p.id, p.profile_id, p.name, p.description, p.base_url,
+                    p.auth_token, p.kind, p.extra_headers
+             FROM route_entries e
+             JOIN providers p ON p.id = e.provider_id
+             WHERE e.status != ?1 AND e.status != ?2",
+        )?;
+        let rows = stmt.query_map(
+            [status_tag(ModelStatus::Healthy), status_tag(ModelStatus::Disabled)],
+            |row| {
+            let status_tag_owned: String = row.get(6)?;
+            let caps_json: String = row.get(7)?;
+            let kind_tag: String = row.get(14)?;
+            let extra_json: String = row.get(15)?;
+            Ok((
+                RouteEntry {
+                    id: row.get(0)?,
+                    route_id: row.get(1)?,
+                    provider_id: row.get(2)?,
+                    model_id: row.get(3)?,
+                    priority: row.get(4)?,
+                    weight: row.get(5)?,
+                    status: status_from_tag(&status_tag_owned).expect("invalid status in store"),
+                    capabilities: serde_json::from_str::<RouteCapabilities>(&caps_json)
+                        .expect("invalid capabilities in store"),
+                },
+                Provider {
+                    id: row.get(8)?,
+                    profile_id: row.get(9)?,
+                    name: row.get(10)?,
+                    description: row.get(11)?,
+                    base_url: row.get(12)?,
+                    auth_token: row.get(13)?,
+                    kind: provider_kind_from_tag(&kind_tag).expect("invalid kind in store"),
+                    extra_headers: serde_json::from_str(&extra_json)
+                        .expect("invalid headers in store"),
+                },
+            ))
+        })?;
+        let mut out = Vec::new();
+        for item in rows {
+            out.push(item?);
+        }
+        Ok(out)
+    }
 }
 
 /// Exercise the full CRUD round-trip against an in-memory store.
