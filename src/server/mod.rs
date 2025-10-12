@@ -13,6 +13,7 @@ use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
 use crate::cli::data_dir;
+use crate::health;
 use crate::storage::Store;
 
 mod auth;
@@ -21,9 +22,9 @@ mod handlers;
 pub use handlers::{chat_completions, list_models, AppState};
 
 /// Build the axum router with all routes and shared state.
-pub fn create_app(store: Store, attempt_timeout: Duration, http_client: reqwest::Client) -> Router {
+pub fn create_app(store: Arc<Store>, attempt_timeout: Duration, http_client: reqwest::Client) -> Router {
     let state = AppState {
-        store: Arc::new(store),
+        store,
         attempt_timeout,
         http_client,
     };
@@ -42,11 +43,14 @@ pub async fn serve(bind_addr: &str) -> Result<()> {
 
     let home = data_dir()?;
     std::fs::create_dir_all(&home)?;
-    let store = Store::open(Store::default_path(&home))?;
+    let store = Arc::new(Store::open(Store::default_path(&home))?);
     let http_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()?;
-    let app = create_app(store, Duration::from_secs(10), http_client);
+    let app = create_app(store.clone(), Duration::from_secs(10), http_client.clone());
+
+    // Start the background health-probe runner so dead entries can recover.
+    health::spawn(store, http_client);
 
     let listener = TcpListener::bind(bind_addr).await?;
     tracing::info!("AGOS Proxy listening on {bind_addr}");
