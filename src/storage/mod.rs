@@ -15,12 +15,26 @@ use std::sync::Mutex;
 
 use anyhow::{bail, Context as _, Result};
 use chrono::Utc;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
+
+use crate::crypto::MasterKey;
 
 use crate::domain::{
     ModelStatus, Profile, Provider, ProviderKind, Proxy, Route, RouteCapabilities, RouteEntry,
     RoutingStrategy,
 };
+
+/// Intermediate provider row, used to defer decryption out of the rusqlite closure.
+struct RawProvider {
+    id: i64,
+    profile_id: String,
+    name: String,
+    description: Option<String>,
+    base_url: String,
+    enc_token: Vec<u8>,
+    kind_tag: String,
+    extra_json: String,
+}
 
 mod schema;
 
@@ -113,6 +127,7 @@ pub struct NewProvider {
 pub struct Store {
     conn: Mutex<Connection>,
     path: PathBuf,
+    master_key: Mutex<Option<MasterKey>>,
 }
 
 impl Store {
@@ -134,20 +149,67 @@ impl Store {
         let conn = Connection::open(&path).context("opening the database file")?;
         conn.execute_batch(schema::SCHEMA)
             .context("applying the database schema")?;
-        Ok(Store {
+        let store = Store {
             conn: Mutex::new(conn),
             path,
-        })
+            master_key: Mutex::new(None),
+        };
+        store.load_or_generate_master_key()?;
+        Ok(store)
     }
 
     /// Open an in-memory store, useful for tests.
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(schema::SCHEMA)?;
-        Ok(Store {
+        let store = Store {
             conn: Mutex::new(conn),
             path: PathBuf::from(":memory:"),
-        })
+            master_key: Mutex::new(None),
+        };
+        store.load_or_generate_master_key()?;
+        Ok(store)
+    }
+
+    /// Load the master key from the `meta` table, or generate and persist one.
+    fn load_or_generate_master_key(&self) -> Result<()> {
+        let mut cached = self.master_key.lock().expect("master key mutex poisoned");
+        if cached.is_some() {
+            return Ok(());
+        }
+        let conn = self.conn();
+        let result: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'master_key'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("reading master key from meta")?;
+        let key = match result {
+            Some(bytes) => MasterKey::from_bytes(&bytes)?,
+            None => {
+                let key = MasterKey::generate()?;
+                conn.execute(
+                    "INSERT INTO meta (key, value) VALUES ('master_key', ?1)",
+                    [key.as_bytes().to_vec()],
+                )
+                .context("persisting master key")?;
+                key
+            }
+        };
+        *cached = Some(key);
+        Ok(())
+    }
+
+    /// Get the master key, loading it if needed.
+    fn master_key(&self) -> MasterKey {
+        self.load_or_generate_master_key().expect("master key must be loadable");
+        self.master_key
+            .lock()
+            .expect("master key mutex poisoned")
+            .clone()
+            .expect("master key must be cached after load")
     }
 
     /// Base location of the backing database file.
@@ -273,6 +335,8 @@ impl Store {
 
     /// Add a provider under a profile.
     pub fn create_provider(&self, profile_id: &str, spec: NewProvider) -> Result<Provider> {
+        let key = self.master_key();
+        let encrypted_token = crate::crypto::encrypt(&key, &spec.auth_token)?;
         let _ = self.conn()
             .execute(
                 "INSERT INTO providers (profile_id, name, description, base_url, auth_token, kind, extra_headers)
@@ -282,7 +346,7 @@ impl Store {
                     spec.name.as_str(),
                     spec.description.as_deref(),
                     spec.base_url.as_str(),
-                    spec.auth_token.as_str(),
+                    encrypted_token,
                     provider_kind_tag(spec.kind),
                     serde_json::to_string(&spec.extra_headers).unwrap(),
                 ),
@@ -303,60 +367,83 @@ impl Store {
     /// All providers belonging to a profile.
     pub fn list_providers(&self, profile_id: &str) -> Result<Vec<Provider>> {
         let conn = self.conn();
+        let key = self.master_key().clone();
         let mut stmt = conn.prepare(
             "SELECT id, profile_id, name, description, base_url, auth_token, kind, extra_headers
              FROM providers WHERE profile_id = ?1 ORDER BY name",
         )?;
         let rows = stmt.query_map((profile_id,), |row| {
-            let kind_tag: String = row.get(6)?;
-            let extra_json: String = row.get(7)?;
-            Ok(Provider {
+            Ok(RawProvider {
                 id: row.get(0)?,
                 profile_id: row.get(1)?,
                 name: row.get(2)?,
                 description: row.get(3)?,
                 base_url: row.get(4)?,
-                auth_token: row.get(5)?,
-                kind: provider_kind_from_tag(&kind_tag).expect("invalid provider kind in store"),
-                extra_headers: serde_json::from_str::<std::collections::BTreeMap<String, String>>(
-                    &extra_json,
-                )
-                .expect("invalid provider headers in store"),
+                enc_token: row.get(5)?,
+                kind_tag: row.get(6)?,
+                extra_json: row.get(7)?,
             })
         })?;
         let mut out = Vec::new();
         for item in rows {
-            out.push(item?);
+            let raw = item?;
+            let auth_token = crate::crypto::decrypt(&key, &raw.enc_token)?;
+            out.push(Provider {
+                id: raw.id,
+                profile_id: raw.profile_id,
+                name: raw.name,
+                description: raw.description,
+                base_url: raw.base_url,
+                auth_token,
+                kind: provider_kind_from_tag(&raw.kind_tag).expect("invalid provider kind in store"),
+                extra_headers: serde_json::from_str::<std::collections::BTreeMap<String, String>>(
+                    &raw.extra_json,
+                )
+                .expect("invalid provider headers in store"),
+            });
         }
         Ok(out)
     }
 
     /// A single provider by id.
     pub fn get_provider(&self, id: i64) -> Result<Option<Provider>> {
-        Ok(self.conn().query_one::<Option<Provider>, _, _>(
+        let key = self.master_key().clone();
+        let raw: Option<RawProvider> = self.conn().query_row(
             "SELECT id, profile_id, name, description, base_url, auth_token, kind, extra_headers
              FROM providers WHERE id = ?1",
             (id,),
             |row| {
-                let kind_tag: String = row.get(6)?;
-                let extra_json: String = row.get(7)?;
-                Ok(Some(Provider {
+                Ok(RawProvider {
                     id: row.get(0)?,
                     profile_id: row.get(1)?,
                     name: row.get(2)?,
                     description: row.get(3)?,
                     base_url: row.get(4)?,
-                    auth_token: row.get(5)?,
-                    kind: provider_kind_from_tag(&kind_tag)
-                        .expect("invalid provider kind in store"),
-                    extra_headers:
-                        serde_json::from_str::<std::collections::BTreeMap<String, String>>(
-                            &extra_json,
-                        )
-                        .expect("invalid provider headers in store"),
-                }))
+                    enc_token: row.get(5)?,
+                    kind_tag: row.get(6)?,
+                    extra_json: row.get(7)?,
+                })
             },
-        )?)
+        ).optional()?;
+        match raw {
+            Some(raw) => {
+                let auth_token = crate::crypto::decrypt(&key, &raw.enc_token)?;
+                Ok(Some(Provider {
+                    id: raw.id,
+                    profile_id: raw.profile_id,
+                    name: raw.name,
+                    description: raw.description,
+                    base_url: raw.base_url,
+                    auth_token,
+                    kind: provider_kind_from_tag(&raw.kind_tag).expect("invalid provider kind in store"),
+                    extra_headers: serde_json::from_str::<std::collections::BTreeMap<String, String>>(
+                        &raw.extra_json,
+                    )
+                    .expect("invalid provider headers in store"),
+                }))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Remove a provider.

@@ -8,6 +8,11 @@ pub const SCHEMA: &str = "
     PRAGMA journal_mode = WAL;
     PRAGMA foreign_keys = ON;
 
+    CREATE TABLE IF NOT EXISTS meta (
+        key   TEXT PRIMARY KEY,
+        value BLOB NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS profiles (
         id            TEXT PRIMARY KEY,
         name          TEXT NOT NULL UNIQUE,
@@ -23,7 +28,7 @@ pub const SCHEMA: &str = "
         name          TEXT NOT NULL,
         description   TEXT,
         base_url      TEXT NOT NULL,
-        auth_token    TEXT NOT NULL,
+        auth_token    BLOB NOT NULL,
         kind          TEXT NOT NULL,
         extra_headers TEXT NOT NULL
     );
