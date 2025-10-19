@@ -7,8 +7,7 @@ use axum::body::Bytes;
 use axum::extract::{Request, State};
 use axum::response::Response;
 
-
-use crate::router::{resolve_targets, execute_with_failover};
+use crate::router::{execute_with_failover, resolve_targets_with_strategy, RoutingState};
 use crate::storage::Store;
 use crate::translator::{self, ChatRequest};
 
@@ -17,6 +16,7 @@ pub struct AppState {
     pub store: Arc<Store>,
     pub attempt_timeout: Duration,
     pub http_client: reqwest::Client,
+    pub routing_state: RoutingState,
 }
 
 pub async fn chat_completions(State(state): State<AppState>, req: Request) -> Response {
@@ -37,11 +37,12 @@ pub async fn chat_completions(State(state): State<AppState>, req: Request) -> Re
 }
 
 async fn handle_non_streaming(state: AppState, chat_req: ChatRequest) -> Response {
-    let targets = match resolve_targets(&state.store, &chat_req.model) {
-        Ok(t) if t.is_empty() => return bad_request("no healthy targets for this route"),
-        Ok(t) => t,
-        Err(e) => return bad_request(format!("route resolution failed: {e}")),
-    };
+    let targets =
+        match resolve_targets_with_strategy(&state.store, &chat_req.model, &state.routing_state) {
+            Ok(t) if t.is_empty() => return bad_request("no healthy targets for this route"),
+            Ok(t) => t,
+            Err(e) => return bad_request(format!("route resolution failed: {e}")),
+        };
     let result = execute_with_failover(
         state.store.clone(),
         targets,
@@ -78,9 +79,11 @@ async fn handle_streaming(state: AppState, chat_req: ChatRequest) -> Response {
     let client = state.http_client.clone();
 
     tokio::spawn(async move {
-        let targets = match resolve_targets(&store, &model) {
+        let targets = match resolve_targets_with_strategy(&store, &model, &state.routing_state) {
             Ok(t) if t.is_empty() => {
-                let _ = tx.send(Err(std::io::Error::other("no healthy targets"))).await;
+                let _ = tx
+                    .send(Err(std::io::Error::other("no healthy targets")))
+                    .await;
                 return;
             }
             Ok(t) => t,
@@ -90,33 +93,60 @@ async fn handle_streaming(state: AppState, chat_req: ChatRequest) -> Response {
             }
         };
         for target in targets {
-            let req = { let mut r = chat_req.clone(); r.stream = true; r };
+            let req = {
+                let mut r = chat_req.clone();
+                r.stream = true;
+                r
+            };
             let (url, headers, body) = match translator::build_upstream_request(&target, &req) {
                 Ok(v) => v,
-                Err(e) => { tracing::warn!(error = %e, "build upstream failed"); continue; }
+                Err(e) => {
+                    tracing::warn!(error = %e, "build upstream failed");
+                    continue;
+                }
             };
             let mut rb = client.post(&url);
-            for (k, v) in &headers { rb = rb.header(k, v); }
+            for (k, v) in &headers {
+                rb = rb.header(k, v);
+            }
             let resp = match tokio::time::timeout(attempt_timeout, rb.json(&body).send()).await {
                 Ok(Ok(r)) if r.status().is_success() => r,
-                Ok(Ok(r)) => { tracing::warn!(status = %r.status(), "upstream error"); continue; }
-                Ok(Err(e)) => { tracing::warn!(error = %e, "upstream failed"); continue; }
+                Ok(Ok(r)) => {
+                    tracing::warn!(status = %r.status(), "upstream error");
+                    continue;
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "upstream failed");
+                    continue;
+                }
                 Err(_) => {
                     tracing::warn!("upstream timed out");
-                    let _ = store.set_route_entry_status(target.entry.id, crate::domain::ModelStatus::Unhealthy);
+                    let _ = store.set_route_entry_status(
+                        target.entry.id,
+                        crate::domain::ModelStatus::Unhealthy,
+                    );
                     continue;
                 }
             };
             let mut stream = resp.bytes_stream();
             while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
                 match chunk {
-                    Ok(bytes) => { if tx.send(Ok(bytes)).await.is_err() { return; } }
-                    Err(e) => { let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await; return; }
+                    Ok(bytes) => {
+                        if tx.send(Ok(bytes)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
+                        return;
+                    }
                 }
             }
             return;
         }
-        let _ = tx.send(Err(std::io::Error::other("all providers failed"))).await;
+        let _ = tx
+            .send(Err(std::io::Error::other("all providers failed")))
+            .await;
     });
 
     // Return the raw byte stream with SSE content type for true passthrough.
@@ -130,7 +160,11 @@ async fn handle_streaming(state: AppState, chat_req: ChatRequest) -> Response {
 }
 
 pub async fn list_models(State(state): State<AppState>, req: Request) -> Response {
-    let token = req.extensions().get::<String>().cloned().unwrap_or_default();
+    let token = req
+        .extensions()
+        .get::<String>()
+        .cloned()
+        .unwrap_or_default();
     let profile = match state.store.get_profile_by_id(&token).ok().flatten() {
         Some(p) => p,
         None => return bad_request("invalid profile token"),
@@ -161,7 +195,8 @@ pub async fn list_models(State(state): State<AppState>, req: Request) -> Respons
 }
 
 fn bad_request(msg: impl Into<String>) -> Response {
-    let body = serde_json::json!({ "error": { "message": msg.into(), "type": "invalid_request_error" } });
+    let body =
+        serde_json::json!({ "error": { "message": msg.into(), "type": "invalid_request_error" } });
     axum::response::Response::builder()
         .status(axum::http::StatusCode::BAD_REQUEST)
         .header("Content-Type", "application/json")

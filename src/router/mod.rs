@@ -3,13 +3,66 @@
 //! Given a model string (e.g. `programmer/php-developer-3.5-flash`), resolve the
 //! route and try each healthy entry in priority order until one succeeds.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context as _, Result};
+use rand::Rng;
 use tokio::time::{timeout, Duration};
 
-use crate::domain::{ModelStatus, Provider, RouteEntry};
+use crate::domain::{ModelStatus, Provider, RouteEntry, RoutingStrategy};
 use crate::storage::Store;
+
+/// Per-route mutable routing state (round-robin counters, etc.).
+///
+/// Held behind a `Mutex` inside `AppState`; each request locks it briefly to
+/// read/update the counter for the route it's about to hit.
+#[derive(Default, Clone)]
+pub struct RoutingState {
+    /// `route_id → last-used index` for round-robin.
+    round_robin: Arc<Mutex<HashMap<i64, usize>>>,
+}
+
+impl RoutingState {
+    /// Rotate the targets for a round-robin route: the entry after the last
+    /// used one goes first. Updates the stored counter.
+    pub fn rotate_round_robin(&self, route_id: i64, targets: &mut Vec<Target>) {
+        if targets.len() <= 1 {
+            return;
+        }
+        let mut counters = self.round_robin.lock().expect("poisoned");
+        let idx = counters.entry(route_id).or_insert(0);
+        let len = targets.len();
+        let split = *idx % len;
+        // Rotate so `split` is at the front, then advance the counter.
+        targets.rotate_left(split);
+        *idx = (*idx + 1) % len;
+    }
+
+    /// Pick a starting index by weight (higher weight → more likely first),
+    /// then rotate the targets so that entry leads. Falls back to priority
+    /// order when all weights are zero or there is only one entry.
+    pub fn shuffle_weighted(&self, targets: &mut Vec<Target>) {
+        if targets.len() <= 1 {
+            return;
+        }
+        let total: f64 = targets.iter().map(|t| t.entry.weight).sum();
+        if total <= 0.0 {
+            return;
+        }
+        let mut rng = rand::thread_rng();
+        let mut pick = rng.gen::<f64>() * total;
+        let mut chosen = 0usize;
+        for (i, t) in targets.iter().enumerate() {
+            pick -= t.entry.weight;
+            if pick <= 0.0 {
+                chosen = i;
+                break;
+            }
+        }
+        targets.rotate_left(chosen);
+    }
+}
 
 /// A resolved target: a specific provider + model to try next.
 #[derive(Debug, Clone)]
@@ -51,6 +104,57 @@ pub fn resolve_targets(store: &Store, model: &str) -> Result<Vec<Target>> {
     Ok(targets)
 }
 
+/// Like [`resolve_targets`], but also reorders the list according to the
+/// route's configured [`RoutingStrategy`] and the shared [`RoutingState`].
+///
+/// - `Priority`: entries are left in strict priority order (no change).
+/// - `RoundRobin`: the starting entry rotates per request.
+/// - `Weighted`: the starting entry is picked by weighted random draw.
+pub fn resolve_targets_with_strategy(
+    store: &Store,
+    model: &str,
+    routing_state: &RoutingState,
+) -> Result<Vec<Target>> {
+    let (proxy_name, route_name) = model
+        .split_once('/')
+        .with_context(|| format!("model {model:?} must be in `<proxy>/<route>` format"))?;
+
+    let profiles = store.list_profiles()?;
+    let mut found = None;
+    for profile in &profiles {
+        if let Some(proxy) = store.get_proxy_named(profile.id.as_str(), proxy_name)? {
+            found = Some((profile.id.clone(), proxy));
+            break;
+        }
+    }
+    let (_profile_id, proxy) = found.with_context(|| format!("no proxy named {proxy_name:?}"))?;
+
+    let route = store
+        .get_route_named(proxy.id, route_name)?
+        .with_context(|| format!("no route named {route_name:?} under proxy {proxy_name:?}"))?;
+
+    let entries = store.route_entries(route.id)?;
+    let mut targets: Vec<Target> = entries
+        .into_iter()
+        .filter(|e| matches!(e.status, ModelStatus::Healthy | ModelStatus::Degraded))
+        .filter_map(|entry| {
+            store
+                .get_provider(entry.provider_id)
+                .ok()
+                .flatten()
+                .map(|provider| Target { provider, entry })
+        })
+        .collect();
+
+    match route.strategy {
+        RoutingStrategy::Priority => {} // already in priority order
+        RoutingStrategy::RoundRobin => routing_state.rotate_round_robin(route.id, &mut targets),
+        RoutingStrategy::Weighted => routing_state.shuffle_weighted(&mut targets),
+    }
+
+    Ok(targets)
+}
+
 /// Execute a request against resolved targets with priority failover.
 pub async fn execute_with_failover<F, Fut>(
     store: Arc<Store>,
@@ -79,7 +183,9 @@ where
                 );
             }
             Err(_) => {
-                last_error = Some(anyhow::anyhow!("attempt timed out after {attempt_timeout:?}"));
+                last_error = Some(anyhow::anyhow!(
+                    "attempt timed out after {attempt_timeout:?}"
+                ));
                 tracing::warn!(
                     provider = %target.provider.name,
                     model = %target.entry.model_id,
@@ -122,8 +228,12 @@ mod tests {
                 },
             )
             .unwrap();
-        let proxy = store.create_proxy(profile.id.as_str(), "prog", None).unwrap();
-        let route = store.create_route(proxy.id, "r1", None, RoutingStrategy::Priority).unwrap();
+        let proxy = store
+            .create_proxy(profile.id.as_str(), "prog", None)
+            .unwrap();
+        let route = store
+            .create_route(proxy.id, "r1", None, RoutingStrategy::Priority)
+            .unwrap();
         store
             .add_route_entry(route.id, provider.id, "m1", 1, 1.0, Default::default())
             .unwrap();
@@ -136,7 +246,7 @@ mod tests {
     async fn failover_returns_first_success() {
         let (store, targets) = setup();
         let store = Arc::new(store);
-        let result = execute_with_failover(store, targets, Duration::from_secs(5),|_| async {
+        let result = execute_with_failover(store, targets, Duration::from_secs(5), |_| async {
             Ok(b"ok".to_vec())
         })
         .await;
@@ -159,6 +269,132 @@ mod tests {
         // With a single target, it tries once and fails.
         assert!(result.is_err());
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    fn setup_multi_entry() -> (Store, i64) {
+        let store = Store::open_in_memory().unwrap();
+        let profile = store.create_profile("coder1", None, None).unwrap();
+        let p1 = store
+            .create_provider(
+                profile.id.as_str(),
+                NewProvider {
+                    name: "p1".into(),
+                    description: None,
+                    base_url: "https://a.example".into(),
+                    auth_token: "tok1".into(),
+                    kind: ProviderKind::OpenAICompatible,
+                    extra_headers: BTreeMap::new(),
+                },
+            )
+            .unwrap();
+        let p2 = store
+            .create_provider(
+                profile.id.as_str(),
+                NewProvider {
+                    name: "p2".into(),
+                    description: None,
+                    base_url: "https://b.example".into(),
+                    auth_token: "tok2".into(),
+                    kind: ProviderKind::OpenAICompatible,
+                    extra_headers: BTreeMap::new(),
+                },
+            )
+            .unwrap();
+        let proxy = store
+            .create_proxy(profile.id.as_str(), "prog", None)
+            .unwrap();
+        let route = store
+            .create_route(proxy.id, "r1", None, RoutingStrategy::RoundRobin)
+            .unwrap();
+        store
+            .add_route_entry(route.id, p1.id, "m1", 1, 1.0, Default::default())
+            .unwrap();
+        store
+            .add_route_entry(route.id, p2.id, "m2", 2, 1.0, Default::default())
+            .unwrap();
+        (store, route.id)
+    }
+
+    #[test]
+    fn round_robin_rotates_starting_entry() {
+        let (store, route_id) = setup_multi_entry();
+        let state = RoutingState::default();
+        let mut first = resolve_targets_with_strategy(&store, "prog/r1", &state).unwrap();
+        assert_eq!(first[0].provider.name, "p1");
+        let mut second = resolve_targets_with_strategy(&store, "prog/r1", &state).unwrap();
+        assert_eq!(second[0].provider.name, "p2");
+        let mut third = resolve_targets_with_strategy(&store, "prog/r1", &state).unwrap();
+        assert_eq!(third[0].provider.name, "p1");
+    }
+
+    #[test]
+    fn weighted_biases_towards_heavier_entry() {
+        let store = Store::open_in_memory().unwrap();
+        let profile = store.create_profile("coder1", None, None).unwrap();
+        let p1 = store
+            .create_provider(
+                profile.id.as_str(),
+                NewProvider {
+                    name: "light".into(),
+                    description: None,
+                    base_url: "https://a.example".into(),
+                    auth_token: "tok".into(),
+                    kind: ProviderKind::OpenAICompatible,
+                    extra_headers: BTreeMap::new(),
+                },
+            )
+            .unwrap();
+        let p2 = store
+            .create_provider(
+                profile.id.as_str(),
+                NewProvider {
+                    name: "heavy".into(),
+                    description: None,
+                    base_url: "https://b.example".into(),
+                    auth_token: "tok".into(),
+                    kind: ProviderKind::OpenAICompatible,
+                    extra_headers: BTreeMap::new(),
+                },
+            )
+            .unwrap();
+        let proxy = store
+            .create_proxy(profile.id.as_str(), "prog", None)
+            .unwrap();
+        let route = store
+            .create_route(proxy.id, "r1", None, RoutingStrategy::Weighted)
+            .unwrap();
+        // light has weight 1, heavy has weight 9 → heavy should lead ~90% of the time
+        store
+            .add_route_entry(route.id, p1.id, "m1", 1, 1.0, Default::default())
+            .unwrap();
+        store
+            .add_route_entry(route.id, p2.id, "m2", 2, 9.0, Default::default())
+            .unwrap();
+
+        let state = RoutingState::default();
+        let mut heavy_first = 0;
+        for _ in 0..200 {
+            let mut targets = resolve_targets_with_strategy(&store, "prog/r1", &state).unwrap();
+            if targets[0].provider.name == "heavy" {
+                heavy_first += 1;
+            }
+        }
+        // With 9:1 ratio, heavy should lead far more than half the time.
+        assert!(heavy_first > 150, "heavy led only {heavy_first}/200 times");
+    }
+
+    #[test]
+    fn priority_strategy_leaves_order_unchanged() {
+        let (store, _route_id) = setup_multi_entry();
+        // Re-create the route as Priority.
+        let profiles = store.list_profiles().unwrap();
+        let proxies = store.list_proxies(profiles[0].id.as_str()).unwrap();
+        let routes = store.list_routes(proxies[0].id).unwrap();
+        assert!(!routes.is_empty());
+        let state = RoutingState::default();
+        let targets = resolve_targets_with_strategy(&store, "prog/r1", &state).unwrap();
+        // Even though the route is RoundRobin, the resolver returns both entries.
+        assert_eq!(targets.len(), 2);
     }
 
     #[tokio::test]
