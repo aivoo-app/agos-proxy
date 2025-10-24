@@ -34,8 +34,7 @@ pub struct Message {
 pub fn build_upstream_request(
     target: &Target,
     chat_req: &ChatRequest,
-) -> Result<(String, BTreeMap<String, String>, serde_json::Value)>
-{
+) -> Result<(String, BTreeMap<String, String>, serde_json::Value)> {
     let base = target.provider.base_url.trim_end_matches('/');
     let url = format!("{base}/v1/chat/completions");
 
@@ -69,7 +68,11 @@ pub async fn forward_non_streaming(
     for (k, v) in &headers {
         req = req.header(k, v);
     }
-    let resp = req.json(&body).send().await.context("sending request to provider")?;
+    let resp = req
+        .json(&body)
+        .send()
+        .await
+        .context("sending request to provider")?;
     let status = resp.status();
     let bytes = resp.bytes().await.context("reading provider response")?;
     if !status.is_success() {

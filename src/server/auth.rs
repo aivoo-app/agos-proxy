@@ -23,7 +23,14 @@ pub async fn auth_middleware(
         .map(String::from);
 
     match token {
-        Some(token) if state.store.get_profile_by_id(&token).ok().flatten().is_some() => {
+        Some(token)
+            if state
+                .store
+                .get_profile_by_id(&token)
+                .ok()
+                .flatten()
+                .is_some() =>
+        {
             request.extensions_mut().insert(token);
             next.run(request).await
         }

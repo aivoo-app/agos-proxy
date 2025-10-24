@@ -2,7 +2,7 @@
 
 use anyhow::{bail, Context as _, Result};
 use clap::Subcommand;
-use dialoguer::{theme::ColorfulTheme, Input, Confirm};
+use dialoguer::{theme::ColorfulTheme, Confirm, Input};
 
 use crate::cli::util::{hash_password, open_store};
 use crate::storage::Store;
@@ -135,5 +135,3 @@ fn rotate(store: &Store, name: &str) -> Result<()> {
     println!("New API token: {token}");
     Ok(())
 }
-
-

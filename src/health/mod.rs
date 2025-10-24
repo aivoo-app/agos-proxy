@@ -50,9 +50,7 @@ async fn run_once(store: &Store, client: &reqwest::Client) -> Result<()> {
         let outcome = ping(client, &provider).await;
         let new_status = decide_status(&entry.status, outcome);
         if new_status != entry.status {
-            tokio::task::block_in_place(|| {
-                store.set_route_entry_status(entry.id, new_status)
-            })?;
+            tokio::task::block_in_place(|| store.set_route_entry_status(entry.id, new_status))?;
             tracing::info!(old = ?entry.status, new = ?new_status, "entry status changed");
         }
     }
@@ -109,24 +107,45 @@ mod tests {
     #[test]
     fn decide_status_recovers_through_degraded() {
         // Unhealthy → Degraded on first success.
-        assert_eq!(decide_status(&ModelStatus::Unhealthy, true), ModelStatus::Degraded);
+        assert_eq!(
+            decide_status(&ModelStatus::Unhealthy, true),
+            ModelStatus::Degraded
+        );
         // Degraded → Healthy on next success.
-        assert_eq!(decide_status(&ModelStatus::Degraded, true), ModelStatus::Healthy);
+        assert_eq!(
+            decide_status(&ModelStatus::Degraded, true),
+            ModelStatus::Healthy
+        );
         // Healthy stays Healthy.
-        assert_eq!(decide_status(&ModelStatus::Healthy, true), ModelStatus::Healthy);
+        assert_eq!(
+            decide_status(&ModelStatus::Healthy, true),
+            ModelStatus::Healthy
+        );
     }
 
     #[test]
     fn decide_status_degrades_on_failure() {
         // Degraded → Unhealthy on failure.
-        assert_eq!(decide_status(&ModelStatus::Degraded, false), ModelStatus::Unhealthy);
+        assert_eq!(
+            decide_status(&ModelStatus::Degraded, false),
+            ModelStatus::Unhealthy
+        );
         // Unhealthy stays Unhealthy on failure.
-        assert_eq!(decide_status(&ModelStatus::Unhealthy, false), ModelStatus::Unhealthy);
+        assert_eq!(
+            decide_status(&ModelStatus::Unhealthy, false),
+            ModelStatus::Unhealthy
+        );
     }
 
     #[test]
     fn decide_status_disabled_is_untouched() {
-        assert_eq!(decide_status(&ModelStatus::Disabled, true), ModelStatus::Disabled);
-        assert_eq!(decide_status(&ModelStatus::Disabled, false), ModelStatus::Disabled);
+        assert_eq!(
+            decide_status(&ModelStatus::Disabled, true),
+            ModelStatus::Disabled
+        );
+        assert_eq!(
+            decide_status(&ModelStatus::Disabled, false),
+            ModelStatus::Disabled
+        );
     }
 }

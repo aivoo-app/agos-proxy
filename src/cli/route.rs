@@ -4,9 +4,9 @@ use anyhow::{bail, Result};
 use clap::Subcommand;
 use dialoguer::{theme::ColorfulTheme, Input, Select};
 
-use anyhow::Context as _;
 use crate::cli::util::{open_store, require_profile};
 use crate::domain::{ModelStatus, RouteCapabilities, RoutingStrategy};
+use anyhow::Context as _;
 
 /// Subcommands under `agos route`.
 #[derive(Debug, Subcommand)]
@@ -54,7 +54,10 @@ fn create(store: &crate::storage::Store, proxy_name: Option<String>) -> Result<(
         .with_prompt("Route name (e.g. php-developer-3.5-flash)")
         .interact_text()?;
     if store.get_route_named(proxy.id, &route_name)?.is_some() {
-        bail!("a route named {route_name:?} already exists under proxy {:?}", proxy.name);
+        bail!(
+            "a route named {route_name:?} already exists under proxy {:?}",
+            proxy.name
+        );
     }
     let description: String = Input::<String>::with_theme(&theme)
         .with_prompt("Description (optional)")

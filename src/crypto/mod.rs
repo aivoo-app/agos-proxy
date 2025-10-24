@@ -6,9 +6,9 @@
 //! table so restarts don't lose it. Keeping this in its own module means
 //! token handling stays in one place and is easy to audit and test in isolation.
 
-use anyhow::Result;
-use aead::{Aead, KeyInit};
 use aead::generic_array::GenericArray;
+use aead::{Aead, KeyInit};
+use anyhow::Result;
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use rand::RngCore;
 

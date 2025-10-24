@@ -204,7 +204,8 @@ impl Store {
 
     /// Get the master key, loading it if needed.
     fn master_key(&self) -> MasterKey {
-        self.load_or_generate_master_key().expect("master key must be loadable");
+        self.load_or_generate_master_key()
+            .expect("master key must be loadable");
         self.master_key
             .lock()
             .expect("master key mutex poisoned")
@@ -319,7 +320,8 @@ impl Store {
     pub fn rotate_profile_token(&self, id: &str) -> Result<String> {
         let new_token = fresh_token()?;
         let now = now_millis();
-        let changed = self.conn()
+        let changed = self
+            .conn()
             .execute(
                 "UPDATE profiles SET id = ?1, updated_at = ?2 WHERE id = ?3",
                 (&new_token, now, id),
@@ -395,7 +397,8 @@ impl Store {
                 description: raw.description,
                 base_url: raw.base_url,
                 auth_token,
-                kind: provider_kind_from_tag(&raw.kind_tag).expect("invalid provider kind in store"),
+                kind: provider_kind_from_tag(&raw.kind_tag)
+                    .expect("invalid provider kind in store"),
                 extra_headers: serde_json::from_str::<std::collections::BTreeMap<String, String>>(
                     &raw.extra_json,
                 )
@@ -435,11 +438,13 @@ impl Store {
                     description: raw.description,
                     base_url: raw.base_url,
                     auth_token,
-                    kind: provider_kind_from_tag(&raw.kind_tag).expect("invalid provider kind in store"),
-                    extra_headers: serde_json::from_str::<std::collections::BTreeMap<String, String>>(
-                        &raw.extra_json,
-                    )
-                    .expect("invalid provider headers in store"),
+                    kind: provider_kind_from_tag(&raw.kind_tag)
+                        .expect("invalid provider kind in store"),
+                    extra_headers:
+                        serde_json::from_str::<std::collections::BTreeMap<String, String>>(
+                            &raw.extra_json,
+                        )
+                        .expect("invalid provider headers in store"),
                 }))
             }
             None => Ok(None),
@@ -463,7 +468,8 @@ impl Store {
         name: &str,
         description: Option<&str>,
     ) -> Result<Proxy> {
-        let _ = self.conn()
+        let _ = self
+            .conn()
             .execute(
                 "INSERT INTO proxies (profile_id, name, description) VALUES (?1, ?2, ?3)",
                 (profile_id, name, description),
@@ -685,37 +691,42 @@ impl Store {
              WHERE e.status != ?1 AND e.status != ?2",
         )?;
         let rows = stmt.query_map(
-            [status_tag(ModelStatus::Healthy), status_tag(ModelStatus::Disabled)],
+            [
+                status_tag(ModelStatus::Healthy),
+                status_tag(ModelStatus::Disabled),
+            ],
             |row| {
-            let status_tag_owned: String = row.get(6)?;
-            let caps_json: String = row.get(7)?;
-            let kind_tag: String = row.get(14)?;
-            let extra_json: String = row.get(15)?;
-            Ok((
-                RouteEntry {
-                    id: row.get(0)?,
-                    route_id: row.get(1)?,
-                    provider_id: row.get(2)?,
-                    model_id: row.get(3)?,
-                    priority: row.get(4)?,
-                    weight: row.get(5)?,
-                    status: status_from_tag(&status_tag_owned).expect("invalid status in store"),
-                    capabilities: serde_json::from_str::<RouteCapabilities>(&caps_json)
-                        .expect("invalid capabilities in store"),
-                },
-                Provider {
-                    id: row.get(8)?,
-                    profile_id: row.get(9)?,
-                    name: row.get(10)?,
-                    description: row.get(11)?,
-                    base_url: row.get(12)?,
-                    auth_token: row.get(13)?,
-                    kind: provider_kind_from_tag(&kind_tag).expect("invalid kind in store"),
-                    extra_headers: serde_json::from_str(&extra_json)
-                        .expect("invalid headers in store"),
-                },
-            ))
-        })?;
+                let status_tag_owned: String = row.get(6)?;
+                let caps_json: String = row.get(7)?;
+                let kind_tag: String = row.get(14)?;
+                let extra_json: String = row.get(15)?;
+                Ok((
+                    RouteEntry {
+                        id: row.get(0)?,
+                        route_id: row.get(1)?,
+                        provider_id: row.get(2)?,
+                        model_id: row.get(3)?,
+                        priority: row.get(4)?,
+                        weight: row.get(5)?,
+                        status: status_from_tag(&status_tag_owned)
+                            .expect("invalid status in store"),
+                        capabilities: serde_json::from_str::<RouteCapabilities>(&caps_json)
+                            .expect("invalid capabilities in store"),
+                    },
+                    Provider {
+                        id: row.get(8)?,
+                        profile_id: row.get(9)?,
+                        name: row.get(10)?,
+                        description: row.get(11)?,
+                        base_url: row.get(12)?,
+                        auth_token: row.get(13)?,
+                        kind: provider_kind_from_tag(&kind_tag).expect("invalid kind in store"),
+                        extra_headers: serde_json::from_str(&extra_json)
+                            .expect("invalid headers in store"),
+                    },
+                ))
+            },
+        )?;
         let mut out = Vec::new();
         for item in rows {
             out.push(item?);

@@ -39,7 +39,10 @@ fn create(store: &crate::storage::Store, profile: Option<String>) -> Result<()> 
         .with_prompt("Proxy name (e.g. Programmer)")
         .interact_text()?;
     if store.get_proxy_named(profile.id.as_str(), &name)?.is_some() {
-        anyhow::bail!("a proxy named {name:?} already exists under {:?}", profile.name);
+        anyhow::bail!(
+            "a proxy named {name:?} already exists under {:?}",
+            profile.name
+        );
     }
     let description: String = Input::<String>::with_theme(&theme)
         .with_prompt("Description (optional)")

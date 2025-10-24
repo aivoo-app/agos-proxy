@@ -65,7 +65,14 @@ fn setup_store(base_url: &str) -> (Store, String) {
         .create_route(proxy.id, "php-dev", None, RoutingStrategy::Priority)
         .expect("create route");
     store
-        .add_route_entry(route.id, provider_id, "mock-model", 1, 1.0, Default::default())
+        .add_route_entry(
+            route.id,
+            provider_id,
+            "mock-model",
+            1,
+            1.0,
+            Default::default(),
+        )
         .expect("add route entry");
 
     (store, profile_id)
@@ -106,8 +113,7 @@ async fn chat_completions_routes_through_mock_upstream() {
         .expect("read body");
     let json: serde_json::Value = serde_json::from_slice(&body).expect("parse json");
     assert_eq!(
-        json["choices"][0]["message"]["content"],
-        "hello from mock",
+        json["choices"][0]["message"]["content"], "hello from mock",
         "upstream response should be passed through"
     );
 }
@@ -136,7 +142,11 @@ async fn chat_completions_rejects_missing_auth() {
         .expect("build request");
 
     let response = app.oneshot(request).await.expect("oneshot");
-    assert_eq!(response.status(), 401, "missing bearer token should be rejected");
+    assert_eq!(
+        response.status(),
+        401,
+        "missing bearer token should be rejected"
+    );
 }
 
 #[tokio::test]
