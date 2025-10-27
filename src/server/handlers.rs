@@ -98,7 +98,8 @@ async fn handle_streaming(state: AppState, chat_req: ChatRequest) -> Response {
                 r.stream = true;
                 r
             };
-            let (url, headers, body) = match translator::build_upstream_request(&target, &req) {
+            let (url, headers, body) = match translator::build_upstream_request(&target, &req, true)
+            {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!(error = %e, "build upstream failed");

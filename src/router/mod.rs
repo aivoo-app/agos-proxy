@@ -26,7 +26,7 @@ pub struct RoutingState {
 impl RoutingState {
     /// Rotate the targets for a round-robin route: the entry after the last
     /// used one goes first. Updates the stored counter.
-    pub fn rotate_round_robin(&self, route_id: i64, targets: &mut Vec<Target>) {
+    pub fn rotate_round_robin(&self, route_id: i64, targets: &mut [Target]) {
         if targets.len() <= 1 {
             return;
         }
@@ -42,7 +42,7 @@ impl RoutingState {
     /// Pick a starting index by weight (higher weight → more likely first),
     /// then rotate the targets so that entry leads. Falls back to priority
     /// order when all weights are zero or there is only one entry.
-    pub fn shuffle_weighted(&self, targets: &mut Vec<Target>) {
+    pub fn shuffle_weighted(&self, targets: &mut [Target]) {
         if targets.len() <= 1 {
             return;
         }
@@ -317,13 +317,13 @@ mod tests {
 
     #[test]
     fn round_robin_rotates_starting_entry() {
-        let (store, route_id) = setup_multi_entry();
+        let (store, _route_id) = setup_multi_entry();
         let state = RoutingState::default();
-        let mut first = resolve_targets_with_strategy(&store, "prog/r1", &state).unwrap();
+        let first = resolve_targets_with_strategy(&store, "prog/r1", &state).unwrap();
         assert_eq!(first[0].provider.name, "p1");
-        let mut second = resolve_targets_with_strategy(&store, "prog/r1", &state).unwrap();
+        let second = resolve_targets_with_strategy(&store, "prog/r1", &state).unwrap();
         assert_eq!(second[0].provider.name, "p2");
-        let mut third = resolve_targets_with_strategy(&store, "prog/r1", &state).unwrap();
+        let third = resolve_targets_with_strategy(&store, "prog/r1", &state).unwrap();
         assert_eq!(third[0].provider.name, "p1");
     }
 
@@ -374,7 +374,7 @@ mod tests {
         let state = RoutingState::default();
         let mut heavy_first = 0;
         for _ in 0..200 {
-            let mut targets = resolve_targets_with_strategy(&store, "prog/r1", &state).unwrap();
+            let targets = resolve_targets_with_strategy(&store, "prog/r1", &state).unwrap();
             if targets[0].provider.name == "heavy" {
                 heavy_first += 1;
             }

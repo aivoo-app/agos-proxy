@@ -1,9 +1,12 @@
 //! Request/response translation between OpenAI-compatible format and the
 //! provider's native format.
 //!
-//! The MVP supports OpenAI-compatible providers only, so the translator is
-//! largely a passthrough that injects provider-specific headers and rewrites
-//! the base URL. Anthropic and Google translators land in V1.
+//! Callers always speak the OpenAI-compatible API; each provider kind gets a
+//! translator that reshapes the request on the way out and the response on the
+//! way back. OpenAI-compatible providers pass through untouched.
+
+pub mod anthropic;
+pub mod google;
 
 use std::collections::BTreeMap;
 
@@ -30,40 +33,83 @@ pub struct Message {
     pub content: String,
 }
 
-/// Build the upstream request for a target, returning the full URL and headers.
+/// Build the upstream request for a target: URL, headers, and a body already
+/// shaped for the provider. `stream` selects the streaming endpoint variant.
 pub fn build_upstream_request(
     target: &Target,
     chat_req: &ChatRequest,
+    stream: bool,
 ) -> Result<(String, BTreeMap<String, String>, serde_json::Value)> {
-    let base = target.provider.base_url.trim_end_matches('/');
-    let url = format!("{base}/v1/chat/completions");
+    match target.provider.kind {
+        ProviderKind::OpenAICompatible => {
+            let base = target.provider.base_url.trim_end_matches('/');
+            let url = format!("{base}/v1/chat/completions");
 
-    let mut headers = target.provider.extra_headers.clone();
-    headers.insert(
-        "Authorization".to_string(),
-        format!("Bearer {}", target.provider.auth_token),
-    );
-    headers.insert("Content-Type".to_string(), "application/json".to_string());
+            let mut headers = target.provider.extra_headers.clone();
+            headers.insert(
+                "Authorization".to_string(),
+                format!("Bearer {}", target.provider.auth_token),
+            );
+            headers.insert("Content-Type".to_string(), "application/json".to_string());
 
-    // The body uses the model ID from the route entry, not the caller's model string.
-    let mut body = serde_json::to_value(chat_req)?;
-    if let Some(obj) = body.as_object_mut() {
-        obj.insert(
-            "model".to_string(),
-            serde_json::Value::String(target.entry.model_id.clone()),
-        );
+            // The body uses the model ID from the route entry, not the caller's
+            // model string.
+            let mut body = serde_json::to_value(chat_req)?;
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert(
+                    "model".to_string(),
+                    serde_json::Value::String(target.entry.model_id.clone()),
+                );
+            }
+            Ok((url, headers, body))
+        }
+        ProviderKind::Anthropic => {
+            let url = anthropic::build_url(target);
+            let headers = anthropic::build_headers(target);
+            let body = anthropic::translate_request(chat_req, &target.entry.model_id);
+            Ok((url, headers, body))
+        }
+        ProviderKind::Google => {
+            let url = google::build_url(target, stream);
+            let headers = google::build_headers(target);
+            let body = google::translate_request(chat_req);
+            Ok((url, headers, body))
+        }
+        ProviderKind::Custom => {
+            anyhow::bail!("custom providers need an explicit OpenAI-compatible base URL")
+        }
     }
-
-    Ok((url, headers, body))
 }
 
-/// Forward a non-streaming chat-completions request, returning the raw bytes.
+/// Reshape a successful upstream response into OpenAI-compatible JSON bytes.
+/// OpenAI-compatible responses pass through as-is.
+pub fn translate_response(target: &Target, bytes: &[u8]) -> Result<Vec<u8>> {
+    match target.provider.kind {
+        ProviderKind::OpenAICompatible => Ok(bytes.to_vec()),
+        ProviderKind::Anthropic => {
+            let resp: serde_json::Value =
+                serde_json::from_slice(bytes).context("parsing anthropic response")?;
+            let out = anthropic::translate_response(&resp)?;
+            serde_json::to_vec(&out).context("serializing translated response")
+        }
+        ProviderKind::Google => {
+            let resp: serde_json::Value =
+                serde_json::from_slice(bytes).context("parsing gemini response")?;
+            let out = google::translate_response(&resp, &target.entry.model_id)?;
+            serde_json::to_vec(&out).context("serializing translated response")
+        }
+        ProviderKind::Custom => Ok(bytes.to_vec()),
+    }
+}
+
+/// Forward a non-streaming chat-completions request, returning OpenAI-shaped
+/// response bytes regardless of the provider's native format.
 pub async fn forward_non_streaming(
     client: &Client,
     target: &Target,
     chat_req: &ChatRequest,
 ) -> Result<Vec<u8>> {
-    let (url, headers, body) = build_upstream_request(target, chat_req)?;
+    let (url, headers, body) = build_upstream_request(target, chat_req, false)?;
     let mut req = client.post(&url);
     for (k, v) in &headers {
         req = req.header(k, v);
@@ -82,12 +128,12 @@ pub async fn forward_non_streaming(
             String::from_utf8_lossy(&bytes)
         );
     }
-    Ok(bytes.to_vec())
+    translate_response(target, &bytes)
 }
 
 /// Check whether a provider kind is supported by the current translator set.
 pub fn is_supported(kind: ProviderKind) -> bool {
-    matches!(kind, ProviderKind::OpenAICompatible)
+    !matches!(kind, ProviderKind::Custom)
 }
 
 #[cfg(test)]
@@ -134,7 +180,7 @@ mod tests {
             stream: false,
             extra: serde_json::Value::Null,
         };
-        let (url, headers, body) = build_upstream_request(&target, &chat_req).unwrap();
+        let (url, headers, body) = build_upstream_request(&target, &chat_req, false).unwrap();
         assert_eq!(url, "https://api.deepseek.com/v1/chat/completions");
         assert_eq!(headers.get("Authorization").unwrap(), "Bearer sk-secret");
         assert_eq!(headers.get("X-Custom").unwrap(), "yes");

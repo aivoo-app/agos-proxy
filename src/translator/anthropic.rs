@@ -10,7 +10,7 @@ use anyhow::{Context as _, Result};
 
 use crate::domain::ProviderKind;
 use crate::router::Target;
-use crate::translator::{ChatRequest, Message};
+use crate::translator::ChatRequest;
 
 /// Build the upstream URL for an Anthropic request.
 pub fn build_url(target: &Target) -> String {
@@ -120,7 +120,7 @@ pub fn translate_response(resp: &serde_json::Value) -> Result<serde_json::Value>
     Ok(serde_json::json!({
         "id": resp.get("id").cloned().unwrap_or_else(|| serde_json::Value::String("msg_agos".into())),
         "object": "chat.completion",
-        "model": resp.get("model").cloned().unwrap_or_else(|| serde_json::Value::Null),
+        "model": resp.get("model").cloned().unwrap_or(serde_json::Value::Null),
         "choices": [{
             "index": 0,
             "message": {
