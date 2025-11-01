@@ -291,21 +291,24 @@ impl Store {
 
     /// Look up a profile by its display name.
     pub fn get_profile_by_name(&self, name: &str) -> Result<Option<Profile>> {
-        Ok(self.conn().query_one::<Option<Profile>, _, _>(
-            "SELECT id, name, description, password_hash, created_at, updated_at
+        self.conn()
+            .query_row(
+                "SELECT id, name, description, password_hash, created_at, updated_at
              FROM profiles WHERE name = ?1",
-            (name,),
-            |row| {
-                Ok(Some(Profile {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    description: row.get(2)?,
-                    password_hash: row.get(3)?,
-                    created_at: row.get(4)?,
-                    updated_at: row.get(5)?,
-                }))
-            },
-        )?)
+                (name,),
+                |row| {
+                    Ok(Profile {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        description: row.get(2)?,
+                        password_hash: row.get(3)?,
+                        created_at: row.get(4)?,
+                        updated_at: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| e.into())
     }
 
     /// Delete a profile and everything under it (cascades).
