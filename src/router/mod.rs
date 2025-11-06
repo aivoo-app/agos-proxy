@@ -71,21 +71,17 @@ pub struct Target {
     pub entry: RouteEntry,
 }
 
-/// Resolve a model string to an ordered list of healthy targets.
-pub fn resolve_targets(store: &Store, model: &str) -> Result<Vec<Target>> {
+/// Resolve a model string to an ordered list of healthy targets, scoped to the
+/// given profile. The caller's profile id comes from the bearer token, so a
+/// caller can only ever reach proxies under their own profile.
+pub fn resolve_targets(store: &Store, profile_id: &str, model: &str) -> Result<Vec<Target>> {
     let (proxy_name, route_name) = model
         .split_once('/')
         .with_context(|| format!("model {model:?} must be in `<proxy>/<route>` format"))?;
 
-    let profiles = store.list_profiles()?;
-    let mut found = None;
-    for profile in &profiles {
-        if let Some(proxy) = store.get_proxy_named(profile.id.as_str(), proxy_name)? {
-            found = Some((profile.id.clone(), proxy));
-            break;
-        }
-    }
-    let (_profile_id, proxy) = found.with_context(|| format!("no proxy named {proxy_name:?}"))?;
+    let proxy = store
+        .get_proxy_named(profile_id, proxy_name)?
+        .with_context(|| format!("no proxy named {proxy_name:?}"))?;
 
     let route = store
         .get_route_named(proxy.id, route_name)?
@@ -112,6 +108,7 @@ pub fn resolve_targets(store: &Store, model: &str) -> Result<Vec<Target>> {
 /// - `Weighted`: the starting entry is picked by weighted random draw.
 pub fn resolve_targets_with_strategy(
     store: &Store,
+    profile_id: &str,
     model: &str,
     routing_state: &RoutingState,
 ) -> Result<Vec<Target>> {
@@ -119,15 +116,9 @@ pub fn resolve_targets_with_strategy(
         .split_once('/')
         .with_context(|| format!("model {model:?} must be in `<proxy>/<route>` format"))?;
 
-    let profiles = store.list_profiles()?;
-    let mut found = None;
-    for profile in &profiles {
-        if let Some(proxy) = store.get_proxy_named(profile.id.as_str(), proxy_name)? {
-            found = Some((profile.id.clone(), proxy));
-            break;
-        }
-    }
-    let (_profile_id, proxy) = found.with_context(|| format!("no proxy named {proxy_name:?}"))?;
+    let proxy = store
+        .get_proxy_named(profile_id, proxy_name)?
+        .with_context(|| format!("no proxy named {proxy_name:?}"))?;
 
     let route = store
         .get_route_named(proxy.id, route_name)?
@@ -237,7 +228,7 @@ mod tests {
         store
             .add_route_entry(route.id, provider.id, "m1", 1, 1.0, Default::default())
             .unwrap();
-        let targets = resolve_targets(&store, "prog/r1").unwrap();
+        let targets = resolve_targets(&store, &profile.id, "prog/r1").unwrap();
         assert_eq!(targets.len(), 1);
         (store, targets)
     }
@@ -315,15 +306,24 @@ mod tests {
         (store, route.id)
     }
 
+    fn pid(store: &Store) -> String {
+        store
+            .get_profile_by_name("coder1")
+            .unwrap()
+            .expect("profile exists")
+            .id
+    }
+
     #[test]
     fn round_robin_rotates_starting_entry() {
         let (store, _route_id) = setup_multi_entry();
         let state = RoutingState::default();
-        let first = resolve_targets_with_strategy(&store, "prog/r1", &state).unwrap();
+        let profile_id = pid(&store);
+        let first = resolve_targets_with_strategy(&store, &profile_id, "prog/r1", &state).unwrap();
         assert_eq!(first[0].provider.name, "p1");
-        let second = resolve_targets_with_strategy(&store, "prog/r1", &state).unwrap();
+        let second = resolve_targets_with_strategy(&store, &profile_id, "prog/r1", &state).unwrap();
         assert_eq!(second[0].provider.name, "p2");
-        let third = resolve_targets_with_strategy(&store, "prog/r1", &state).unwrap();
+        let third = resolve_targets_with_strategy(&store, &profile_id, "prog/r1", &state).unwrap();
         assert_eq!(third[0].provider.name, "p1");
     }
 
@@ -372,9 +372,11 @@ mod tests {
             .unwrap();
 
         let state = RoutingState::default();
+        let profile_id = pid(&store);
         let mut heavy_first = 0;
         for _ in 0..200 {
-            let targets = resolve_targets_with_strategy(&store, "prog/r1", &state).unwrap();
+            let targets =
+                resolve_targets_with_strategy(&store, &profile_id, "prog/r1", &state).unwrap();
             if targets[0].provider.name == "heavy" {
                 heavy_first += 1;
             }
@@ -392,7 +394,8 @@ mod tests {
         let routes = store.list_routes(proxies[0].id).unwrap();
         assert!(!routes.is_empty());
         let state = RoutingState::default();
-        let targets = resolve_targets_with_strategy(&store, "prog/r1", &state).unwrap();
+        let targets =
+            resolve_targets_with_strategy(&store, &pid(&store), "prog/r1", &state).unwrap();
         // Even though the route is RoundRobin, the resolver returns both entries.
         assert_eq!(targets.len(), 2);
     }
@@ -409,7 +412,51 @@ mod tests {
         store
             .set_route_entry_status(entries[0].id, ModelStatus::Unhealthy)
             .unwrap();
-        let targets = resolve_targets(&store, "prog/r1").unwrap();
+        let targets = resolve_targets(&store, &pid(&store), "prog/r1").unwrap();
         assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn resolution_is_scoped_to_the_callers_profile() {
+        let store = Store::open_in_memory().unwrap();
+        // Profile A owns the proxy/route; profile B is a different tenant.
+        let a = store.create_profile("alice", None, None).unwrap();
+        let _b = store.create_profile("bob", None, None).unwrap();
+        let p = store
+            .create_provider(
+                a.id.as_str(),
+                NewProvider {
+                    name: "p".into(),
+                    description: None,
+                    base_url: "https://a.example".into(),
+                    auth_token: "tok".into(),
+                    kind: ProviderKind::OpenAICompatible,
+                    extra_headers: BTreeMap::new(),
+                },
+            )
+            .unwrap();
+        let proxy = store.create_proxy(a.id.as_str(), "prog", None).unwrap();
+        let route = store
+            .create_route(proxy.id, "r1", None, RoutingStrategy::Priority)
+            .unwrap();
+        store
+            .add_route_entry(route.id, p.id, "m1", 1, 1.0, Default::default())
+            .unwrap();
+
+        // Alice resolves fine.
+        let own = resolve_targets(&store, &a.id, "prog/r1").unwrap();
+        assert_eq!(own.len(), 1);
+        // Bob cannot reach Alice's proxy even with the same model string.
+        let other = resolve_targets(&store, &_b.id, "prog/r1");
+        assert!(other.is_err(), "cross-profile resolution must fail");
+        // A second proxy with the same name under Bob's profile doesn't leak
+        // Alice's routes either.
+        let b_proxy = store.create_proxy(_b.id.as_str(), "prog", None).unwrap();
+        let b_route = store
+            .create_route(b_proxy.id, "r1", None, RoutingStrategy::Priority)
+            .unwrap();
+        let _ = b_route;
+        let still_empty = resolve_targets(&store, &_b.id, "prog/r1").unwrap();
+        assert!(still_empty.is_empty());
     }
 }

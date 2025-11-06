@@ -20,7 +20,11 @@ pub struct AppState {
 }
 
 pub async fn chat_completions(State(state): State<AppState>, req: Request) -> Response {
-    let (_parts, body) = req.into_parts();
+    let (parts, body) = req.into_parts();
+    let profile_id = match parts.extensions.get::<String>() {
+        Some(id) => id.clone(),
+        None => return bad_request("unauthenticated"),
+    };
     let bytes = match axum::body::to_bytes(body, usize::MAX).await {
         Ok(b) => b,
         Err(e) => return bad_request(format!("failed to read body: {e}")),
@@ -30,19 +34,27 @@ pub async fn chat_completions(State(state): State<AppState>, req: Request) -> Re
         Err(e) => return bad_request(format!("invalid request body: {e}")),
     };
     if chat_req.stream {
-        handle_streaming(state, chat_req).await
+        handle_streaming(state, profile_id, chat_req).await
     } else {
-        handle_non_streaming(state, chat_req).await
+        handle_non_streaming(state, profile_id, chat_req).await
     }
 }
 
-async fn handle_non_streaming(state: AppState, chat_req: ChatRequest) -> Response {
-    let targets =
-        match resolve_targets_with_strategy(&state.store, &chat_req.model, &state.routing_state) {
-            Ok(t) if t.is_empty() => return bad_request("no healthy targets for this route"),
-            Ok(t) => t,
-            Err(e) => return bad_request(format!("route resolution failed: {e}")),
-        };
+async fn handle_non_streaming(
+    state: AppState,
+    profile_id: String,
+    chat_req: ChatRequest,
+) -> Response {
+    let targets = match resolve_targets_with_strategy(
+        &state.store,
+        &profile_id,
+        &chat_req.model,
+        &state.routing_state,
+    ) {
+        Ok(t) if t.is_empty() => return bad_request("no healthy targets for this route"),
+        Ok(t) => t,
+        Err(e) => return bad_request(format!("route resolution failed: {e}")),
+    };
     let result = execute_with_failover(
         state.store.clone(),
         targets,
@@ -71,7 +83,7 @@ async fn handle_non_streaming(state: AppState, chat_req: ChatRequest) -> Respons
     }
 }
 
-async fn handle_streaming(state: AppState, chat_req: ChatRequest) -> Response {
+async fn handle_streaming(state: AppState, profile_id: String, chat_req: ChatRequest) -> Response {
     let model = chat_req.model.clone();
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(16);
     let store = state.store.clone();
@@ -79,7 +91,12 @@ async fn handle_streaming(state: AppState, chat_req: ChatRequest) -> Response {
     let client = state.http_client.clone();
 
     tokio::spawn(async move {
-        let targets = match resolve_targets_with_strategy(&store, &model, &state.routing_state) {
+        let targets = match resolve_targets_with_strategy(
+            &store,
+            &profile_id,
+            &model,
+            &state.routing_state,
+        ) {
             Ok(t) if t.is_empty() => {
                 let _ = tx
                     .send(Err(std::io::Error::other("no healthy targets")))
