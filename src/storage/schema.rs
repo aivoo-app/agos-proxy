@@ -62,4 +62,23 @@ pub const SCHEMA: &str = "
     CREATE UNIQUE INDEX IF NOT EXISTS idx_providers_profile ON providers(profile_id, name);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_proxies_profile    ON proxies(profile_id, name);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_routes_proxy       ON routes(proxy_id, name);
+
+    CREATE TABLE IF NOT EXISTS usage_log (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        profile_id    TEXT NOT NULL,
+        route_entry_id INTEGER NOT NULL REFERENCES route_entries(id) ON DELETE CASCADE,
+        model_id      TEXT NOT NULL,
+        streamed      INTEGER NOT NULL DEFAULT 0,
+        success       INTEGER NOT NULL,
+        status_code   INTEGER,
+        error_message TEXT,
+        latency_ms    INTEGER NOT NULL,
+        prompt_tokens INTEGER,
+        completion_tokens INTEGER,
+        created_at    INTEGER NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_usage_profile ON usage_log(profile_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_usage_entry   ON usage_log(route_entry_id, created_at);
+
 ";

@@ -19,5 +19,5 @@ pub mod model;
 
 pub use model::{
     ModelStatus, Profile, Provider, ProviderKind, Proxy, Route, RouteCapabilities, RouteEntry,
-    RoutingStrategy,
+    RoutingStrategy, UsageRecord, UsageStats,
 };

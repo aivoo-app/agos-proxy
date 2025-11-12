@@ -21,7 +21,7 @@ use crate::crypto::MasterKey;
 
 use crate::domain::{
     ModelStatus, Profile, Provider, ProviderKind, Proxy, Route, RouteCapabilities, RouteEntry,
-    RoutingStrategy,
+    RoutingStrategy, UsageRecord, UsageStats,
 };
 
 /// Intermediate provider row, used to defer decryption out of the rusqlite closure.
@@ -117,6 +117,20 @@ pub struct NewProvider {
     pub auth_token: String,
     pub kind: ProviderKind,
     pub extra_headers: std::collections::BTreeMap<String, String>,
+}
+
+/// Details needed to append one request to the usage log.
+pub struct NewUsage {
+    pub profile_id: String,
+    pub route_entry_id: i64,
+    pub model_id: String,
+    pub streamed: bool,
+    pub success: bool,
+    pub status_code: Option<i32>,
+    pub error_message: Option<String>,
+    pub latency_ms: i64,
+    pub prompt_tokens: Option<i64>,
+    pub completion_tokens: Option<i64>,
 }
 
 /// Handle to the on-disk store.
@@ -730,6 +744,116 @@ impl Store {
                 ))
             },
         )?;
+        let mut out = Vec::new();
+        for item in rows {
+            out.push(item?);
+        }
+        Ok(out)
+    }
+
+    // ---- usage logging -------------------------------------------------
+
+    /// Append one completed request to the usage log.
+    pub fn record_usage(&self, rec: NewUsage) -> Result<UsageRecord> {
+        let now = now_millis();
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO usage_log
+                (profile_id, route_entry_id, model_id, streamed, success,
+                 status_code, error_message, latency_ms, prompt_tokens,
+                 completion_tokens, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            rusqlite::params![
+                rec.profile_id,
+                rec.route_entry_id,
+                rec.model_id,
+                rec.streamed as i64,
+                rec.success as i64,
+                rec.status_code,
+                rec.error_message,
+                rec.latency_ms,
+                rec.prompt_tokens,
+                rec.completion_tokens,
+                now,
+            ],
+        )?;
+        let id = conn.last_insert_rowid();
+        Ok(UsageRecord {
+            id,
+            profile_id: rec.profile_id,
+            route_entry_id: rec.route_entry_id,
+            model_id: rec.model_id,
+            streamed: rec.streamed,
+            success: rec.success,
+            status_code: rec.status_code,
+            error_message: rec.error_message,
+            latency_ms: rec.latency_ms,
+            prompt_tokens: rec.prompt_tokens,
+            completion_tokens: rec.completion_tokens,
+            created_at: now,
+        })
+    }
+
+    /// The most recent usage records for a profile, newest first.
+    pub fn list_usage(&self, profile_id: &str, limit: u32) -> Result<Vec<UsageRecord>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, profile_id, route_entry_id, model_id, streamed, success,
+                    status_code, error_message, latency_ms, prompt_tokens,
+                    completion_tokens, created_at
+             FROM usage_log
+             WHERE profile_id = ?1
+             ORDER BY created_at DESC, id DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map([profile_id, &limit.to_string()], |row| {
+            Ok(UsageRecord {
+                id: row.get(0)?,
+                profile_id: row.get(1)?,
+                route_entry_id: row.get(2)?,
+                model_id: row.get(3)?,
+                streamed: row.get::<_, i64>(4)? != 0,
+                success: row.get::<_, i64>(5)? != 0,
+                status_code: row.get(6)?,
+                error_message: row.get(7)?,
+                latency_ms: row.get(8)?,
+                prompt_tokens: row.get(9)?,
+                completion_tokens: row.get(10)?,
+                created_at: row.get(11)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for item in rows {
+            out.push(item?);
+        }
+        Ok(out)
+    }
+
+    /// Per-model aggregates (calls, failures, latency, tokens) for a profile.
+    pub fn usage_stats(&self, profile_id: &str) -> Result<Vec<UsageStats>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT model_id,
+                    COUNT(*) AS calls,
+                    SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) AS failures,
+                    AVG(latency_ms),
+                    COALESCE(SUM(prompt_tokens), 0),
+                    COALESCE(SUM(completion_tokens), 0)
+             FROM usage_log
+             WHERE profile_id = ?1
+             GROUP BY model_id
+             ORDER BY calls DESC",
+        )?;
+        let rows = stmt.query_map([profile_id], |row| {
+            Ok(UsageStats {
+                model_id: row.get(0)?,
+                calls: row.get(1)?,
+                failures: row.get(2)?,
+                avg_latency_ms: row.get(3)?,
+                prompt_tokens: row.get(4)?,
+                completion_tokens: row.get(5)?,
+            })
+        })?;
         let mut out = Vec::new();
         for item in rows {
             out.push(item?);

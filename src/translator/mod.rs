@@ -122,13 +122,22 @@ pub async fn forward_non_streaming(
     let status = resp.status();
     let bytes = resp.bytes().await.context("reading provider response")?;
     if !status.is_success() {
-        anyhow::bail!(
-            "provider returned {}: {}",
+        return Err(ProviderError {
             status,
-            String::from_utf8_lossy(&bytes)
-        );
+            body: String::from_utf8_lossy(&bytes).into_owned(),
+        })
+        .context("provider returned an error response");
     }
     translate_response(target, &bytes)
+}
+
+/// An error response straight from the upstream provider, preserving its HTTP
+/// status so usage logging can record what actually happened.
+#[derive(Debug, thiserror::Error)]
+#[error("provider returned {}: {}", status, body)]
+pub struct ProviderError {
+    pub status: reqwest::StatusCode,
+    pub body: String,
 }
 
 /// Check whether a provider kind is supported by the current translator set.

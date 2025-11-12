@@ -133,3 +133,34 @@ pub struct RouteCapabilities {
     /// Maximum context window in tokens; `None` if unknown.
     pub max_context: Option<u32>,
 }
+
+/// One logged request against a route entry: outcome, latency, and token use.
+///
+/// Written by the server on every completion attempt (streaming or not) and
+/// surfaced through `agos logs` / `agos stats`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageRecord {
+    pub id: i64,
+    pub profile_id: String,
+    pub route_entry_id: i64,
+    pub model_id: String,
+    pub streamed: bool,
+    pub success: bool,
+    pub status_code: Option<i32>,
+    pub error_message: Option<String>,
+    pub latency_ms: i64,
+    pub prompt_tokens: Option<i64>,
+    pub completion_tokens: Option<i64>,
+    pub created_at: i64,
+}
+
+/// Aggregate usage per model over a window: calls, failures, latency, tokens.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageStats {
+    pub model_id: String,
+    pub calls: i64,
+    pub failures: i64,
+    pub avg_latency_ms: f64,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+}

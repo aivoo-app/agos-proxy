@@ -62,7 +62,15 @@ async fn handle_non_streaming(
         |target| {
             let client = state.http_client.clone();
             let req = chat_req.clone();
-            async move { translator::forward_non_streaming(&client, &target, &req).await }
+            let store = state.store.clone();
+            let profile_id = profile_id.clone();
+            async move {
+                let started = std::time::Instant::now();
+                let outcome = translator::forward_non_streaming(&client, &target, &req).await;
+                let latency_ms = started.elapsed().as_millis() as i64;
+                log_attempt(&store, &profile_id, &target, false, &outcome, latency_ms);
+                outcome
+            }
         },
     )
     .await;
@@ -81,6 +89,52 @@ async fn handle_non_streaming(
                 .unwrap()
         }
     }
+}
+
+/// Write one usage-log row for a completed attempt. Failures to log are
+/// swallowed — telemetry must never break request handling.
+fn log_attempt(
+    store: &Store,
+    profile_id: &str,
+    target: &crate::router::Target,
+    streamed: bool,
+    outcome: &anyhow::Result<Vec<u8>>,
+    latency_ms: i64,
+) {
+    let (success, status_code, error_message, prompt_tokens, completion_tokens) = match outcome {
+        Ok(bytes) => {
+            // Best-effort token extraction from the OpenAI-shaped response.
+            let (pt, ct) = serde_json::from_slice::<serde_json::Value>(bytes)
+                .ok()
+                .and_then(|v| {
+                    let u = v.get("usage")?;
+                    Some((
+                        u.get("prompt_tokens").and_then(|t| t.as_i64()),
+                        u.get("completion_tokens").and_then(|t| t.as_i64()),
+                    ))
+                })
+                .unwrap_or((None, None));
+            (true, Some(200), None, pt, ct)
+        }
+        Err(e) => {
+            let status = e
+                .downcast_ref::<crate::translator::ProviderError>()
+                .map(|pe| pe.status.as_u16() as i32);
+            (false, status, Some(e.to_string()), None, None)
+        }
+    };
+    let _ = store.record_usage(crate::storage::NewUsage {
+        profile_id: profile_id.to_string(),
+        route_entry_id: target.entry.id,
+        model_id: target.entry.model_id.clone(),
+        streamed,
+        success,
+        status_code,
+        error_message,
+        latency_ms,
+        prompt_tokens,
+        completion_tokens,
+    });
 }
 
 async fn handle_streaming(state: AppState, profile_id: String, chat_req: ChatRequest) -> Response {
@@ -127,13 +181,36 @@ async fn handle_streaming(state: AppState, profile_id: String, chat_req: ChatReq
             for (k, v) in &headers {
                 rb = rb.header(k, v);
             }
+            let started = std::time::Instant::now();
             let resp = match tokio::time::timeout(attempt_timeout, rb.json(&body).send()).await {
                 Ok(Ok(r)) if r.status().is_success() => r,
                 Ok(Ok(r)) => {
-                    tracing::warn!(status = %r.status(), "upstream error");
+                    let status = r.status();
+                    let bytes = r.bytes().await.unwrap_or_default();
+                    log_attempt(
+                        &store,
+                        &profile_id,
+                        &target,
+                        true,
+                        &Err::<Vec<u8>, _>(anyhow::anyhow!(
+                            "provider returned {}: {}",
+                            status,
+                            String::from_utf8_lossy(&bytes)
+                        )),
+                        started.elapsed().as_millis() as i64,
+                    );
+                    tracing::warn!(status = %status, "upstream error");
                     continue;
                 }
                 Ok(Err(e)) => {
+                    log_attempt(
+                        &store,
+                        &profile_id,
+                        &target,
+                        true,
+                        &Err::<Vec<u8>, _>(anyhow::anyhow!("upstream failed: {e}")),
+                        started.elapsed().as_millis() as i64,
+                    );
                     tracing::warn!(error = %e, "upstream failed");
                     continue;
                 }
@@ -142,6 +219,14 @@ async fn handle_streaming(state: AppState, profile_id: String, chat_req: ChatReq
                     let _ = store.set_route_entry_status(
                         target.entry.id,
                         crate::domain::ModelStatus::Unhealthy,
+                    );
+                    log_attempt(
+                        &store,
+                        &profile_id,
+                        &target,
+                        true,
+                        &Err::<Vec<u8>, _>(anyhow::anyhow!("upstream timed out")),
+                        started.elapsed().as_millis() as i64,
                     );
                     continue;
                 }
@@ -160,6 +245,17 @@ async fn handle_streaming(state: AppState, profile_id: String, chat_req: ChatReq
                     }
                 }
             }
+            // Stream completed successfully. Token counts for streamed responses
+            // only appear when the caller asks for stream_options.include_usage,
+            // so we record the latency and leave counts empty.
+            log_attempt(
+                &store,
+                &profile_id,
+                &target,
+                true,
+                &Ok(Vec::new()),
+                started.elapsed().as_millis() as i64,
+            );
             return;
         }
         let _ = tx
