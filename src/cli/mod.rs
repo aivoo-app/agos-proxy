@@ -29,6 +29,7 @@ mod profile;
 mod provider;
 mod proxy;
 mod route;
+mod usage;
 pub mod util;
 
 /// Top-level entry point parsed from the command line.
@@ -63,6 +64,9 @@ pub enum Command {
     /// Export or import a profile setup.
     #[command(subcommand)]
     Config(config::ConfigArgs),
+    /// Show per-request usage logs and aggregates for a profile.
+    #[command(subcommand)]
+    Usage(usage::UsageArgs),
 }
 
 /// Where AGOS Proxy looks for its working files. Uses the platform config dir
@@ -87,6 +91,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Proxy(args) => proxy::run(args),
         Command::Route(args) => route::run(args),
         Command::Config(args) => config::run(args),
+        Command::Usage(args) => usage::run(args),
     }
 }
 
