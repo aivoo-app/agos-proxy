@@ -29,26 +29,33 @@ pub async fn chat_completions(State(state): State<AppState>, req: Request) -> Re
         Ok(b) => b,
         Err(e) => return bad_request(format!("failed to read body: {e}")),
     };
-    let chat_req: ChatRequest = match serde_json::from_slice(&bytes) {
+    let body_value: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(r) => r,
+        Err(e) => return bad_request(format!("invalid request body: {e}")),
+    };
+    let needs = crate::router::RequestNeeds::from_body(&body_value);
+    let chat_req: ChatRequest = match serde_json::from_value(body_value) {
         Ok(r) => r,
         Err(e) => return bad_request(format!("invalid request body: {e}")),
     };
     if chat_req.stream {
-        handle_streaming(state, profile_id, chat_req).await
+        handle_streaming(state, profile_id, needs, chat_req).await
     } else {
-        handle_non_streaming(state, profile_id, chat_req).await
+        handle_non_streaming(state, profile_id, needs, chat_req).await
     }
 }
 
 async fn handle_non_streaming(
     state: AppState,
     profile_id: String,
+    needs: crate::router::RequestNeeds,
     chat_req: ChatRequest,
 ) -> Response {
     let targets = match resolve_targets_with_strategy(
         &state.store,
         &profile_id,
         &chat_req.model,
+        needs,
         &state.routing_state,
     ) {
         Ok(t) if t.is_empty() => return bad_request("no healthy targets for this route"),
@@ -137,7 +144,12 @@ fn log_attempt(
     });
 }
 
-async fn handle_streaming(state: AppState, profile_id: String, chat_req: ChatRequest) -> Response {
+async fn handle_streaming(
+    state: AppState,
+    profile_id: String,
+    needs: crate::router::RequestNeeds,
+    chat_req: ChatRequest,
+) -> Response {
     let model = chat_req.model.clone();
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(16);
     let store = state.store.clone();
@@ -149,6 +161,7 @@ async fn handle_streaming(state: AppState, profile_id: String, chat_req: ChatReq
             &store,
             &profile_id,
             &model,
+            needs,
             &state.routing_state,
         ) {
             Ok(t) if t.is_empty() => {

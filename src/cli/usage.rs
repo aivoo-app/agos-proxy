@@ -55,10 +55,7 @@ fn stats(store: &crate::storage::Store, profile: Option<String>) -> Result<()> {
         println!("No usage recorded for {:?} yet.", profile.name);
         return Ok(());
     }
-    println!(
-        "Usage for {:?} (per model):",
-        profile.name
-    );
+    println!("Usage for {:?} (per model):", profile.name);
     println!(
         "{:<28} {:>7} {:>9} {:>12} {:>10} {:>12}",
         "MODEL", "CALLS", "FAILURES", "AVG LAT(ms)", "PROMPT", "COMPLETION"
@@ -66,12 +63,7 @@ fn stats(store: &crate::storage::Store, profile: Option<String>) -> Result<()> {
     for s in rows {
         println!(
             "{:<28} {:>7} {:>9} {:>12.0} {:>10} {:>12}",
-            s.model_id,
-            s.calls,
-            s.failures,
-            s.avg_latency_ms,
-            s.prompt_tokens,
-            s.completion_tokens
+            s.model_id, s.calls, s.failures, s.avg_latency_ms, s.prompt_tokens, s.completion_tokens
         );
     }
     Ok(())
@@ -87,7 +79,11 @@ fn recent(store: &crate::storage::Store, profile: Option<String>, limit: u32) ->
     println!("Last {} requests for {:?}:", rows.len(), profile.name);
     for r in rows {
         let when = chrono::DateTime::from_timestamp(r.created_at, 0)
-            .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string())
+            .map(|dt| {
+                dt.with_timezone(&chrono::Local)
+                    .format("%Y-%m-%d %H:%M:%S")
+                    .to_string()
+            })
             .unwrap_or_else(|| r.created_at.to_string());
         let outcome = match (r.success, r.status_code) {
             (true, Some(code)) => format!("ok ({code})"),

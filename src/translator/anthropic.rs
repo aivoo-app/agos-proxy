@@ -10,7 +10,7 @@ use anyhow::{Context as _, Result};
 
 use crate::domain::ProviderKind;
 use crate::router::Target;
-use crate::translator::ChatRequest;
+use crate::translator::{content_text, ChatRequest};
 
 /// Build the upstream URL for an Anthropic request.
 pub fn build_url(target: &Target) -> String {
@@ -38,11 +38,11 @@ pub fn translate_request(chat_req: &ChatRequest, model_id: &str) -> serde_json::
             if !system_text.is_empty() {
                 system_text.push('\n');
             }
-            system_text.push_str(&msg.content);
+            system_text.push_str(&content_text(&msg.content));
         } else {
             messages.push(serde_json::json!({
                 "role": msg.role,
-                "content": msg.content,
+                "content": content_text(&msg.content),
             }));
         }
     }

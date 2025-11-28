@@ -2,7 +2,7 @@
 
 use anyhow::{bail, Result};
 use clap::Subcommand;
-use dialoguer::{theme::ColorfulTheme, Input, Select};
+use dialoguer::{theme::ColorfulTheme, Confirm, Input, Select};
 
 use crate::cli::util::{open_store, require_profile};
 use crate::domain::{ModelStatus, RouteCapabilities, RoutingStrategy};
@@ -129,15 +129,41 @@ fn prompt_route_entry(
         .default("1.0".into())
         .interact_text()?;
     let weight: f64 = weight_str.parse().unwrap_or(1.0);
+
+    let capabilities = prompt_capabilities(theme)?;
+
     store.add_route_entry(
         route_id,
         provider.id,
         &model_id,
         priority,
         weight,
-        RouteCapabilities::default(),
+        capabilities,
     )?;
     Ok(Some(model_id))
+}
+
+/// Ask which capabilities the model actually supports so request routing can
+/// skip entries that cannot serve tool/vision/json calls.
+fn prompt_capabilities(theme: &ColorfulTheme) -> Result<RouteCapabilities> {
+    let tools = Confirm::with_theme(theme)
+        .with_prompt("Supports tool / function calling?")
+        .default(false)
+        .interact()?;
+    let vision = Confirm::with_theme(theme)
+        .with_prompt("Supports image (vision) input?")
+        .default(false)
+        .interact()?;
+    let json_mode = Confirm::with_theme(theme)
+        .with_prompt("Supports structured JSON output?")
+        .default(false)
+        .interact()?;
+    Ok(RouteCapabilities {
+        tools,
+        vision,
+        json_mode,
+        max_context: None,
+    })
 }
 
 fn status(store: &crate::storage::Store, route_name: Option<String>) -> Result<()> {

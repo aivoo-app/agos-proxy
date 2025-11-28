@@ -64,6 +64,55 @@ impl RoutingState {
     }
 }
 
+/// What a request actually requires, derived from its body. Entries whose
+/// capabilities can't satisfy the needs are skipped during resolution.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RequestNeeds {
+    /// The request carries tool / function-call definitions.
+    pub tools: bool,
+    /// The request carries image (vision) parts.
+    pub vision: bool,
+    /// The request asks for structured JSON output.
+    pub json_mode: bool,
+}
+
+impl RequestNeeds {
+    /// Infer the needs from a raw OpenAI-compatible request body.
+    pub fn from_body(body: &serde_json::Value) -> Self {
+        let tools = body
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .is_some_and(|a| !a.is_empty());
+        let json_mode = body
+            .pointer("/response_format/type")
+            .and_then(|v| v.as_str())
+            .is_some_and(|t| t == "json_object");
+        let mut vision = false;
+        if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
+            for msg in messages {
+                if msg.get("content").is_some_and(|c| c.is_array()) {
+                    vision = true;
+                    break;
+                }
+            }
+        }
+        Self {
+            tools,
+            vision,
+            json_mode,
+        }
+    }
+
+    /// Whether an entry's capabilities can serve a request with these needs.
+    /// An entry with unknown/unset capabilities is assumed unable; the CLI
+    /// wizard writes explicit flags at creation time.
+    fn satisfies(&self, caps: crate::domain::RouteCapabilities) -> bool {
+        (!self.tools || caps.tools)
+            && (!self.vision || caps.vision)
+            && (!self.json_mode || caps.json_mode)
+    }
+}
+
 /// A resolved target: a specific provider + model to try next.
 #[derive(Debug, Clone)]
 pub struct Target {
@@ -110,6 +159,7 @@ pub fn resolve_targets_with_strategy(
     store: &Store,
     profile_id: &str,
     model: &str,
+    needs: RequestNeeds,
     routing_state: &RoutingState,
 ) -> Result<Vec<Target>> {
     let (proxy_name, route_name) = model
@@ -128,6 +178,7 @@ pub fn resolve_targets_with_strategy(
     let mut targets: Vec<Target> = entries
         .into_iter()
         .filter(|e| matches!(e.status, ModelStatus::Healthy | ModelStatus::Degraded))
+        .filter(|e| needs.satisfies(e.capabilities.clone()))
         .filter_map(|entry| {
             store
                 .get_provider(entry.provider_id)
@@ -201,6 +252,7 @@ mod tests {
     use super::*;
     use crate::domain::{ProviderKind, RoutingStrategy};
     use crate::storage::NewProvider;
+    use crate::translator::content_text;
     use std::collections::BTreeMap;
 
     fn setup() -> (Store, Vec<Target>) {
@@ -319,11 +371,32 @@ mod tests {
         let (store, _route_id) = setup_multi_entry();
         let state = RoutingState::default();
         let profile_id = pid(&store);
-        let first = resolve_targets_with_strategy(&store, &profile_id, "prog/r1", &state).unwrap();
+        let first = resolve_targets_with_strategy(
+            &store,
+            &profile_id,
+            "prog/r1",
+            RequestNeeds::default(),
+            &state,
+        )
+        .unwrap();
         assert_eq!(first[0].provider.name, "p1");
-        let second = resolve_targets_with_strategy(&store, &profile_id, "prog/r1", &state).unwrap();
+        let second = resolve_targets_with_strategy(
+            &store,
+            &profile_id,
+            "prog/r1",
+            RequestNeeds::default(),
+            &state,
+        )
+        .unwrap();
         assert_eq!(second[0].provider.name, "p2");
-        let third = resolve_targets_with_strategy(&store, &profile_id, "prog/r1", &state).unwrap();
+        let third = resolve_targets_with_strategy(
+            &store,
+            &profile_id,
+            "prog/r1",
+            RequestNeeds::default(),
+            &state,
+        )
+        .unwrap();
         assert_eq!(third[0].provider.name, "p1");
     }
 
@@ -375,8 +448,14 @@ mod tests {
         let profile_id = pid(&store);
         let mut heavy_first = 0;
         for _ in 0..200 {
-            let targets =
-                resolve_targets_with_strategy(&store, &profile_id, "prog/r1", &state).unwrap();
+            let targets = resolve_targets_with_strategy(
+                &store,
+                &profile_id,
+                "prog/r1",
+                RequestNeeds::default(),
+                &state,
+            )
+            .unwrap();
             if targets[0].provider.name == "heavy" {
                 heavy_first += 1;
             }
@@ -394,10 +473,98 @@ mod tests {
         let routes = store.list_routes(proxies[0].id).unwrap();
         assert!(!routes.is_empty());
         let state = RoutingState::default();
-        let targets =
-            resolve_targets_with_strategy(&store, &pid(&store), "prog/r1", &state).unwrap();
+        let targets = resolve_targets_with_strategy(
+            &store,
+            &pid(&store),
+            "prog/r1",
+            RequestNeeds::default(),
+            &state,
+        )
+        .unwrap();
         // Even though the route is RoundRobin, the resolver returns both entries.
         assert_eq!(targets.len(), 2);
+    }
+
+    #[test]
+    fn needs_filtering_skips_entries_without_capabilities() {
+        let (store, _route_id) = setup_multi_entry();
+        let profile_id = pid(&store);
+        let state = RoutingState::default();
+
+        // No needs: both entries resolve.
+        let plain = resolve_targets_with_strategy(
+            &store,
+            &profile_id,
+            "prog/r1",
+            RequestNeeds::default(),
+            &state,
+        )
+        .unwrap();
+        assert_eq!(plain.len(), 2);
+
+        // Tools needed: entries without the `tools` capability are skipped.
+        let targets = resolve_targets_with_strategy(
+            &store,
+            &profile_id,
+            "prog/r1",
+            RequestNeeds {
+                tools: true,
+                ..Default::default()
+            },
+            &state,
+        )
+        .unwrap();
+        assert!(targets.is_empty(), "entries lack the tools capability");
+    }
+
+    #[test]
+    fn needs_from_body_detects_tools_vision_and_json() {
+        let tools = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "f"}}]
+        });
+        let n = RequestNeeds::from_body(&tools);
+        assert!(n.tools);
+        assert!(!n.vision);
+        assert!(!n.json_mode);
+
+        let vision = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "what is this"},
+                {"type": "image_url", "image_url": {"url": "https://x/img.png"}}
+            ]}]
+        });
+        let n = RequestNeeds::from_body(&vision);
+        assert!(n.vision);
+        assert!(!n.tools);
+
+        let json = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "json_object"}
+        });
+        assert!(RequestNeeds::from_body(&json).json_mode);
+
+        let plain = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        assert_eq!(RequestNeeds::from_body(&plain), RequestNeeds::default());
+    }
+
+    #[test]
+    fn content_text_joins_text_parts_and_drops_images() {
+        let s = serde_json::json!("plain string");
+        assert_eq!(content_text(&s), "plain string");
+
+        let arr = serde_json::json!([
+            {"type": "text", "text": "line one"},
+            {"type": "image_url", "image_url": {"url": "x"}},
+            {"type": "text", "text": "line two"}
+        ]);
+        assert_eq!(content_text(&arr), "line one\nline two");
     }
 
     #[tokio::test]

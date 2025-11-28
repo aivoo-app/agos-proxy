@@ -10,7 +10,7 @@ use anyhow::{Context as _, Result};
 
 use crate::domain::ProviderKind;
 use crate::router::Target;
-use crate::translator::ChatRequest;
+use crate::translator::{content_text, ChatRequest};
 
 /// Build the upstream URL for a Gemini request. The API key goes in the query
 /// string, so the target's auth token is appended there.
@@ -52,12 +52,12 @@ pub fn translate_request(chat_req: &ChatRequest) -> serde_json::Value {
 
     for msg in &chat_req.messages {
         if msg.role == "system" {
-            system_parts.push(serde_json::json!({ "text": msg.content }));
+            system_parts.push(serde_json::json!({ "text": content_text(&msg.content) }));
             continue;
         }
         contents.push(serde_json::json!({
             "role": gemini_role(&msg.role),
-            "parts": [{ "text": msg.content }],
+            "parts": [{ "text": content_text(&msg.content) }],
         }));
     }
 

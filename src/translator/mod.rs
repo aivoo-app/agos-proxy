@@ -30,7 +30,30 @@ pub struct ChatRequest {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Message {
     pub role: String,
-    pub content: String,
+    /// The message content, kept as raw JSON so the OpenAI-compatible
+    /// passthrough stays lossless. Plain text is a JSON string; multimodal
+    /// requests use the OpenAI parts array (text / image_url entries).
+    pub content: serde_json::Value,
+}
+
+/// Extract the plain-text portion of a message content value. Multimodal
+/// (array) content contributes its `text` parts; image parts are dropped.
+pub fn content_text(content: &serde_json::Value) -> String {
+    match content {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(parts) => parts
+            .iter()
+            .filter_map(|p| {
+                if p.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    p.get("text").and_then(|t| t.as_str()).map(str::to_string)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
 }
 
 /// Build the upstream request for a target: URL, headers, and a body already
