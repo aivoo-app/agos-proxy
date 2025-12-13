@@ -16,6 +16,7 @@
 //! ├── provider  add  list       manage providers for a profile
 //! ├── proxy     create          manage proxies
 //! ├── route     create  status  manage routes and their model chains
+//! ├── chat                      test a proxy/route interactively
 //! └── config    export  import  move a profile setup between machines
 //! ```
 
@@ -24,6 +25,7 @@ use std::path::PathBuf;
 use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
 
+mod chat;
 mod config;
 mod profile;
 mod provider;
@@ -61,6 +63,8 @@ pub enum Command {
     /// Manage routes and their ordered model chains.
     #[command(subcommand)]
     Route(route::RouteArgs),
+    /// Test a proxy/route interactively before wiring up a client.
+    Chat(chat::ChatArgs),
     /// Export or import a profile setup.
     #[command(subcommand)]
     Config(config::ConfigArgs),
@@ -90,6 +94,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Provider(args) => provider::run(args),
         Command::Proxy(args) => proxy::run(args),
         Command::Route(args) => route::run(args),
+        Command::Chat(args) => chat::run(args),
         Command::Config(args) => config::run(args),
         Command::Usage(args) => usage::run(args),
     }
