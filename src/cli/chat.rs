@@ -1,10 +1,11 @@
 //! Interactive chat for testing a configured route against real providers.
 //!
-//! Lets you pick a profile → proxy → route (by selection, or with `--profile`,
-//! `--proxy` and `--route` to skip), then holds an interactive conversation with
-//! it. Each turn is routed exactly like an HTTP request: strategy reordering,
-//! capability filtering and priority failover all apply, so you can validate a
-//! chain before wiring up an OpenAI SDK client.
+//! `agos chat` is a wizard: it presents the configured profiles, proxies and
+//! routes as selectable lists, lets you pick one of each, then opens an
+//! interactive chat session routed through that chain exactly like an HTTP
+//! request. Strategy reordering, capability filtering and priority failover
+//! all apply, so you can validate a chain before wiring up an OpenAI SDK
+//! client.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,52 +22,32 @@ use crate::router::{
 use crate::storage::Store;
 use crate::translator::{content_text, forward_non_streaming, ChatRequest, Message};
 
-/// Arguments for `agos chat`.
+/// Arguments for `agos chat`. None: the command is fully wizard-driven.
 #[derive(Debug, Parser)]
-pub struct ChatArgs {
-    /// Name of the profile to chat through (defaults to the only one).
-    #[arg(long)]
-    profile: Option<String>,
-    /// Name of the proxy to use (prompted if omitted).
-    #[arg(long)]
-    proxy: Option<String>,
-    /// Name of the route to use (prompted if omitted).
-    #[arg(long)]
-    route: Option<String>,
-    /// Per-attempt timeout in seconds before failing over.
-    #[arg(long)]
-    timeout: Option<u32>,
-}
+pub struct ChatArgs;
 
-/// Entry point for `agos chat ...`.
-pub fn run(args: ChatArgs) -> Result<()> {
-    chat(args.profile, args.proxy, args.route, args.timeout)
-}
-
-fn chat(
-    profile: Option<String>,
-    proxy: Option<String>,
-    route: Option<String>,
-    timeout: Option<u32>,
-) -> Result<()> {
+/// Entry point for `agos chat`.
+pub fn run(_args: ChatArgs) -> Result<()> {
     let store = open_store()?;
     let theme = ColorfulTheme::default();
 
-    let profile = resolve_profile(&store, &theme, profile)?;
-    let proxy = pick_proxy(&store, &theme, &profile, proxy)?;
-    let route = pick_route(&store, &theme, &proxy, route)?;
+    let profile = select_profile(&store, &theme)?;
+    let proxy = select_proxy(&store, &theme, &profile)?;
+    let route = select_route(&store, &theme, &proxy)?;
     let model = format!("{}/{}", proxy.name, route.name);
 
-    let attempt_timeout = Duration::from_secs(timeout.unwrap_or(60) as u64);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
         .build()?;
 
-    eprintln!(
-        "Chatting on {model} (profile {:?}, {n} model(s) in chain). Ctrl-D to exit; /help for commands.",
+    println!();
+    println!(
+        "Starting chat on {model} (profile {:?}, {} model(s) in the fallback chain).",
         profile.name,
-        n = store.route_entries(route.id)?.len(),
+        store.route_entries(route.id)?.len()
     );
+    println!("Type /help for commands, or Ctrl-D to exit.");
+    println!();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -78,44 +59,41 @@ fn chat(
             RoutingState::default(),
             profile.id.clone(),
             model,
-            attempt_timeout,
+            Duration::from_secs(60),
         )
         .await
     })?;
     Ok(())
 }
 
-/// Resolve which profile to chat through: an explicit `--profile`, the sole
-/// profile if there is exactly one, or an interactive selection.
-fn resolve_profile(store: &Store, theme: &ColorfulTheme, given: Option<String>) -> Result<Profile> {
+/// Present the configured profiles and let the caller pick one.
+fn select_profile(store: &Store, theme: &ColorfulTheme) -> Result<Profile> {
     let profiles = store.list_profiles()?;
     if profiles.is_empty() {
         bail!("no profiles configured; create one with `agos profile create` first");
     }
-    match given {
-        Some(name) if !name.is_empty() => {
-            let profile = store
-                .get_profile_by_name(&name)?
-                .with_context(|| format!("no profile named {name:?}"))?;
-            Ok(profile)
-        }
-        _ if profiles.len() == 1 => Ok(profiles[0].clone()),
-        _ => {
-            let labels: Vec<String> = profiles.iter().map(|p| p.name.clone()).collect();
-            let idx = Select::with_theme(theme)
-                .with_prompt("Profile")
-                .items(&labels)
-                .interact()?;
-            Ok(profiles[idx].clone())
-        }
-    }
+    let labels: Vec<String> = profiles
+        .iter()
+        .map(|p| {
+            format!(
+                "{} — {}",
+                p.name,
+                p.description.as_deref().unwrap_or("no description")
+            )
+        })
+        .collect();
+    let idx = Select::with_theme(theme)
+        .with_prompt("Choose a profile")
+        .items(&labels)
+        .interact()?;
+    Ok(profiles[idx].clone())
 }
-/// Resolve a proxy under the profile (flag, sole match, or selection).
-fn pick_proxy(
+
+/// Present the proxies under a profile and let the caller pick one.
+fn select_proxy(
     store: &Store,
     theme: &ColorfulTheme,
     profile: &Profile,
-    given: Option<String>,
 ) -> Result<crate::domain::Proxy> {
     let proxies = store.list_proxies(profile.id.as_str())?;
     if proxies.is_empty() {
@@ -124,31 +102,28 @@ fn pick_proxy(
             profile.name
         );
     }
-    match given {
-        Some(name) if !name.is_empty() => store
-            .get_proxy_named(profile.id.as_str(), &name)?
-            .with_context(|| format!("no proxy named {name:?} under {:?}", profile.name)),
-        _ if proxies.len() == 1 => Ok(proxies[0].clone()),
-        _ => {
-            let labels: Vec<String> = proxies
-                .iter()
-                .map(|p| format!("{} ({})", p.name, p.description.as_deref().unwrap_or("-")))
-                .collect();
-            let idx = Select::with_theme(theme)
-                .with_prompt("Proxy")
-                .items(&labels)
-                .interact()?;
-            Ok(proxies[idx].clone())
-        }
-    }
+    let labels: Vec<String> = proxies
+        .iter()
+        .map(|p| {
+            format!(
+                "{} — {}",
+                p.name,
+                p.description.as_deref().unwrap_or("no description")
+            )
+        })
+        .collect();
+    let idx = Select::with_theme(theme)
+        .with_prompt("Choose a proxy (provider)")
+        .items(&labels)
+        .interact()?;
+    Ok(proxies[idx].clone())
 }
 
-/// Resolve a route under the proxy (flag, sole match, or selection).
-fn pick_route(
+/// Present the routes under a proxy and let the caller pick one.
+fn select_route(
     store: &Store,
     theme: &ColorfulTheme,
     proxy: &crate::domain::Proxy,
-    given: Option<String>,
 ) -> Result<crate::domain::Route> {
     let routes = store.list_routes(proxy.id)?;
     if routes.is_empty() {
@@ -157,23 +132,15 @@ fn pick_route(
             proxy.name
         );
     }
-    match given {
-        Some(name) if !name.is_empty() => store
-            .get_route_named(proxy.id, &name)?
-            .with_context(|| format!("no route named {name:?} under proxy {:?}", proxy.name)),
-        _ if routes.len() == 1 => Ok(routes[0].clone()),
-        _ => {
-            let labels: Vec<String> = routes
-                .iter()
-                .map(|r| format!("{} ({:?})", r.name, r.strategy))
-                .collect();
-            let idx = Select::with_theme(theme)
-                .with_prompt("Route")
-                .items(&labels)
-                .interact()?;
-            Ok(routes[idx].clone())
-        }
-    }
+    let labels: Vec<String> = routes
+        .iter()
+        .map(|r| format!("{} ({:?})", r.name, r.strategy))
+        .collect();
+    let idx = Select::with_theme(theme)
+        .with_prompt("Choose a route (model)")
+        .items(&labels)
+        .interact()?;
+    Ok(routes[idx].clone())
 }
 
 /// Turn taken by the REPL after processing one line.
@@ -182,22 +149,6 @@ enum LineOutcome {
     KeepGoing,
     /// Leave the loop.
     Quit,
-}
-
-/// If `text` begins with a `/`, return everything after that leading slash as
-/// an owned string. Returns `None` for ordinary chat lines.
-fn command_word(text: &str) -> Option<String> {
-    let mut it = text.chars();
-    match it.next() {
-        Some('/') => {
-            let mut rest = String::new();
-            for c in it {
-                rest.push(c);
-            }
-            Some(rest)
-        }
-        _ => None,
-    }
 }
 
 /// Run the interactive conversation. History lives in memory for the session.
@@ -212,7 +163,6 @@ async fn chat_session(
     let mut history: Vec<Message> = Vec::new();
     let mut lines = std::io::stdin().lines();
 
-    eprintln!("Session started. Type /help for commands.");
     loop {
         eprint!("you> ");
 
@@ -251,11 +201,11 @@ async fn chat_session(
                 )
                 .await
                 {
-                    Ok(text) => {
-                        println!("{text}");
+                    Ok(reply) => {
+                        println!("assistant> {reply}");
                         history.push(Message {
                             role: "assistant".into(),
-                            content: serde_json::Value::String(text),
+                            content: serde_json::Value::String(reply),
                         });
                     }
                     Err(e) => {
@@ -266,7 +216,7 @@ async fn chat_session(
         }
     }
 
-    eprintln!("Bye. {n} message(s) exchanged.", n = history.len());
+    eprintln!("Bye. {} message(s) exchanged.", history.len());
     Ok(())
 }
 
@@ -281,9 +231,14 @@ async fn send_turn(
     messages: Vec<Message>,
     attempt_timeout: Duration,
 ) -> Result<String> {
-    let targets =
-        resolve_targets_with_strategy(store, profile_id, model, RequestNeeds::default(), routing)
-            .context("resolving route")?;
+    let targets = resolve_targets_with_strategy(
+        store,
+        profile_id,
+        model,
+        RequestNeeds::default(),
+        routing,
+    )
+    .context("resolving route")?;
     if targets.is_empty() {
         bail!(
             "no healthy targets for {model}; check `agos route status` or wait for health recovery"
@@ -297,11 +252,16 @@ async fn send_turn(
         extra: serde_json::Value::Null,
     };
 
-    let bytes: Vec<u8> = execute_with_failover(store.clone(), targets, attempt_timeout, |target| {
-        let client = client.clone();
-        let req = chat_req.clone();
-        async move { forward_non_streaming(&client, &target, &req).await }
-    })
+    let bytes: Vec<u8> = execute_with_failover(
+        store.clone(),
+        targets,
+        attempt_timeout,
+        |target| {
+            let client = client.clone();
+            let req = chat_req.clone();
+            async move { forward_non_streaming(&client, &target, &req).await }
+        },
+    )
     .await?;
 
     // The reply is OpenAI-shaped regardless of which provider actually served it.
@@ -314,6 +274,22 @@ async fn send_turn(
     match content {
         Some(c) => Ok(content_text(c)),
         None => bail!("the provider returned no message content"),
+    }
+}
+
+/// If `text` begins with a `/`, return everything after that leading slash as
+/// an owned string. Returns `None` for ordinary chat lines.
+fn command_word(text: &str) -> Option<String> {
+    let mut it = text.chars();
+    match it.next() {
+        Some('/') => {
+            let mut rest = String::new();
+            for c in it {
+                rest.push(c);
+            }
+            Some(rest)
+        }
+        _ => None,
     }
 }
 
@@ -337,6 +313,7 @@ fn handle_command(rest: &str, history: &mut Vec<Message>) -> LineOutcome {
         LineOutcome::KeepGoing
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,9 +356,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let store = Store::open_in_memory().expect("open store");
-        let profile = store
-            .create_profile("coder1", None, None)
-            .expect("create profile");
+        let profile = store.create_profile("coder1", None, None).expect("create profile");
         store
             .create_provider(
                 &profile.id,
@@ -397,9 +372,7 @@ mod tests {
             .expect("create provider");
         let providers = store.list_providers(&profile.id).expect("list providers");
         let provider = providers[0].clone();
-        let proxy = store
-            .create_proxy(&profile.id, "prog", None)
-            .expect("create proxy");
+        let proxy = store.create_proxy(&profile.id, "prog", None).expect("create proxy");
         let route = store
             .create_route(proxy.id, "r1", None, RoutingStrategy::Priority)
             .expect("create route");
