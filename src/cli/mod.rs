@@ -8,7 +8,7 @@
 //! The command tree:
 //!
 //! ```text
-//! agos
+//! agos-proxy
 //! ├── serve                     start the proxy server
 //! ├── profile                   manage profiles / API tokens
 //! │   ├── create  list  show    ...
@@ -37,7 +37,7 @@ pub mod util;
 /// Top-level entry point parsed from the command line.
 #[derive(Debug, Parser)]
 #[command(
-    name = "agos",
+    name = "agos-proxy",
     version,
     about = "Self-hosted OpenAI-compatible AI gateway with multi-provider failover"
 )]
@@ -74,7 +74,7 @@ pub enum Command {
 }
 
 /// Where AGOS Proxy looks for its working files. Uses the platform config dir
-/// (e.g. `~/.config/agos` on Linux) so nothing is scattered around the cwd.
+/// (e.g. `proxy` on Linux) so nothing is scattered around the cwd.
 pub fn data_dir() -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os("AGOS_HOME") {
         return Ok(PathBuf::from(dir));
@@ -83,7 +83,7 @@ pub fn data_dir() -> Result<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
         .context("cannot determine a home config directory")?;
-    Ok(base.join("agos"))
+    Ok(base.join("agos-proxy"))
 }
 
 /// Dispatch a parsed command line and run it to completion.

@@ -155,7 +155,7 @@ impl Store {
 impl Store {
     /// The default backing-file name inside a given config/home directory.
     pub fn default_path(home: &Path) -> PathBuf {
-        home.join("agos.db")
+        home.join("agos-proxy.db")
     }
 
     /// Open the store at `path`, creating the file and schema if needed.

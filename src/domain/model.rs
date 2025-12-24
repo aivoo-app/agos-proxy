@@ -137,7 +137,7 @@ pub struct RouteCapabilities {
 /// One logged request against a route entry: outcome, latency, and token use.
 ///
 /// Written by the server on every completion attempt (streaming or not) and
-/// surfaced through `agos logs` / `agos stats`.
+/// surfaced through `agos-proxy logs` / `agos-proxy stats`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageRecord {
     pub id: i64,

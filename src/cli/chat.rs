@@ -1,6 +1,6 @@
 //! Interactive chat for testing a configured route against real providers.
 //!
-//! `agos chat` is a wizard: it presents the configured profiles, proxies and
+//! `agos-proxy chat` is a wizard: it presents the configured profiles, proxies and
 //! routes as selectable lists, lets you pick one of each, then opens an
 //! interactive chat session routed through that chain exactly like an HTTP
 //! request. Strategy reordering, capability filtering and priority failover
@@ -22,11 +22,11 @@ use crate::router::{
 use crate::storage::Store;
 use crate::translator::{content_text, forward_non_streaming, ChatRequest, Message};
 
-/// Arguments for `agos chat`. None: the command is fully wizard-driven.
+/// Arguments for `agos-proxy chat`. None: the command is fully wizard-driven.
 #[derive(Debug, Parser)]
 pub struct ChatArgs;
 
-/// Entry point for `agos chat`.
+/// Entry point for `agos-proxy chat`.
 pub fn run(_args: ChatArgs) -> Result<()> {
     let store = open_store()?;
     let theme = ColorfulTheme::default();
@@ -70,7 +70,7 @@ pub fn run(_args: ChatArgs) -> Result<()> {
 fn select_profile(store: &Store, theme: &ColorfulTheme) -> Result<Profile> {
     let profiles = store.list_profiles()?;
     if profiles.is_empty() {
-        bail!("no profiles configured; create one with `agos profile create` first");
+        bail!("no profiles configured; create one with `agos-proxy profile create` first");
     }
     let labels: Vec<String> = profiles
         .iter()
@@ -98,7 +98,7 @@ fn select_proxy(
     let proxies = store.list_proxies(profile.id.as_str())?;
     if proxies.is_empty() {
         bail!(
-            "no proxies configured for {:?}; create one with `agos proxy create` first",
+            "no proxies configured for {:?}; create one with `agos-proxy proxy create` first",
             profile.name
         );
     }
@@ -128,7 +128,7 @@ fn select_route(
     let routes = store.list_routes(proxy.id)?;
     if routes.is_empty() {
         bail!(
-            "no routes under proxy {:?}; create one with `agos route create` first",
+            "no routes under proxy {:?}; create one with `agos-proxy route create` first",
             proxy.name
         );
     }
@@ -241,7 +241,7 @@ async fn send_turn(
     .context("resolving route")?;
     if targets.is_empty() {
         bail!(
-            "no healthy targets for {model}; check `agos route status` or wait for health recovery"
+            "no healthy targets for {model}; check `agos-proxy route status` or wait for health recovery"
         );
     }
 

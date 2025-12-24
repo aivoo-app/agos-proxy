@@ -40,3 +40,7 @@ tower = "0.5.3"
 [profile.release]
 lto = true
 strip = true
+
+[[bin]]
+name = "agos-proxy"
+path = "src/main.rs"

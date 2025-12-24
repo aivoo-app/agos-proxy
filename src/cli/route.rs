@@ -8,7 +8,7 @@ use crate::cli::util::{open_store, require_profile};
 use crate::domain::{ModelStatus, RouteCapabilities, RoutingStrategy};
 use anyhow::Context as _;
 
-/// Subcommands under `agos route`.
+/// Subcommands under `agos-proxy route`.
 #[derive(Debug, Subcommand)]
 pub enum RouteArgs {
     /// Create a new route under a proxy (interactive wizard, or flag-driven).
@@ -25,7 +25,7 @@ pub enum RouteArgs {
     },
 }
 
-/// Entry point for `agos route ...`.
+/// Entry point for `agos-proxy route ...`.
 pub fn run(args: RouteArgs) -> Result<()> {
     let store = open_store()?;
     match args {
@@ -111,7 +111,7 @@ fn prompt_route_entry(
     let providers = store.list_providers(profile.id.as_str())?;
     if providers.is_empty() {
         bail!(
-            "no providers configured for {:?}; add one with `agos provider add` first",
+            "no providers configured for {:?}; add one with `agos-proxy provider add` first",
             profile.name
         );
     }

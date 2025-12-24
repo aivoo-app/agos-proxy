@@ -6,7 +6,7 @@ use dialoguer::{theme::ColorfulTheme, Input};
 
 use crate::cli::util::{open_store, require_profile};
 
-/// Subcommands under `agos usage`.
+/// Subcommands under `agos-proxy usage`.
 #[derive(Debug, Subcommand)]
 pub enum UsageArgs {
     /// Aggregate calls, failures, latency and tokens per model.
@@ -26,7 +26,7 @@ pub enum UsageArgs {
     },
 }
 
-/// Entry point for `agos usage ...`.
+/// Entry point for `agos-proxy usage ...`.
 pub fn run(args: UsageArgs) -> Result<()> {
     let store = open_store()?;
     match args {

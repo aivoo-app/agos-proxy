@@ -7,7 +7,7 @@ use dialoguer::{theme::ColorfulTheme, Confirm, Input};
 use crate::cli::util::{hash_password, open_store};
 use crate::storage::Store;
 
-/// Subcommands under `agos profile`.
+/// Subcommands under `agos-proxy profile`.
 #[derive(Debug, Subcommand)]
 pub enum ProfileArgs {
     /// Create a new profile (interactive wizard, or flag-driven).
@@ -28,7 +28,7 @@ pub enum ProfileArgs {
     Token(TokenArgs),
 }
 
-/// Subcommands under `agos profile token`.
+/// Subcommands under `agos-proxy profile token`.
 #[derive(Debug, Subcommand)]
 pub enum TokenArgs {
     /// Generate a new API token for the profile.
@@ -38,7 +38,7 @@ pub enum TokenArgs {
     },
 }
 
-/// Entry point for `agos profile ...`.
+/// Entry point for `agos-proxy profile ...`.
 pub fn run(args: ProfileArgs) -> Result<()> {
     let store = open_store()?;
     match args {
@@ -87,7 +87,7 @@ fn create(store: &Store, name: Option<String>) -> Result<()> {
 fn list(store: &Store) -> Result<()> {
     let profiles = store.list_profiles()?;
     if profiles.is_empty() {
-        println!("No profiles yet. Create one with `agos profile create`.");
+        println!("No profiles yet. Create one with `agos-proxy profile create`.");
         return Ok(());
     }
     println!("{:<16} {:<20} {}", "TOKEN", "NAME", "DESCRIPTION");

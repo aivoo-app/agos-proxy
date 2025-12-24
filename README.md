@@ -36,8 +36,8 @@ The project is still in active development. Build the binary with:
 cargo build --release
 ```
 
-The CLI entry point is `agos`; `agos serve` starts the proxy server once the
-routing engine and HTTP surface are in place. See `agos --help` for the current
+The CLI entry point is `agos-proxy`; `agos-proxy serve` starts the proxy server once the
+routing engine and HTTP surface are in place. See `agos-proxy --help` for the current
 command tree.
 
 ## Documentation

@@ -18,7 +18,7 @@ use crate::crypto::{self, MasterKey};
 use crate::domain::{ProviderKind, RouteCapabilities, RoutingStrategy};
 use crate::storage::{NewProvider, Store};
 
-/// Subcommands under `agos config`.
+/// Subcommands under `agos-proxy config`.
 #[derive(Debug, Subcommand)]
 pub enum ConfigArgs {
     /// Export a profile's setup (providers, proxies, routes) to a portable file.
@@ -94,7 +94,7 @@ pub struct PortableEntry {
     pub capabilities: RouteCapabilities,
 }
 
-/// Entry point for `agos config ...`.
+/// Entry point for `agos-proxy config ...`.
 pub fn run(args: ConfigArgs) -> Result<()> {
     let store = open_store()?;
     match args {
@@ -235,7 +235,7 @@ pub fn seal_bundle(bundle: &PortableProfile, password: &str) -> Result<PortableF
 /// Open a sealed `PortableFile` with a passphrase.
 pub fn open_bundle(file: &PortableFile, password: &str) -> Result<PortableProfile> {
     if file.format != "agos-profile" {
-        bail!("not an agos profile export (format {:?})", file.format);
+        bail!("not an agos-proxy profile export (format {:?})", file.format);
     }
     if file.version != 1 {
         bail!("unsupported export version {}", file.version);

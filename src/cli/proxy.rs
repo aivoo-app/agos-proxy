@@ -6,7 +6,7 @@ use dialoguer::{theme::ColorfulTheme, Input};
 
 use crate::cli::util::{open_store, require_profile};
 
-/// Subcommands under `agos proxy`.
+/// Subcommands under `agos-proxy proxy`.
 #[derive(Debug, Subcommand)]
 pub enum ProxyArgs {
     /// Create a new proxy under a profile (interactive wizard, or flag-driven).
@@ -17,7 +17,7 @@ pub enum ProxyArgs {
     },
 }
 
-/// Entry point for `agos proxy ...`.
+/// Entry point for `agos-proxy proxy ...`.
 pub fn run(args: ProxyArgs) -> Result<()> {
     let store = open_store()?;
     match args {

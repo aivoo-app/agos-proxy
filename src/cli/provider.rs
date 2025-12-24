@@ -8,7 +8,7 @@ use crate::cli::util::{kind_label, open_store, prompt_headers, require_profile};
 use crate::domain::ProviderKind;
 use crate::storage::NewProvider;
 
-/// Subcommands under `agos provider`.
+/// Subcommands under `agos-proxy provider`.
 #[derive(Debug, Subcommand)]
 pub enum ProviderArgs {
     /// Add a provider to a profile (interactive wizard, or flag-driven).
@@ -25,7 +25,7 @@ pub enum ProviderArgs {
     },
 }
 
-/// Entry point for `agos provider ...`.
+/// Entry point for `agos-proxy provider ...`.
 pub fn run(args: ProviderArgs) -> Result<()> {
     let store = open_store()?;
     match args {
@@ -97,7 +97,7 @@ fn list(store: &crate::storage::Store, profile: Option<String>) -> Result<()> {
     let providers = store.list_providers(profile.id.as_str())?;
     if providers.is_empty() {
         println!(
-            "No providers configured for {:?}. Add one with `agos provider add`.",
+            "No providers configured for {:?}. Add one with `agos-proxy provider add`.",
             profile.name
         );
         return Ok(());
