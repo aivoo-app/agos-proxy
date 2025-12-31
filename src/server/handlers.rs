@@ -6,6 +6,7 @@ use std::time::Duration;
 use axum::body::Bytes;
 use axum::extract::{Request, State};
 use axum::response::Response;
+use futures::StreamExt;
 
 use crate::router::{execute_with_failover, resolve_targets_with_strategy, RoutingState};
 use crate::storage::Store;
@@ -17,6 +18,30 @@ pub struct AppState {
     pub attempt_timeout: Duration,
     pub http_client: reqwest::Client,
     pub routing_state: RoutingState,
+}
+
+/// Legacy OpenAI completions request (non-streaming passthrough).
+#[derive(serde::Deserialize, serde::Serialize, Clone)]
+struct CompletionRequest {
+    model: String,
+    prompt: String,
+    #[serde(default)]
+    max_tokens: Option<u32>,
+    #[serde(default)]
+    temperature: Option<f32>,
+    #[serde(default)]
+    top_p: Option<f32>,
+    #[serde(default)]
+    stream: bool,
+    #[serde(default)]
+    echo: bool,
+}
+
+/// OpenAI embeddings request (passthrough).
+#[derive(serde::Deserialize, serde::Serialize, Clone)]
+struct EmbeddingRequest {
+    model: String,
+    input: serde_json::Value,
 }
 
 pub async fn chat_completions(State(state): State<AppState>, req: Request) -> Response {
@@ -45,16 +70,67 @@ pub async fn chat_completions(State(state): State<AppState>, req: Request) -> Re
     }
 }
 
+/// Handle `/v1/completions` — legacy OpenAI completions API, passthrough
+/// through the routing layer with automatic failover.
+pub async fn completions(State(state): State<AppState>, req: Request) -> Response {
+    let (parts, body) = req.into_parts();
+    let profile_id = match parts.extensions.get::<String>() {
+        Some(id) => id.clone(),
+        None => return bad_request("unauthenticated"),
+    };
+    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(b) => b,
+        Err(e) => return bad_request(format!("failed to read body: {e}")),
+    };
+    let body_value: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(r) => r,
+        Err(e) => return bad_request(format!("invalid request body: {e}")),
+    };
+    let completion_req: CompletionRequest = match serde_json::from_value(body_value.clone()) {
+        Ok(r) => r,
+        Err(e) => return bad_request(format!("invalid request body: {e}")),
+    };
+    if completion_req.stream {
+        handle_completion_streaming(state, profile_id, completion_req).await
+    } else {
+        handle_completion(state, profile_id, completion_req).await
+    }
+}
+
+/// Handle `/v1/embeddings` — OpenAI embeddings API, passthrough
+/// through the routing layer with automatic failover.
+pub async fn embeddings(State(state): State<AppState>, req: Request) -> Response {
+    let (parts, body) = req.into_parts();
+    let profile_id = match parts.extensions.get::<String>() {
+        Some(id) => id.clone(),
+        None => return bad_request("unauthenticated"),
+    };
+    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(b) => b,
+        Err(e) => return bad_request(format!("failed to read body: {e}")),
+    };
+    let body_value: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(r) => r,
+        Err(e) => return bad_request(format!("invalid request body: {e}")),
+    };
+    let embedding_req: EmbeddingRequest = match serde_json::from_value(body_value) {
+        Ok(r) => r,
+        Err(e) => return bad_request(format!("invalid request body: {e}")),
+    };
+    handle_embeddings(state, profile_id, embedding_req).await
+}
+
 async fn handle_non_streaming(
     state: AppState,
     profile_id: String,
     needs: crate::router::RequestNeeds,
     chat_req: ChatRequest,
 ) -> Response {
+    let model = chat_req.model.clone();
     let targets = match resolve_targets_with_strategy(
         &state.store,
         &profile_id,
-        &chat_req.model,
+        &model,
         needs,
         &state.routing_state,
     ) {
@@ -81,6 +157,7 @@ async fn handle_non_streaming(
         },
     )
     .await;
+
     match result {
         Ok(bytes) => Response::builder()
             .status(200)
@@ -88,40 +165,50 @@ async fn handle_non_streaming(
             .body(axum::body::Body::from(bytes))
             .unwrap(),
         Err(e) => {
-            let body = serde_json::json!({ "error": { "message": format!("all providers failed: {e}"), "type": "provider_error" } });
-            axum::response::Response::builder()
+            let status = e
+                .downcast_ref::<crate::translator::ProviderError>()
+                .map(|pe| pe.status.as_u16() as i32);
+            let msg = if let Some(se) = e.downcast_ref::<crate::translator::ProviderError>() {
+                format!("provider returned {}: {}", se.status, se.body)
+            } else {
+                e.to_string()
+            };
+            let resp = serde_json::json!({
+                "error": {
+                    "message": msg,
+                    "type": "provider_error",
+                    "code": status.unwrap_or(502),
+                }
+            });
+            Response::builder()
                 .status(axum::http::StatusCode::BAD_GATEWAY)
                 .header("Content-Type", "application/json")
-                .body(axum::body::Body::from(body.to_string()))
+                .body(axum::body::Body::from(resp.to_string()))
                 .unwrap()
         }
     }
 }
 
-/// Write one usage-log row for a completed attempt. Failures to log are
-/// swallowed — telemetry must never break request handling.
 fn log_attempt(
-    store: &Store,
+    store: &Arc<Store>,
     profile_id: &str,
     target: &crate::router::Target,
     streamed: bool,
-    outcome: &anyhow::Result<Vec<u8>>,
+    outcome: &Result<Vec<u8>, anyhow::Error>,
     latency_ms: i64,
 ) {
     let (success, status_code, error_message, prompt_tokens, completion_tokens) = match outcome {
         Ok(bytes) => {
-            // Best-effort token extraction from the OpenAI-shaped response.
-            let (pt, ct) = serde_json::from_slice::<serde_json::Value>(bytes)
+            let usage = serde_json::from_slice::<serde_json::Value>(bytes)
                 .ok()
-                .and_then(|v| {
-                    let u = v.get("usage")?;
-                    Some((
-                        u.get("prompt_tokens").and_then(|t| t.as_i64()),
-                        u.get("completion_tokens").and_then(|t| t.as_i64()),
-                    ))
+                .and_then(|mut v| {
+                    let usage_obj = v.get_mut("usage")?.as_object()?.clone();
+                    let prompt = usage_obj.get("prompt_tokens").and_then(|t| t.as_i64());
+                    let completion = usage_obj.get("completion_tokens").and_then(|t| t.as_i64());
+                    Some((prompt, completion))
                 })
                 .unwrap_or((None, None));
-            (true, Some(200), None, pt, ct)
+            (true, Some(200), None, usage.0, usage.1)
         }
         Err(e) => {
             let status = e
@@ -178,74 +265,345 @@ async fn handle_streaming(
         };
         for target in targets {
             let req = {
-                let mut r = chat_req.clone();
-                r.stream = true;
-                r
+                let target = target.clone();
+                translate_and_forward_streaming(&client, &target, &chat_req).await
             };
-            let (url, headers, body) = match translator::build_upstream_request(&target, &req, true)
-            {
-                Ok(v) => v,
+            match req {
+                Ok(stream_req) => {
+                    let started = std::time::Instant::now();
+                    let resp =
+                        match tokio::time::timeout(attempt_timeout, client.execute(stream_req))
+                            .await
+                        {
+                            Ok(Ok(r)) => r,
+                            Ok(Err(e)) => {
+                                let _ = tx
+                                    .send(Err(std::io::Error::other(format!(
+                                        "upstream failed: {e}"
+                                    ))))
+                                    .await;
+                                log_attempt(
+                                    &store,
+                                    &profile_id,
+                                    &target,
+                                    true,
+                                    &Err(anyhow::anyhow!("upstream failed: {e}")),
+                                    started.elapsed().as_millis() as i64,
+                                );
+                                continue;
+                            }
+                            Err(_) => {
+                                let _ = tx
+                                    .send(Err(std::io::Error::other("upstream timeout")))
+                                    .await;
+                                log_attempt(
+                                    &store,
+                                    &profile_id,
+                                    &target,
+                                    true,
+                                    &Err(anyhow::anyhow!("upstream timeout")),
+                                    started.elapsed().as_millis() as i64,
+                                );
+                                continue;
+                            }
+                        };
+
+                    if !resp.status().is_success() {
+                        let status = resp.status();
+                        let bytes = resp.bytes().await.unwrap_or_default();
+                        let _ = tx
+                            .send(Err(std::io::Error::other(format!(
+                                "provider returned {}: {}",
+                                status,
+                                String::from_utf8_lossy(&bytes)
+                            ))))
+                            .await;
+                        log_attempt(
+                            &store,
+                            &profile_id,
+                            &target,
+                            true,
+                            &Err(anyhow::anyhow!(
+                                "provider returned {}: {}",
+                                status,
+                                String::from_utf8_lossy(&bytes)
+                            )),
+                            started.elapsed().as_millis() as i64,
+                        );
+                        continue;
+                    }
+
+                    let mut stream = resp.bytes_stream();
+                    while let Some(chunk) = stream.next().await {
+                        match chunk {
+                            Ok(bytes) => {
+                                if tx.send(Ok(bytes)).await.is_err() {
+                                    return;
+                                }
+                            }
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Err(std::io::Error::other(format!("stream error: {e}"))))
+                                    .await;
+                                log_attempt(
+                                    &store,
+                                    &profile_id,
+                                    &target,
+                                    true,
+                                    &Err(anyhow::anyhow!("stream error: {e}")),
+                                    started.elapsed().as_millis() as i64,
+                                );
+                                return;
+                            }
+                        }
+                    }
+
+                    log_attempt(
+                        &store,
+                        &profile_id,
+                        &target,
+                        true,
+                        &Ok(Vec::new()),
+                        started.elapsed().as_millis() as i64,
+                    );
+                    return;
+                }
                 Err(e) => {
-                    tracing::warn!(error = %e, "build upstream failed");
+                    let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
+                    tracing::warn!(err = %e, "translate request failed, trying next");
                     continue;
                 }
-            };
-            let mut rb = client.post(&url);
-            for (k, v) in &headers {
-                rb = rb.header(k, v);
             }
-            let started = std::time::Instant::now();
-            let resp = match tokio::time::timeout(attempt_timeout, rb.json(&body).send()).await {
-                Ok(Ok(r)) if r.status().is_success() => r,
-                Ok(Ok(r)) => {
-                    let status = r.status();
-                    let bytes = r.bytes().await.unwrap_or_default();
-                    log_attempt(
-                        &store,
-                        &profile_id,
-                        &target,
-                        true,
-                        &Err::<Vec<u8>, _>(anyhow::anyhow!(
-                            "provider returned {}: {}",
-                            status,
-                            String::from_utf8_lossy(&bytes)
-                        )),
-                        started.elapsed().as_millis() as i64,
+        }
+        let _ = tx
+            .send(Err(std::io::Error::other("all providers failed")))
+            .await;
+    });
+
+    let body = axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
+    Response::builder()
+        .status(200)
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .body(body)
+        .unwrap()
+}
+
+/// Translate and prepare the streaming request for a target.
+async fn translate_and_forward_streaming(
+    client: &reqwest::Client,
+    target: &crate::router::Target,
+    req: &ChatRequest,
+) -> Result<reqwest::Request, anyhow::Error> {
+    let (url, headers, body) = crate::translator::build_upstream_request(target, req, true)?;
+    let mut request = client.post(&url);
+    for (k, v) in &headers {
+        request = request.header(k, v);
+    }
+    let reqwest_req = request
+        .json(&body)
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build request: {e}"))?;
+    Ok(reqwest_req)
+}
+
+/// Passthrough a non-streaming completions request to the upstream.
+async fn handle_completion(
+    state: AppState,
+    profile_id: String,
+    completion_req: CompletionRequest,
+) -> Response {
+    let targets = match resolve_targets_with_strategy(
+        &state.store,
+        &profile_id,
+        &completion_req.model,
+        crate::router::RequestNeeds::default(),
+        &state.routing_state,
+    ) {
+        Ok(t) if t.is_empty() => return bad_request("no healthy targets for this route"),
+        Ok(t) => t,
+        Err(e) => return bad_request(format!("route resolution failed: {e}")),
+    };
+
+    let result = execute_with_failover(
+        state.store.clone(),
+        targets,
+        state.attempt_timeout,
+        |target| {
+            let client = state.http_client.clone();
+            let req = completion_req.clone();
+            let store = state.store.clone();
+            let profile_id = profile_id.clone();
+            let base = target.provider.base_url.trim_end_matches('/').to_string();
+            async move {
+                let started = std::time::Instant::now();
+                let url = format!("{base}/v1/completions");
+                let mut body = serde_json::to_value(&req).map_err(|e| anyhow::anyhow!("{e}"))?;
+                if let Some(obj) = body.as_object_mut() {
+                    obj.insert(
+                        "model".to_string(),
+                        serde_json::Value::String(target.entry.model_id.clone()),
                     );
-                    tracing::warn!(status = %status, "upstream error");
-                    continue;
                 }
+                let resp = client
+                    .post(&url)
+                    .header(
+                        "Authorization",
+                        format!("Bearer {}", target.provider.auth_token),
+                    )
+                    .header("Content-Type", "application/json")
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("upstream failed: {e}"))?;
+                let status = resp.status();
+                let bytes = resp
+                    .bytes()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("failed to read response: {e}"))?;
+                if !status.is_success() {
+                    return Err(anyhow::anyhow!(
+                        "provider returned {}: {}",
+                        status,
+                        String::from_utf8_lossy(&bytes)
+                    ));
+                }
+                let outcome: Result<Vec<u8>, anyhow::Error> = Ok(bytes.to_vec());
+                log_attempt(
+                    &store,
+                    &profile_id,
+                    &target,
+                    false,
+                    &outcome,
+                    started.elapsed().as_millis() as i64,
+                );
+                outcome
+            }
+        },
+    )
+    .await;
+
+    match result {
+        Ok(bytes) => Response::builder()
+            .status(200)
+            .header("Content-Type", "application/json")
+            .body(axum::body::Body::from(bytes))
+            .unwrap(),
+        Err(e) => bad_request(format!("all providers failed: {e}")),
+    }
+}
+
+/// Streaming passthrough for `/v1/completions` (SSE), with priority failover.
+async fn handle_completion_streaming(
+    state: AppState,
+    profile_id: String,
+    completion_req: CompletionRequest,
+) -> Response {
+    let targets = match resolve_targets_with_strategy(
+        &state.store,
+        &profile_id,
+        &completion_req.model,
+        crate::router::RequestNeeds::default(),
+        &state.routing_state,
+    ) {
+        Ok(t) if t.is_empty() => return bad_request("no healthy targets for this route"),
+        Ok(t) => t,
+        Err(e) => return bad_request(format!("route resolution failed: {e}")),
+    };
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+    let store = state.store.clone();
+    let attempt_timeout = state.attempt_timeout;
+    let client = state.http_client.clone();
+
+    tokio::spawn(async move {
+        for target in targets {
+            let started = std::time::Instant::now();
+            let req = completion_req.clone();
+            let base = target.provider.base_url.trim_end_matches('/');
+            let url = format!("{base}/v1/completions");
+
+            let mut body = serde_json::to_value(&req).unwrap_or(serde_json::Value::Null);
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert(
+                    "model".to_string(),
+                    serde_json::Value::String(target.entry.model_id.clone()),
+                );
+            }
+
+            let resp_result = tokio::time::timeout(
+                attempt_timeout,
+                client
+                    .post(&url)
+                    .header(
+                        "Authorization",
+                        format!("Bearer {}", target.provider.auth_token),
+                    )
+                    .header("Content-Type", "application/json")
+                    .json(&body)
+                    .send(),
+            )
+            .await;
+
+            let resp = match resp_result {
+                Ok(Ok(r)) => r,
                 Ok(Err(e)) => {
+                    let _ = tx
+                        .send(Err(std::io::Error::other(format!("upstream failed: {e}"))))
+                        .await;
                     log_attempt(
                         &store,
                         &profile_id,
                         &target,
                         true,
-                        &Err::<Vec<u8>, _>(anyhow::anyhow!("upstream failed: {e}")),
+                        &Err(anyhow::anyhow!("upstream failed: {e}")),
                         started.elapsed().as_millis() as i64,
                     );
-                    tracing::warn!(error = %e, "upstream failed");
                     continue;
                 }
                 Err(_) => {
-                    tracing::warn!("upstream timed out");
-                    let _ = store.set_route_entry_status(
-                        target.entry.id,
-                        crate::domain::ModelStatus::Unhealthy,
-                    );
+                    let _ = tx
+                        .send(Err(std::io::Error::other("upstream timeout")))
+                        .await;
                     log_attempt(
                         &store,
                         &profile_id,
                         &target,
                         true,
-                        &Err::<Vec<u8>, _>(anyhow::anyhow!("upstream timed out")),
+                        &Err(anyhow::anyhow!("upstream timeout")),
                         started.elapsed().as_millis() as i64,
                     );
                     continue;
                 }
             };
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let bytes = resp.bytes().await.unwrap_or_default();
+                let _ = tx
+                    .send(Err(std::io::Error::other(format!(
+                        "provider returned {}: {}",
+                        status,
+                        String::from_utf8_lossy(&bytes)
+                    ))))
+                    .await;
+                log_attempt(
+                    &store,
+                    &profile_id,
+                    &target,
+                    true,
+                    &Err(anyhow::anyhow!(
+                        "provider returned {}: {}",
+                        status,
+                        String::from_utf8_lossy(&bytes)
+                    )),
+                    started.elapsed().as_millis() as i64,
+                );
+                continue;
+            }
+
             let mut stream = resp.bytes_stream();
-            while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+            while let Some(chunk) = stream.next().await {
                 match chunk {
                     Ok(bytes) => {
                         if tx.send(Ok(bytes)).await.is_err() {
@@ -253,14 +611,14 @@ async fn handle_streaming(
                         }
                     }
                     Err(e) => {
-                        let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
+                        let _ = tx
+                            .send(Err(std::io::Error::other(format!("stream error: {e}"))))
+                            .await;
                         return;
                     }
                 }
             }
-            // Stream completed successfully. Token counts for streamed responses
-            // only appear when the caller asks for stream_options.include_usage,
-            // so we record the latency and leave counts empty.
+
             log_attempt(
                 &store,
                 &profile_id,
@@ -276,7 +634,6 @@ async fn handle_streaming(
             .await;
     });
 
-    // Return the raw byte stream with SSE content type for true passthrough.
     let body = axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
     Response::builder()
         .status(200)
@@ -284,6 +641,93 @@ async fn handle_streaming(
         .header("Cache-Control", "no-cache")
         .body(body)
         .unwrap()
+}
+
+/// Non-streaming passthrough for `/v1/embeddings`: resolve targets with
+/// priority failover, send the request, and return the upstream's JSON verbatim.
+async fn handle_embeddings(
+    state: AppState,
+    profile_id: String,
+    embedding_req: EmbeddingRequest,
+) -> Response {
+    let targets = match resolve_targets_with_strategy(
+        &state.store,
+        &profile_id,
+        &embedding_req.model,
+        crate::router::RequestNeeds::default(),
+        &state.routing_state,
+    ) {
+        Ok(t) if t.is_empty() => return bad_request("no healthy targets for this route"),
+        Ok(t) => t,
+        Err(e) => return bad_request(format!("route resolution failed: {e}")),
+    };
+
+    let result = execute_with_failover(
+        state.store.clone(),
+        targets,
+        state.attempt_timeout,
+        |target| {
+            let client = state.http_client.clone();
+            let req = embedding_req.clone();
+            let store = state.store.clone();
+            let profile_id = profile_id.clone();
+            let base = target.provider.base_url.trim_end_matches('/').to_string();
+            async move {
+                let started = std::time::Instant::now();
+                let url = format!("{base}/v1/embeddings");
+                let mut body = serde_json::to_value(&req).map_err(|e| anyhow::anyhow!("{e}"))?;
+                if let Some(obj) = body.as_object_mut() {
+                    obj.insert(
+                        "model".to_string(),
+                        serde_json::Value::String(target.entry.model_id.clone()),
+                    );
+                }
+                let resp = client
+                    .post(&url)
+                    .header(
+                        "Authorization",
+                        format!("Bearer {}", target.provider.auth_token),
+                    )
+                    .header("Content-Type", "application/json")
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("upstream failed: {e}"))?;
+                let status = resp.status();
+                let bytes = resp
+                    .bytes()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("failed to read response: {e}"))?;
+                if !status.is_success() {
+                    return Err(anyhow::anyhow!(
+                        "provider returned {}: {}",
+                        status,
+                        String::from_utf8_lossy(&bytes)
+                    ));
+                }
+                let outcome: Result<Vec<u8>, anyhow::Error> = Ok(bytes.to_vec());
+                log_attempt(
+                    &store,
+                    &profile_id,
+                    &target,
+                    false,
+                    &outcome,
+                    started.elapsed().as_millis() as i64,
+                );
+                outcome
+            }
+        },
+    )
+    .await;
+
+    match result {
+        Ok(bytes) => Response::builder()
+            .status(200)
+            .header("Content-Type", "application/json")
+            .body(axum::body::Body::from(bytes))
+            .unwrap(),
+        Err(e) => bad_request(format!("all providers failed: {e}")),
+    }
 }
 
 pub async fn list_models(State(state): State<AppState>, req: Request) -> Response {

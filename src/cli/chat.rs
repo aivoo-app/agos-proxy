@@ -231,14 +231,9 @@ async fn send_turn(
     messages: Vec<Message>,
     attempt_timeout: Duration,
 ) -> Result<String> {
-    let targets = resolve_targets_with_strategy(
-        store,
-        profile_id,
-        model,
-        RequestNeeds::default(),
-        routing,
-    )
-    .context("resolving route")?;
+    let targets =
+        resolve_targets_with_strategy(store, profile_id, model, RequestNeeds::default(), routing)
+            .context("resolving route")?;
     if targets.is_empty() {
         bail!(
             "no healthy targets for {model}; check `agos-proxy route status` or wait for health recovery"
@@ -252,16 +247,11 @@ async fn send_turn(
         extra: serde_json::Value::Null,
     };
 
-    let bytes: Vec<u8> = execute_with_failover(
-        store.clone(),
-        targets,
-        attempt_timeout,
-        |target| {
-            let client = client.clone();
-            let req = chat_req.clone();
-            async move { forward_non_streaming(&client, &target, &req).await }
-        },
-    )
+    let bytes: Vec<u8> = execute_with_failover(store.clone(), targets, attempt_timeout, |target| {
+        let client = client.clone();
+        let req = chat_req.clone();
+        async move { forward_non_streaming(&client, &target, &req).await }
+    })
     .await?;
 
     // The reply is OpenAI-shaped regardless of which provider actually served it.
@@ -356,14 +346,16 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let store = Store::open_in_memory().expect("open store");
-        let profile = store.create_profile("coder1", None, None).expect("create profile");
+        let profile = store
+            .create_profile("coder1", None, None)
+            .expect("create profile");
         store
             .create_provider(
                 &profile.id,
                 NewProvider {
                     name: "mock".into(),
                     description: None,
-                    base_url: base.into(),
+                    base_url: base,
                     auth_token: "sk-mock".into(),
                     kind: ProviderKind::OpenAICompatible,
                     extra_headers: BTreeMap::new(),
@@ -372,7 +364,9 @@ mod tests {
             .expect("create provider");
         let providers = store.list_providers(&profile.id).expect("list providers");
         let provider = providers[0].clone();
-        let proxy = store.create_proxy(&profile.id, "prog", None).expect("create proxy");
+        let proxy = store
+            .create_proxy(&profile.id, "prog", None)
+            .expect("create proxy");
         let route = store
             .create_route(proxy.id, "r1", None, RoutingStrategy::Priority)
             .expect("create route");

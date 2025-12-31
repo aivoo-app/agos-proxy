@@ -235,7 +235,10 @@ pub fn seal_bundle(bundle: &PortableProfile, password: &str) -> Result<PortableF
 /// Open a sealed `PortableFile` with a passphrase.
 pub fn open_bundle(file: &PortableFile, password: &str) -> Result<PortableProfile> {
     if file.format != "agos-profile" {
-        bail!("not an agos-proxy profile export (format {:?})", file.format);
+        bail!(
+            "not an agos-proxy profile export (format {:?})",
+            file.format
+        );
     }
     if file.version != 1 {
         bail!("unsupported export version {}", file.version);

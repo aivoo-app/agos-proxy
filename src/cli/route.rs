@@ -197,8 +197,8 @@ fn status(store: &crate::storage::Store, route_name: Option<String>) -> Result<(
         route.name, proxy.name, route.strategy
     );
     println!(
-        "{:<5} {:<6} {:<8} {:<24} {:<24} {}",
-        "PRI", "ID", "STATUS", "MODEL", "PROVIDER", "WEIGHT"
+        "{:<5} {:<6} {:<8} {:<24} {:<24} WEIGHT",
+        "PRI", "ID", "STATUS", "MODEL", "PROVIDER"
     );
     for e in entries {
         let provider = store.get_provider(e.provider_id)?;

@@ -102,7 +102,7 @@ fn list(store: &crate::storage::Store, profile: Option<String>) -> Result<()> {
         );
         return Ok(());
     }
-    println!("{:<16} {:<14} {:<30} {}", "ID", "KIND", "NAME", "BASE URL");
+    println!("{:<16} {:<14} {:<30} BASE URL", "ID", "KIND", "NAME");
     for p in providers {
         println!(
             "{:<16} {:<14} {:<30} {}",

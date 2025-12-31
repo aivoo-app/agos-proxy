@@ -8,6 +8,10 @@ keywords = ["ai", "gateway", "llm", "proxy", "openai"]
 categories = ["command-line-utilities", "network-programming"]
 readme = "README.md"
 
+[[bin]]
+name = "agos-proxy"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = "1"
 async-stream = "0.3.6"
@@ -18,9 +22,6 @@ clap = { version = "4", features = ["derive"] }
 dialoguer = "0.12.0"
 getrandom = "0.4.3"
 reqwest = { version = "0.13.5", features = ["json", "stream"] }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-futures = "0.3"
-rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10.8"
 hex = "0.4.3"
@@ -31,8 +32,12 @@ aead = "0.5.2"
 argon2 = "0.5.3"
 rand = "0.8.5"
 tokio = { version = "1.53.1", features = ["full"] }
-tokio-stream = "0.1.19"
+tokio-stream = { version = "0.1.19", features = ["sync"] }
 tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+clap-markdown = "0.1.5"
+futures = "0.3.31"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 
 [dev-dependencies]
 tower = "0.5.3"
@@ -41,6 +46,3 @@ tower = "0.5.3"
 lto = true
 strip = true
 
-[[bin]]
-name = "agos-proxy"
-path = "src/main.rs"

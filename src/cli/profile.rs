@@ -90,7 +90,7 @@ fn list(store: &Store) -> Result<()> {
         println!("No profiles yet. Create one with `agos-proxy profile create`.");
         return Ok(());
     }
-    println!("{:<16} {:<20} {}", "TOKEN", "NAME", "DESCRIPTION");
+    println!("{:<16} {:<20} DESCRIPTION", "TOKEN", "NAME");
     for p in profiles {
         let desc = p.description.as_deref().unwrap_or("-");
         let token_preview = if p.id.len() > 12 {

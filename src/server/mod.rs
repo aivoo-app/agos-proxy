@@ -1,7 +1,8 @@
 //! The HTTP surface exposed to callers.
 //!
 //! AGOS Proxy speaks the OpenAI-compatible API — `/v1/chat/completions`,
-//! `/v1/models` — so an existing OpenAI SDK client can be pointed at this
+//! `/v1/completions`, `/v1/embeddings`, `/v1/models` — so an existing OpenAI
+//! SDK client can be pointed at this
 //! server unchanged.
 
 use std::sync::Arc;
@@ -39,6 +40,11 @@ pub fn create_app(
             "/v1/chat/completions",
             axum::routing::post(handlers::chat_completions),
         )
+        .route(
+            "/v1/completions",
+            axum::routing::post(handlers::completions),
+        )
+        .route("/v1/embeddings", axum::routing::post(handlers::embeddings))
         .route("/v1/models", axum::routing::get(handlers::list_models))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

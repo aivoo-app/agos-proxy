@@ -219,3 +219,230 @@ mod tests {
         assert_eq!(body["model"], "deepseek-v4-flash");
     }
 }
+
+/// An OpenAI-compatible completions request. Kept flexible with `#[serde(flatten)]`
+/// so unknown provider-specific fields pass through untouched.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CompletionRequest {
+    pub model: String,
+    pub prompt: serde_json::Value,
+    #[serde(default)]
+    pub suffix: Option<String>,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    #[serde(default)]
+    pub n: Option<u32>,
+    #[serde(default)]
+    pub stream: Option<bool>,
+    #[serde(default)]
+    pub logprobs: Option<u32>,
+    #[serde(default)]
+    pub echo: Option<bool>,
+    #[serde(default)]
+    pub stop: Option<serde_json::Value>,
+    #[serde(default)]
+    pub best_of: Option<u32>,
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
+    #[serde(default)]
+    pub frequency_penalty: Option<f32>,
+    #[serde(default)]
+    pub logit_bias: Option<serde_json::Value>,
+    #[serde(default)]
+    pub user: Option<String>,
+    #[serde(flatten)]
+    pub extra: serde_json::Value,
+}
+
+/// A single choice in a completions response.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CompletionChoice {
+    pub text: String,
+    pub index: u32,
+    #[serde(default)]
+    pub logprobs: Option<serde_json::Value>,
+    pub finish_reason: String,
+}
+
+/// Usage stats returned with a completions response.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CompletionUsage {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub total_tokens: u32,
+}
+
+/// An OpenAI-compatible completions response.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CompletionResponse {
+    pub id: String,
+    pub object: String,
+    pub created: u64,
+    pub model: String,
+    pub choices: Vec<CompletionChoice>,
+    pub usage: CompletionUsage,
+}
+
+/// An OpenAI-compatible embeddings request.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EmbeddingRequest {
+    pub model: String,
+    pub input: serde_json::Value,
+    #[serde(default)]
+    pub user: Option<String>,
+    #[serde(flatten)]
+    pub extra: serde_json::Value,
+}
+
+/// A single embedding vector in an embeddings response.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EmbeddingData {
+    pub object: String,
+    pub index: u32,
+    pub embedding: Vec<f32>,
+}
+
+/// Usage stats returned with an embeddings response.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EmbeddingUsage {
+    pub prompt_tokens: u32,
+    pub total_tokens: u32,
+}
+
+/// An OpenAI-compatible embeddings response.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EmbeddingResponse {
+    pub object: String,
+    pub data: Vec<EmbeddingData>,
+    pub model: String,
+    pub usage: EmbeddingUsage,
+}
+
+/// Build the upstream request for a completions target. OpenAI-compatible
+/// providers get a straight passthrough with the route entry's model_id;
+/// other provider kinds are rejected because they do not expose an
+/// OpenAI-compatible completions endpoint.
+pub fn build_completion_upstream_request(
+    target: &Target,
+    req: &CompletionRequest,
+) -> Result<(String, BTreeMap<String, String>, serde_json::Value)> {
+    match target.provider.kind {
+        ProviderKind::OpenAICompatible => {
+            let base = target.provider.base_url.trim_end_matches('/');
+            let url = format!("{base}/v1/completions");
+            let mut headers = target.provider.extra_headers.clone();
+            headers.insert(
+                "Authorization".to_string(),
+                format!("Bearer {}", target.provider.auth_token),
+            );
+            headers.insert("Content-Type".to_string(), "application/json".to_string());
+            let mut body = serde_json::to_value(req)?;
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert(
+                    "model".to_string(),
+                    serde_json::Value::String(target.entry.model_id.clone()),
+                );
+            }
+            Ok((url, headers, body))
+        }
+        kind => Err(anyhow::anyhow!(
+            "completions not supported for provider kind {:?}",
+            kind
+        )),
+    }
+}
+
+/// Build the upstream request for an embeddings target. Same passthrough
+/// approach as completions.
+pub fn build_embedding_upstream_request(
+    target: &Target,
+    req: &EmbeddingRequest,
+) -> Result<(String, BTreeMap<String, String>, serde_json::Value)> {
+    match target.provider.kind {
+        ProviderKind::OpenAICompatible => {
+            let base = target.provider.base_url.trim_end_matches('/');
+            let url = format!("{base}/v1/embeddings");
+            let mut headers = target.provider.extra_headers.clone();
+            headers.insert(
+                "Authorization".to_string(),
+                format!("Bearer {}", target.provider.auth_token),
+            );
+            headers.insert("Content-Type".to_string(), "application/json".to_string());
+            let mut body = serde_json::to_value(req)?;
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert(
+                    "model".to_string(),
+                    serde_json::Value::String(target.entry.model_id.clone()),
+                );
+            }
+            Ok((url, headers, body))
+        }
+        kind => Err(anyhow::anyhow!(
+            "embeddings not supported for provider kind {:?}",
+            kind
+        )),
+    }
+}
+
+/// Forward a non-streaming completions request to a target and return the
+/// raw response bytes. For OpenAI-compatible providers the response is
+/// already in OpenAI format, so no translation is needed.
+pub async fn forward_completion(
+    client: &Client,
+    target: &Target,
+    req: &CompletionRequest,
+) -> Result<Vec<u8>> {
+    let (url, headers, body) = build_completion_upstream_request(target, req)?;
+    let mut request = client.post(&url);
+    for (k, v) in &headers {
+        request = request.header(k, v);
+    }
+    let resp = request
+        .json(&body)
+        .send()
+        .await
+        .context("sending completion request to provider")?;
+    let status = resp.status();
+    let bytes = resp.bytes().await.context("reading provider response")?;
+    if !status.is_success() {
+        return Err(ProviderError {
+            status,
+            body: String::from_utf8_lossy(&bytes).into_owned(),
+        })
+        .context("provider returned an error response");
+    }
+    Ok(bytes.to_vec())
+}
+
+/// Forward a non-streaming embeddings request to a target and return the
+/// raw response bytes.
+pub async fn forward_embedding(
+    client: &Client,
+    target: &Target,
+    req: &EmbeddingRequest,
+) -> Result<Vec<u8>> {
+    let (url, headers, body) = build_embedding_upstream_request(target, req)?;
+    let mut request = client.post(&url);
+    for (k, v) in &headers {
+        request = request.header(k, v);
+    }
+    let resp = request
+        .json(&body)
+        .send()
+        .await
+        .context("sending embedding request to provider")?;
+    let status = resp.status();
+    let bytes = resp.bytes().await.context("reading provider response")?;
+    if !status.is_success() {
+        return Err(ProviderError {
+            status,
+            body: String::from_utf8_lossy(&bytes).into_owned(),
+        })
+        .context("provider returned an error response");
+    }
+    Ok(bytes.to_vec())
+}
