@@ -4,7 +4,7 @@ use anyhow::{bail, Context as _, Result};
 use clap::Subcommand;
 use dialoguer::{theme::ColorfulTheme, Confirm, Input};
 
-use crate::cli::util::{hash_password, open_store};
+use crate::cli::util::{ensure_password_ok, hash_password, open_store};
 use crate::storage::Store;
 
 /// Subcommands under `agos-proxy profile`.
@@ -130,6 +130,7 @@ fn rotate(store: &Store, name: &str) -> Result<()> {
     let profile = store
         .get_profile_by_name(name)?
         .with_context(|| format!("no profile named {name:?}"))?;
+    ensure_password_ok(&profile)?;
     let token = store.rotate_profile_token(&profile.id)?;
     println!("Rotated token for {:?}.", profile.name);
     println!("New API token: {token}");

@@ -4,7 +4,7 @@ use anyhow::Result;
 use clap::Subcommand;
 use dialoguer::{theme::ColorfulTheme, Input};
 
-use crate::cli::util::{open_store, require_profile};
+use crate::cli::util::{ensure_password_ok, open_store, require_profile};
 
 /// Subcommands under `agos-proxy proxy`.
 #[derive(Debug, Subcommand)]
@@ -34,6 +34,7 @@ fn create(store: &crate::storage::Store, profile: Option<String>) -> Result<()> 
             .interact_text()?,
     };
     let profile = require_profile(store, &profile_name)?;
+    ensure_password_ok(&profile)?;
 
     let name: String = Input::<String>::with_theme(&theme)
         .with_prompt("Proxy name (e.g. Programmer)")

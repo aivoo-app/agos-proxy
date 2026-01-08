@@ -4,7 +4,7 @@ use anyhow::{bail, Result};
 use clap::Subcommand;
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, Select};
 
-use crate::cli::util::{open_store, require_profile};
+use crate::cli::util::{ensure_password_ok, open_store, require_profile};
 use crate::domain::{ModelStatus, RouteCapabilities, RoutingStrategy};
 use anyhow::Context as _;
 
@@ -46,6 +46,7 @@ fn create(store: &crate::storage::Store, proxy_name: Option<String>) -> Result<(
         .with_prompt("Owning profile name")
         .interact_text()?;
     let profile = require_profile(store, &profile_name)?;
+    ensure_password_ok(&profile)?;
     let proxy = store
         .get_proxy_named(profile.id.as_str(), &proxy_name)?
         .with_context(|| format!("no proxy named {proxy_name:?} under {:?}", profile.name))?;

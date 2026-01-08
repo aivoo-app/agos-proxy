@@ -13,7 +13,7 @@ use clap::Subcommand;
 use dialoguer::{theme::ColorfulTheme, Input, Password};
 use serde::{Deserialize, Serialize};
 
-use crate::cli::util::{open_store, require_profile};
+use crate::cli::util::{ensure_password_ok, open_store, require_profile};
 use crate::crypto::{self, MasterKey};
 use crate::domain::{ProviderKind, RouteCapabilities, RoutingStrategy};
 use crate::storage::{NewProvider, Store};
@@ -112,6 +112,7 @@ fn export_cmd(store: &Store, profile: Option<String>, output: Option<String>) ->
             .interact_text()?,
     };
     let profile = require_profile(store, &name)?;
+    ensure_password_ok(&profile)?;
 
     let bundle = export_bundle(store, &profile)?;
     let out_path = output.unwrap_or_else(|| format!("{}.agos.json", profile.name));

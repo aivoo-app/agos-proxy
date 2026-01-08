@@ -1,6 +1,6 @@
 //! Shared helpers for the CLI subcommands.
 
-use anyhow::{Context as _, Result};
+use anyhow::{bail, Context as _, Result};
 
 use crate::cli::data_dir;
 use crate::storage::Store;
@@ -23,14 +23,73 @@ pub fn kind_label(kind: &crate::domain::ProviderKind) -> &'static str {
     }
 }
 
-/// Best-effort password hash. MVP stores the plaintext behind a marker; real
-/// argon2 lands with the crypto milestone.
+/// Hash a profile password with Argon2id and a random salt.
+///
+/// The stored form is `argon2id:<salt-hex>:<derived-key-hex>`; verification
+/// re-derives the key from the recorded salt and compares in constant time.
 pub fn hash_password(password: &str) -> Result<String> {
+    use rand::RngCore;
+    let mut salt = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut salt);
+    let key = crate::crypto::derive_key(password, &salt)?;
+    Ok(format!(
+        "argon2id:{}:{}",
+        hex::encode(salt),
+        hex::encode(key)
+    ))
+}
+
+/// Check a candidate password against a stored hash.
+///
+/// Accepts the current `argon2id:` format and the older unsalted `sha256:`
+/// marker hashes so profiles created before the crypto milestone keep working.
+pub fn verify_password(stored: &str, candidate: &str) -> Result<bool> {
     use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(b"agos-password-marker:");
-    hasher.update(password.as_bytes());
-    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
+    if let Some(rest) = stored.strip_prefix("argon2id:") {
+        let (salt_hex, key_hex) = rest.split_once(':').context("malformed argon2 hash")?;
+        let salt = hex::decode(salt_hex).context("bad hash salt")?;
+        let key = crate::crypto::derive_key(candidate, &salt)?;
+        let stored_key = hex::decode(key_hex).context("bad hash digest")?;
+        // Constant-time-ish compare; lengths differ only on tampering.
+        if stored_key.len() != key.len() {
+            return Ok(false);
+        }
+        let diff = stored_key
+            .iter()
+            .zip(key.iter())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b));
+        return Ok(diff == 0);
+    }
+    if let Some(digest_hex) = stored.strip_prefix("sha256:") {
+        let mut hasher = Sha256::new();
+        hasher.update(b"agos-password-marker:");
+        hasher.update(candidate.as_bytes());
+        return Ok(hex::encode(hasher.finalize()) == digest_hex);
+    }
+    bail!("unrecognised password hash format")
+}
+
+/// Gate a management operation on the profile's password.
+///
+/// Profiles without a password pass straight through; protected profiles are
+/// prompted up to three times before the operation is refused.
+pub fn ensure_password_ok(profile: &crate::domain::Profile) -> Result<()> {
+    use dialoguer::{theme::ColorfulTheme, Password};
+    let Some(hash) = profile.password_hash.as_deref() else {
+        return Ok(());
+    };
+    let theme = ColorfulTheme::default();
+    for attempt in 1..=3 {
+        let candidate = Password::with_theme(&theme)
+            .with_prompt(format!("Password for {:?}", profile.name))
+            .interact()
+            .context("reading the profile password")?;
+        if verify_password(hash, &candidate)? {
+            return Ok(());
+        }
+        eprintln!("incorrect password (attempt {attempt} of 3)");
+    }
+    bail!("password check failed; refusing to modify {:?}", profile.name)
 }
 
 /// Find a profile by name, failing clearly if it doesn't exist.
@@ -60,4 +119,42 @@ pub fn prompt_headers() -> Result<std::collections::BTreeMap<String, String>> {
         headers.insert(name, value);
     }
     Ok(headers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn argon2_hash_roundtrips() {
+        let stored = hash_password("s3cret").unwrap();
+        assert!(stored.starts_with("argon2id:"));
+        assert!(verify_password(&stored, "s3cret").unwrap());
+        assert!(!verify_password(&stored, "wrong").unwrap());
+    }
+
+    #[test]
+    fn hashes_are_salted() {
+        let a = hash_password("same").unwrap();
+        let b = hash_password("same").unwrap();
+        assert_ne!(a, b, "same password must produce different hashes");
+        assert!(verify_password(&a, "same").unwrap());
+        assert!(verify_password(&b, "same").unwrap());
+    }
+
+    #[test]
+    fn legacy_sha256_hashes_still_verify() {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"agos-password-marker:");
+        hasher.update(b"oldpw");
+        let legacy = format!("sha256:{}", hex::encode(hasher.finalize()));
+        assert!(verify_password(&legacy, "oldpw").unwrap());
+        assert!(!verify_password(&legacy, "nope").unwrap());
+    }
+
+    #[test]
+    fn unknown_hash_format_is_rejected() {
+        assert!(verify_password("plaintext", "x").is_err());
+    }
 }

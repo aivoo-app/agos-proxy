@@ -4,7 +4,7 @@ use anyhow::Result;
 use clap::Subcommand;
 use dialoguer::{theme::ColorfulTheme, Input, Select};
 
-use crate::cli::util::{kind_label, open_store, prompt_headers, require_profile};
+use crate::cli::util::{ensure_password_ok, kind_label, open_store, prompt_headers, require_profile};
 use crate::domain::ProviderKind;
 use crate::storage::NewProvider;
 
@@ -43,6 +43,7 @@ fn add(store: &crate::storage::Store, profile: Option<String>) -> Result<()> {
             .interact_text()?,
     };
     let profile = require_profile(store, &profile_name)?;
+    ensure_password_ok(&profile)?;
 
     let name: String = Input::<String>::with_theme(&theme)
         .with_prompt("Provider name (e.g. deepseek)")
