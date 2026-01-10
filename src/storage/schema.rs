@@ -19,7 +19,8 @@ pub const SCHEMA: &str = "
         description   TEXT,
         password_hash TEXT,
         created_at    INTEGER NOT NULL,
-        updated_at    INTEGER NOT NULL
+        updated_at    INTEGER NOT NULL,
+        rpm_limit     INTEGER NOT NULL DEFAULT 0
     );
 
     CREATE TABLE IF NOT EXISTS providers (
@@ -82,3 +83,29 @@ pub const SCHEMA: &str = "
     CREATE INDEX IF NOT EXISTS idx_usage_entry   ON usage_log(route_entry_id, created_at);
 
 ";
+
+/// Bring stores created before a given column existed up to date.
+///
+/// `CREATE TABLE IF NOT EXISTS` cannot evolve an existing table, so column
+/// additions are checked and applied one at a time on every open.
+pub fn migrate_columns(conn: &rusqlite::Connection) -> anyhow::Result<()> {
+    ensure_column(conn, "profiles", "rpm_limit", "INTEGER NOT NULL DEFAULT 0")?;
+    Ok(())
+}
+
+fn ensure_column(
+    conn: &rusqlite::Connection,
+    table: &str,
+    column: &str,
+    decl: &str,
+) -> anyhow::Result<()> {
+    let present: bool = conn
+        .prepare(&format!("PRAGMA table_info({table})"))?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .any(|name| name == column);
+    if !present {
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
+    }
+    Ok(())
+}

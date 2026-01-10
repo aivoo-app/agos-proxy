@@ -2,8 +2,9 @@
 //!
 //! AGOS Proxy speaks the OpenAI-compatible API — `/v1/chat/completions`,
 //! `/v1/completions`, `/v1/embeddings`, `/v1/models` — so an existing OpenAI
-//! SDK client can be pointed at this
-//! server unchanged.
+//! SDK client can be pointed at this server unchanged. Requests are
+//! authenticated with the caller profile's bearer token and subject to the
+//! profile's per-minute rate limit when one is set.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,6 +21,7 @@ use crate::storage::Store;
 
 mod auth;
 mod handlers;
+pub mod ratelimit;
 
 pub use handlers::{chat_completions, list_models, AppState};
 
@@ -34,6 +36,7 @@ pub fn create_app(
         attempt_timeout,
         http_client,
         routing_state: RoutingState::default(),
+        rate_limiter: Arc::new(ratelimit::RateLimiter::new()),
     };
     Router::new()
         .route(

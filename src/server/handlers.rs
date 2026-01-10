@@ -18,6 +18,7 @@ pub struct AppState {
     pub attempt_timeout: Duration,
     pub http_client: reqwest::Client,
     pub routing_state: RoutingState,
+    pub rate_limiter: Arc<crate::server::ratelimit::RateLimiter>,
 }
 
 /// Legacy OpenAI completions request (non-streaming passthrough).

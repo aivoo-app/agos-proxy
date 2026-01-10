@@ -4,7 +4,9 @@ use anyhow::Result;
 use clap::Subcommand;
 use dialoguer::{theme::ColorfulTheme, Input, Select};
 
-use crate::cli::util::{ensure_password_ok, kind_label, open_store, prompt_headers, require_profile};
+use crate::cli::util::{
+    ensure_password_ok, kind_label, open_store, prompt_headers, require_profile,
+};
 use crate::domain::ProviderKind;
 use crate::storage::NewProvider;
 

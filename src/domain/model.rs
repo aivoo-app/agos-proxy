@@ -25,6 +25,8 @@ pub struct Profile {
     pub password_hash: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    /// Requests-per-minute ceiling for API callers; 0 means unlimited.
+    pub rpm_limit: i64,
 }
 
 /// What wire format a provider speaks. AGOS Proxy uses this to pick a request

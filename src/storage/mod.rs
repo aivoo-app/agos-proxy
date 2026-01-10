@@ -163,6 +163,7 @@ impl Store {
         let conn = Connection::open(&path).context("opening the database file")?;
         conn.execute_batch(schema::SCHEMA)
             .context("applying the database schema")?;
+        schema::migrate_columns(&conn).context("migrating the database schema")?;
         let store = Store {
             conn: Mutex::new(conn),
             path,
@@ -176,6 +177,7 @@ impl Store {
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(schema::SCHEMA)?;
+        schema::migrate_columns(&conn)?;
         let store = Store {
             conn: Mutex::new(conn),
             path: PathBuf::from(":memory:"),
@@ -257,6 +259,7 @@ impl Store {
             password_hash: password_hash.map(|p| p.to_string()),
             created_at: now,
             updated_at: now,
+            rpm_limit: 0,
         })
     }
 
@@ -264,7 +267,7 @@ impl Store {
     pub fn list_profiles(&self) -> Result<Vec<Profile>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, password_hash, created_at, updated_at
+            "SELECT id, name, description, password_hash, created_at, updated_at, rpm_limit
                  FROM profiles ORDER BY name",
         )?;
         let rows = stmt.query_map((), |row| {
@@ -275,6 +278,7 @@ impl Store {
                 password_hash: row.get(3)?,
                 created_at: row.get(4)?,
                 updated_at: row.get(5)?,
+                rpm_limit: row.get(6)?,
             })
         })?;
         let mut out = Vec::new();
@@ -287,7 +291,7 @@ impl Store {
     /// Look up a profile by its id/token.
     pub fn get_profile_by_id(&self, id: &str) -> Result<Option<Profile>> {
         Ok(self.conn().query_one::<Option<Profile>, _, _>(
-            "SELECT id, name, description, password_hash, created_at, updated_at
+            "SELECT id, name, description, password_hash, created_at, updated_at, rpm_limit
              FROM profiles WHERE id = ?1",
             (id,),
             |row| {
@@ -298,6 +302,7 @@ impl Store {
                     password_hash: row.get(3)?,
                     created_at: row.get(4)?,
                     updated_at: row.get(5)?,
+                    rpm_limit: row.get(6)?,
                 }))
             },
         )?)
@@ -307,7 +312,7 @@ impl Store {
     pub fn get_profile_by_name(&self, name: &str) -> Result<Option<Profile>> {
         self.conn()
             .query_row(
-                "SELECT id, name, description, password_hash, created_at, updated_at
+                "SELECT id, name, description, password_hash, created_at, updated_at, rpm_limit
              FROM profiles WHERE name = ?1",
                 (name,),
                 |row| {
@@ -318,6 +323,7 @@ impl Store {
                         password_hash: row.get(3)?,
                         created_at: row.get(4)?,
                         updated_at: row.get(5)?,
+                        rpm_limit: row.get(6)?,
                     })
                 },
             )
@@ -348,6 +354,21 @@ impl Store {
             bail!("no profile matches id {id:?}");
         }
         Ok(new_token)
+    }
+
+    /// Set the requests-per-minute ceiling for a profile (0 = unlimited).
+    pub fn set_profile_rpm_limit(&self, id: &str, rpm_limit: i64) -> Result<()> {
+        let changed = self
+            .conn()
+            .execute(
+                "UPDATE profiles SET rpm_limit = ?1, updated_at = ?2 WHERE id = ?3",
+                (rpm_limit, now_millis(), id),
+            )
+            .context("updating the profile rpm limit")?;
+        if changed == 0 {
+            bail!("no profile matches id {id:?}");
+        }
+        Ok(())
     }
 
     // --- providers ----------------------------------------------------------
@@ -867,6 +888,36 @@ impl Store {
 mod tests {
     use super::*;
     use crate::domain::{ProviderKind, RoutingStrategy};
+
+    #[test]
+    fn rpm_limit_roundtrip_and_unknown_profile() -> Result<()> {
+        let store = Store::open_in_memory()?;
+
+        // Fresh profiles start unlimited.
+        let profile = store.create_profile("lim", None, None)?;
+        assert_eq!(profile.rpm_limit, 0);
+        assert_eq!(store.get_profile_by_name("lim")?.unwrap().rpm_limit, 0);
+
+        // Setting a limit is visible through every read path.
+        store.set_profile_rpm_limit(profile.id.as_str(), 120)?;
+        assert_eq!(store.get_profile_by_name("lim")?.unwrap().rpm_limit, 120);
+        assert_eq!(
+            store
+                .get_profile_by_id(profile.id.as_str())?
+                .unwrap()
+                .rpm_limit,
+            120
+        );
+        assert_eq!(store.list_profiles()?[0].rpm_limit, 120);
+
+        // Back to unlimited.
+        store.set_profile_rpm_limit(profile.id.as_str(), 0)?;
+        assert_eq!(store.get_profile_by_name("lim")?.unwrap().rpm_limit, 0);
+
+        // Unknown ids are rejected rather than silently ignored.
+        assert!(store.set_profile_rpm_limit("no-such-id", 10).is_err());
+        Ok(())
+    }
 
     #[test]
     fn profile_and_provider_roundtrip() -> Result<()> {

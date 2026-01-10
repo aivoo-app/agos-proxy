@@ -2,7 +2,8 @@
 //!
 //! The caller presents their profile token as a bearer token. On success the
 //! profile id is stashed in request extensions so handlers can scope their
-//! lookups.
+//! lookups, and the profile's per-minute rate limit — when one is set — is
+//! enforced with a 429 reply before the request reaches any handler.
 
 use axum::extract::{Request, State};
 use axum::middleware::Next;
@@ -22,16 +23,32 @@ pub async fn auth_middleware(
         .and_then(|h| h.strip_prefix("Bearer "))
         .map(String::from);
 
-    match token {
-        Some(token)
-            if state
-                .store
-                .get_profile_by_id(&token)
-                .ok()
-                .flatten()
-                .is_some() =>
-        {
-            request.extensions_mut().insert(token);
+    let profile = token
+        .as_ref()
+        .and_then(|t| state.store.get_profile_by_id(t).ok().flatten());
+
+    match profile {
+        Some(profile) => {
+            if profile.rpm_limit > 0 && !state.rate_limiter.check(&profile.id, profile.rpm_limit) {
+                let body = serde_json::json!({
+                    "error": {
+                        "message": format!(
+                            "rate limit exceeded: {} requests per minute for this profile",
+                            profile.rpm_limit
+                        ),
+                        "type": "rate_limit_error",
+                    }
+                });
+                return axum::response::Response::builder()
+                    .status(axum::http::StatusCode::TOO_MANY_REQUESTS)
+                    .header("Content-Type", "application/json")
+                    .header("Retry-After", "60")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap();
+            }
+            request
+                .extensions_mut()
+                .insert(token.expect("token present"));
             next.run(request).await
         }
         _ => {

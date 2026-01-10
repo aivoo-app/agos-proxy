@@ -89,7 +89,10 @@ pub fn ensure_password_ok(profile: &crate::domain::Profile) -> Result<()> {
         }
         eprintln!("incorrect password (attempt {attempt} of 3)");
     }
-    bail!("password check failed; refusing to modify {:?}", profile.name)
+    bail!(
+        "password check failed; refusing to modify {:?}",
+        profile.name
+    )
 }
 
 /// Find a profile by name, failing clearly if it doesn't exist.

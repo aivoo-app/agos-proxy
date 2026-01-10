@@ -26,6 +26,13 @@ pub enum ProfileArgs {
     /// Manage a profile's API token.
     #[command(subcommand)]
     Token(TokenArgs),
+    /// View or change a profile's requests-per-minute limit (0 = unlimited).
+    Limit {
+        /// Name of the profile.
+        name: String,
+        /// New requests-per-minute ceiling; omit to just show the current one.
+        rpm: Option<i64>,
+    },
 }
 
 /// Subcommands under `agos-proxy profile token`.
@@ -46,6 +53,7 @@ pub fn run(args: ProfileArgs) -> Result<()> {
         ProfileArgs::List => list(&store),
         ProfileArgs::Show { name } => show(&store, &name),
         ProfileArgs::Token(TokenArgs::Rotate { name }) => rotate(&store, &name),
+        ProfileArgs::Limit { name, rpm } => limit(&store, &name, rpm),
     }
 }
 
@@ -77,7 +85,22 @@ fn create(store: &Store, name: Option<String>) -> Result<()> {
     } else {
         None
     };
+    let wants_limit = Confirm::with_theme(&theme)
+        .with_prompt("Limit API requests per minute? (rate limiting)")
+        .default(false)
+        .interact()?;
+    let rpm_limit = if wants_limit {
+        Input::<i64>::with_theme(&theme)
+            .with_prompt("Requests per minute")
+            .default(60)
+            .interact()?
+    } else {
+        0
+    };
     let profile = store.create_profile(&name, description.as_deref(), password_hash.as_deref())?;
+    if rpm_limit > 0 {
+        store.set_profile_rpm_limit(&profile.id, rpm_limit)?;
+    }
     println!("Created profile {:?}.", profile.name);
     println!("API token: {}", profile.id);
     println!("Store: {}", store.path().display());
@@ -90,7 +113,7 @@ fn list(store: &Store) -> Result<()> {
         println!("No profiles yet. Create one with `agos-proxy profile create`.");
         return Ok(());
     }
-    println!("{:<16} {:<20} DESCRIPTION", "TOKEN", "NAME");
+    println!("{:<16} {:<20} {:<24} DESCRIPTION", "TOKEN", "NAME", "LIMIT");
     for p in profiles {
         let desc = p.description.as_deref().unwrap_or("-");
         let token_preview = if p.id.len() > 12 {
@@ -98,7 +121,15 @@ fn list(store: &Store) -> Result<()> {
         } else {
             p.id.clone()
         };
-        println!("{:<16} {:<20} {}", token_preview, p.name, desc);
+        let limit = if p.rpm_limit > 0 {
+            format!("{} rpm", p.rpm_limit)
+        } else {
+            "unlimited".to_string()
+        };
+        println!(
+            "{:<16} {:<20} {:<24} {}",
+            token_preview, p.name, limit, desc
+        );
     }
     Ok(())
 }
@@ -112,6 +143,14 @@ fn show(store: &Store, name: &str) -> Result<()> {
     println!(
         "  description: {}",
         profile.description.as_deref().unwrap_or("-")
+    );
+    println!(
+        "  rate limit:  {}",
+        if profile.rpm_limit > 0 {
+            format!("{} req/min", profile.rpm_limit)
+        } else {
+            "unlimited".to_string()
+        }
     );
     println!(
         "  password:    {}",
@@ -134,5 +173,34 @@ fn rotate(store: &Store, name: &str) -> Result<()> {
     let token = store.rotate_profile_token(&profile.id)?;
     println!("Rotated token for {:?}.", profile.name);
     println!("New API token: {token}");
+    Ok(())
+}
+
+fn limit(store: &Store, name: &str, rpm: Option<i64>) -> Result<()> {
+    let profile = store
+        .get_profile_by_name(name)?
+        .with_context(|| format!("no profile named {name:?}"))?;
+    let current = if profile.rpm_limit > 0 {
+        format!("{} req/min", profile.rpm_limit)
+    } else {
+        "unlimited".to_string()
+    };
+    match rpm {
+        None => {
+            println!("Rate limit for {:?}: {current}", profile.name);
+        }
+        Some(rpm) => {
+            if rpm < 0 {
+                bail!("the requests-per-minute limit cannot be negative");
+            }
+            store.set_profile_rpm_limit(&profile.id, rpm)?;
+            let updated = if rpm == 0 {
+                "unlimited".to_string()
+            } else {
+                format!("{rpm} req/min")
+            };
+            println!("Rate limit for {:?}: {current} -> {updated}", profile.name);
+        }
+    }
     Ok(())
 }
