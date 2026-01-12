@@ -1,0 +1,6 @@
+# Tiny mock OpenAI-compatible upstream for testing AGOS Proxy end to end.
+FROM python:3.12-alpine
+WORKDIR /app
+COPY mock.py .
+EXPOSE 9999
+CMD ["python", "mock.py"]

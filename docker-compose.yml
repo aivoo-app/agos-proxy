@@ -1,0 +1,41 @@
+services:
+  mock:
+    image: agos-mock-upstream
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.mock
+    ports:
+      - "9999:9999"
+
+  proxy:
+    image: agos-proxy
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      - mock
+    ports:
+      - "8080:8080"
+    volumes:
+      - agos-data:/data
+    environment:
+      # Written on first run to seed the profile tree; delete the volume to re-seed.
+      AGOS_SETUP: |
+        {
+          "profile": "docker-tenant",
+          "description": "created by docker compose",
+          "providers": [
+            {"name": "mock", "base_url": "http://mock:9999", "auth_token": "sk-mock", "kind": "openai_compatible"}
+          ],
+          "proxies": [
+            {"name": "main", "routes": [
+              {"name": "chat", "models": [
+                {"provider": "mock", "model": "mock-model"}
+              ]}
+            ]}
+          ]
+        }
+    command: ["serve", "--bind", "0.0.0.0:8080"]
+
+volumes:
+  agos-data:

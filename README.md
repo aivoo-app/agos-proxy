@@ -40,6 +40,33 @@ The CLI entry point is `agos-proxy`; `agos-proxy serve` starts the proxy server 
 routing engine and HTTP surface are in place. See `agos-proxy --help` for the current
 command tree.
 
+## Docker test environment
+
+A self-contained stack for trying the proxy without touching your machine:
+
+```sh
+docker compose up -d          # builds the proxy + a mock OpenAI upstream
+```
+
+Compose seeds the store on first run (see `AGOS_SETUP` in
+`docker-compose.yml`) and the freshly minted bearer token is printed to the
+proxy container log:
+
+```sh
+docker compose logs proxy | grep -A1 'API token'
+
+# point any OpenAI SDK or curl at it
+curl -H "Authorization: Bearer <token>" \
+     -H 'Content-Type: application/json' \
+     localhost:8080/v1/chat/completions \
+     -d '{"model":"main/chat","messages":[{"role":"user","content":"hi"}]}'
+```
+
+`docker/mock.py` answers chat (streaming and plain), completions and
+embeddings, so failover, SSE passthrough and usage logging can be exercised
+without a real provider key. Wipe state with
+`docker compose down && docker volume rm agos-proxy_agos-data`.
+
 ## Documentation
 
 - Architecture and data model live under `docs/`.

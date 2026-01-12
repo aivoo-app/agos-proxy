@@ -25,6 +25,7 @@ use std::path::PathBuf;
 use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
 
+mod bootstrap;
 mod chat;
 mod config;
 mod profile;
@@ -50,7 +51,11 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Start the proxy server.
-    Serve,
+    Serve {
+        /// Address to bind, e.g. 0.0.0.0:8080.
+        #[arg(long, default_value = "127.0.0.1:3000")]
+        bind: String,
+    },
     /// Manage profiles (tenants) and their API tokens.
     #[command(subcommand)]
     Profile(profile::ProfileArgs),
@@ -71,6 +76,9 @@ pub enum Command {
     /// Show per-request usage logs and aggregates for a profile.
     #[command(subcommand)]
     Usage(usage::UsageArgs),
+    /// Seed a profile setup non-interactively from a JSON document.
+    #[command(subcommand)]
+    Bootstrap(bootstrap::BootstrapArgs),
 }
 
 /// Where AGOS Proxy looks for its working files. Uses the platform config dir
@@ -89,7 +97,7 @@ pub fn data_dir() -> Result<PathBuf> {
 /// Dispatch a parsed command line and run it to completion.
 pub fn run(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::Serve => server_command(),
+        Command::Serve { bind } => server_command(&bind),
         Command::Profile(args) => profile::run(args),
         Command::Provider(args) => provider::run(args),
         Command::Proxy(args) => proxy::run(args),
@@ -97,15 +105,17 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Chat(args) => chat::run(args),
         Command::Config(args) => config::run(args),
         Command::Usage(args) => usage::run(args),
+        Command::Bootstrap(args) => bootstrap::run(args),
     }
 }
 
-fn server_command() -> Result<()> {
+fn server_command(bind: &str) -> Result<()> {
     // The runtime is intentionally small: open the store, build the router, and
     // hand off to tokio. All the interesting work happens inside the handlers.
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(async { crate::server::serve("127.0.0.1:3000").await })?;
+    let addr = bind.to_string();
+    rt.block_on(async move { crate::server::serve(&addr).await })?;
     Ok(())
 }

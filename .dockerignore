@@ -1,0 +1,7 @@
+target/
+.git/
+plan/
+docs/
+*.md
+docker/*
+!docker/entrypoint.sh
