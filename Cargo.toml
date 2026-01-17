@@ -12,6 +12,19 @@ readme = "README.md"
 name = "agos-proxy"
 path = "src/main.rs"
 
+# Developer-only generator for man pages + shell completions + CLI markdown.
+# Not installed by `cargo install`; run it explicitly when cutting a release:
+#   cargo run --release --bin gen-docs
+[[bin]]
+name = "gen-docs"
+path = "src/bin/gen-docs.rs"
+required-features = ["gen-docs"]
+
+[features]
+default = []
+# Enables the gen-docs binary (pulls in clap_mangen + clap_complete).
+gen-docs = ["clap_mangen", "clap_complete"]
+
 [dependencies]
 anyhow = "1"
 async-stream = "0.3.6"
@@ -38,6 +51,8 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 clap-markdown = "0.1.5"
 futures = "0.3.31"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+clap_mangen = { version = "0.3.3", optional = true }
+clap_complete = { version = "4.6.9", optional = true }
 
 [dev-dependencies]
 tower = "0.5.3"
