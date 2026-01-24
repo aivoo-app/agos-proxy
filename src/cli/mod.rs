@@ -17,6 +17,7 @@
 //! ├── proxy     create          manage proxies
 //! ├── route     create  status  manage routes and their model chains
 //! ├── chat                      test a proxy/route interactively
+//! ├── setup                     guided terminal setup wizard
 //! └── config    export  import  move a profile setup between machines
 //! ```
 
@@ -32,6 +33,7 @@ mod profile;
 mod provider;
 mod proxy;
 mod route;
+mod setup;
 mod usage;
 pub mod util;
 
@@ -79,6 +81,8 @@ pub enum Command {
     /// Seed a profile setup non-interactively from a JSON document.
     #[command(subcommand)]
     Bootstrap(bootstrap::BootstrapArgs),
+    /// Guided terminal setup wizard: profile -> providers -> proxies -> routes.
+    Setup(setup::SetupArgs),
 }
 
 /// Where AGOS Proxy looks for its working files. Uses the platform config dir
@@ -106,6 +110,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Config(args) => config::run(args),
         Command::Usage(args) => usage::run(args),
         Command::Bootstrap(args) => bootstrap::run(args),
+        Command::Setup(args) => setup::run(args),
     }
 }
 
