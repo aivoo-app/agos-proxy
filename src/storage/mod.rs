@@ -290,22 +290,24 @@ impl Store {
 
     /// Look up a profile by its id/token.
     pub fn get_profile_by_id(&self, id: &str) -> Result<Option<Profile>> {
-        Ok(self.conn().query_one::<Option<Profile>, _, _>(
-            "SELECT id, name, description, password_hash, created_at, updated_at, rpm_limit
-             FROM profiles WHERE id = ?1",
-            (id,),
-            |row| {
-                Ok(Some(Profile {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    description: row.get(2)?,
-                    password_hash: row.get(3)?,
-                    created_at: row.get(4)?,
-                    updated_at: row.get(5)?,
-                    rpm_limit: row.get(6)?,
-                }))
-            },
-        )?)
+        self.conn()
+            .query_row(
+                "SELECT id, name, description, password_hash, created_at, updated_at, rpm_limit\n             FROM profiles WHERE id = ?1",
+                (id,),
+                |row| {
+                    Ok(Profile {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        description: row.get(2)?,
+                        password_hash: row.get(3)?,
+                        created_at: row.get(4)?,
+                        updated_at: row.get(5)?,
+                        rpm_limit: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| e.into())
     }
 
     /// Look up a profile by its display name.
@@ -544,34 +546,40 @@ impl Store {
 
     /// Find a proxy by id.
     pub fn get_proxy(&self, id: i64) -> Result<Option<Proxy>> {
-        Ok(self.conn().query_one::<Option<Proxy>, _, _>(
-            "SELECT id, profile_id, name, description FROM proxies WHERE id = ?1",
-            (id,),
-            |row| {
-                Ok(Some(Proxy {
-                    id: row.get(0)?,
-                    profile_id: row.get(1)?,
-                    name: row.get(2)?,
-                    description: row.get(3)?,
-                }))
-            },
-        )?)
+        self.conn()
+            .query_row(
+                "SELECT id, profile_id, name, description FROM proxies WHERE id = ?1",
+                (id,),
+                |row| {
+                    Ok(Proxy {
+                        id: row.get(0)?,
+                        profile_id: row.get(1)?,
+                        name: row.get(2)?,
+                        description: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| e.into())
     }
 
     /// Find a proxy within a profile by name.
     pub fn get_proxy_named(&self, profile_id: &str, name: &str) -> Result<Option<Proxy>> {
-        Ok(self.conn().query_one::<Option<Proxy>, _, _>(
-            "SELECT id, profile_id, name, description FROM proxies WHERE profile_id = ?1 AND name = ?2",
-            (profile_id, name),
-            |row| {
-                Ok(Some(Proxy {
-                    id: row.get(0)?,
-                    profile_id: row.get(1)?,
-                    name: row.get(2)?,
-                    description: row.get(3)?,
-                }))
-            },
-        )?)
+        self.conn()
+            .query_row(
+                "SELECT id, profile_id, name, description FROM proxies WHERE profile_id = ?1 AND name = ?2",
+                (profile_id, name),
+                |row| {
+                    Ok(Proxy {
+                        id: row.get(0)?,
+                        profile_id: row.get(1)?,
+                        name: row.get(2)?,
+                        description: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| e.into())
     }
 
     /// Create a route under a proxy.
@@ -622,20 +630,23 @@ impl Store {
 
     /// Find a route within a proxy by name.
     pub fn get_route_named(&self, proxy_id: i64, name: &str) -> Result<Option<Route>> {
-        Ok(self.conn().query_one::<Option<Route>, _, _>(
-            "SELECT id, proxy_id, name, description, strategy FROM routes WHERE proxy_id = ?1 AND name = ?2",
-            (proxy_id, name),
-            |row| {
-                let strat_tag: String = row.get(4)?;
-                Ok(Some(Route {
-                    id: row.get(0)?,
-                    proxy_id: row.get(1)?,
-                    name: row.get(2)?,
-                    description: row.get(3)?,
-                    strategy: strategy_from_tag(&strat_tag).expect("invalid strategy in store"),
-                }))
-            },
-        )?)
+        self.conn()
+            .query_row(
+                "SELECT id, proxy_id, name, description, strategy FROM routes WHERE proxy_id = ?1 AND name = ?2",
+                (proxy_id, name),
+                |row| {
+                    let strat_tag: String = row.get(4)?;
+                    Ok(Route {
+                        id: row.get(0)?,
+                        proxy_id: row.get(1)?,
+                        name: row.get(2)?,
+                        description: row.get(3)?,
+                        strategy: strategy_from_tag(&strat_tag).expect("invalid strategy in store"),
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| e.into())
     }
 
     /// Append a model to a route's fallback chain.
