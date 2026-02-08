@@ -373,6 +373,66 @@ impl Store {
         Ok(())
     }
 
+    /// Rename a profile.
+    pub fn rename_profile(&self, id: &str, new_name: &str) -> Result<()> {
+        let changed = self
+            .conn()
+            .execute(
+                "UPDATE profiles SET name = ?1, updated_at = ?2 WHERE id = ?3",
+                (new_name, now_millis(), id),
+            )
+            .context("renaming the profile")?;
+        if changed == 0 {
+            bail!("no profile matches id {id:?}");
+        }
+        Ok(())
+    }
+
+    /// Set (or clear) a profile's free-text description.
+    pub fn set_profile_description(&self, id: &str, description: Option<&str>) -> Result<()> {
+        let changed = self
+            .conn()
+            .execute(
+                "UPDATE profiles SET description = ?1, updated_at = ?2 WHERE id = ?3",
+                (description, now_millis(), id),
+            )
+            .context("updating the profile description")?;
+        if changed == 0 {
+            bail!("no profile matches id {id:?}");
+        }
+        Ok(())
+    }
+
+    /// Set a profile's Argon2 password hash.
+    pub fn set_profile_password(&self, id: &str, hash: &str) -> Result<()> {
+        let changed = self
+            .conn()
+            .execute(
+                "UPDATE profiles SET password_hash = ?1, updated_at = ?2 WHERE id = ?3",
+                (hash, now_millis(), id),
+            )
+            .context("setting the profile password")?;
+        if changed == 0 {
+            bail!("no profile matches id {id:?}");
+        }
+        Ok(())
+    }
+
+    /// Remove a profile's password so future changes are no longer gated.
+    pub fn clear_profile_password(&self, id: &str) -> Result<()> {
+        let changed = self
+            .conn()
+            .execute(
+                "UPDATE profiles SET password_hash = NULL, updated_at = ?1 WHERE id = ?2",
+                (now_millis(), id),
+            )
+            .context("clearing the profile password")?;
+        if changed == 0 {
+            bail!("no profile matches id {id:?}");
+        }
+        Ok(())
+    }
+
     // --- providers ----------------------------------------------------------
 
     /// Add a provider under a profile.
@@ -499,6 +559,31 @@ impl Store {
         Ok(())
     }
 
+    /// Update a provider's settings (name, description, base URL, token, kind, headers).
+    pub fn update_provider(&self, id: i64, spec: NewProvider) -> Result<()> {
+        let key = self.master_key();
+        let encrypted_token = crate::crypto::encrypt(&key, &spec.auth_token)?;
+        let changed = self
+            .conn()
+            .execute(
+                "UPDATE providers SET name = ?1, description = ?2, base_url = ?3, auth_token = ?4, kind = ?5, extra_headers = ?6 WHERE id = ?7",
+                (
+                    spec.name.as_str(),
+                    spec.description.as_deref(),
+                    spec.base_url.as_str(),
+                    encrypted_token,
+                    provider_kind_tag(spec.kind),
+                    serde_json::to_string(&spec.extra_headers).unwrap(),
+                    id,
+                ),
+            )
+            .context("updating the provider")?;
+        if changed == 0 {
+            bail!("no provider matches id {id}");
+        }
+        Ok(())
+    }
+
     // --- proxies and routes --------------------------------------------------
 
     /// Create a proxy under a profile.
@@ -582,6 +667,29 @@ impl Store {
             .map_err(|e| e.into())
     }
 
+    /// Remove a proxy and all of its routes.
+    pub fn delete_proxy(&self, id: i64) -> Result<()> {
+        self.conn()
+            .execute("DELETE FROM proxies WHERE id = ?1", (id,))
+            .context("deleting the proxy")?;
+        Ok(())
+    }
+
+    /// Update a proxy's name and description.
+    pub fn update_proxy(&self, id: i64, name: &str, description: Option<&str>) -> Result<()> {
+        let changed = self
+            .conn()
+            .execute(
+                "UPDATE proxies SET name = ?1, description = ?2 WHERE id = ?3",
+                (name, description, id),
+            )
+            .context("updating the proxy")?;
+        if changed == 0 {
+            bail!("no proxy matches id {id}");
+        }
+        Ok(())
+    }
+
     /// Create a route under a proxy.
     pub fn create_route(
         &self,
@@ -603,6 +711,35 @@ impl Store {
             description: description.map(|d| d.to_string()),
             strategy,
         })
+    }
+
+    /// Remove a route and its model chain.
+    pub fn delete_route(&self, id: i64) -> Result<()> {
+        self.conn()
+            .execute("DELETE FROM routes WHERE id = ?1", (id,))
+            .context("deleting the route")?;
+        Ok(())
+    }
+
+    /// Update a route's name, description and routing strategy.
+    pub fn update_route(
+        &self,
+        id: i64,
+        name: &str,
+        description: Option<&str>,
+        strategy: RoutingStrategy,
+    ) -> Result<()> {
+        let changed = self
+            .conn()
+            .execute(
+                "UPDATE routes SET name = ?1, description = ?2, strategy = ?3 WHERE id = ?4",
+                (name, description, strategy_tag(strategy), id),
+            )
+            .context("updating the route")?;
+        if changed == 0 {
+            bail!("no route matches id {id}");
+        }
+        Ok(())
     }
 
     /// All routes under a proxy.
@@ -723,6 +860,54 @@ impl Store {
                 (status_tag(status), entry_id),
             )
             .context("updating the route model status")?;
+        Ok(())
+    }
+
+    /// Remove a model from a route's chain.
+    pub fn delete_route_entry(&self, id: i64) -> Result<()> {
+        self.conn()
+            .execute("DELETE FROM route_entries WHERE id = ?1", (id,))
+            .context("deleting the route model")?;
+        Ok(())
+    }
+
+    /// Re-point a route entry to a different provider/model and tune its weight
+    /// and capabilities, keeping its position in the chain.
+    pub fn update_route_entry(
+        &self,
+        id: i64,
+        model_id: &str,
+        provider_id: i64,
+        weight: f64,
+        capabilities: RouteCapabilities,
+    ) -> Result<()> {
+        let changed = self
+            .conn()
+            .execute(
+                "UPDATE route_entries SET model_id = ?1, provider_id = ?2, weight = ?3, capabilities = ?4 WHERE id = ?5",
+                (
+                    model_id,
+                    provider_id,
+                    weight,
+                    serde_json::to_string(&capabilities).unwrap(),
+                    id,
+                ),
+            )
+            .context("updating the route model")?;
+        if changed == 0 {
+            bail!("no route model matches id {id}");
+        }
+        Ok(())
+    }
+
+    /// Move a route entry to a new position in the fallback chain.
+    pub fn set_route_entry_priority(&self, id: i64, priority: i32) -> Result<()> {
+        self.conn()
+            .execute(
+                "UPDATE route_entries SET priority = ?1 WHERE id = ?2",
+                (priority, id),
+            )
+            .context("reordering the route model")?;
         Ok(())
     }
 
@@ -959,6 +1144,93 @@ mod tests {
         store.delete_provider(provider.id)?;
         assert_eq!(store.list_providers(profile.id.as_str())?.len(), 0);
 
+        store.delete_profile(profile.id.as_str())?;
+        assert_eq!(store.list_profiles()?.len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn crud_update_delete_end_to_end() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let profile = store.create_profile("acct", Some("desc"), None)?;
+
+        // Profile editing.
+        store.rename_profile(profile.id.as_str(), "acct2")?;
+        assert_eq!(store.get_profile_by_name("acct2")?.unwrap().name, "acct2");
+        store.set_profile_description(profile.id.as_str(), Some("new desc"))?;
+        assert_eq!(
+            store.get_profile_by_name("acct2")?.unwrap().description,
+            Some("new desc".to_string())
+        );
+        store.set_profile_password(profile.id.as_str(), "argon2:abc")?;
+        assert!(store.get_profile_by_name("acct2")?.unwrap().password_hash.is_some());
+        store.clear_profile_password(profile.id.as_str())?;
+        assert!(!store.get_profile_by_name("acct2")?.unwrap().password_hash.is_some());
+
+        // Provider edit (token re-encrypted and readable).
+        let provider = store.create_provider(
+            profile.id.as_str(),
+            NewProvider {
+                name: "p1".to_string(),
+                description: None,
+                base_url: "https://a".to_string(),
+                auth_token: "t1".to_string(),
+                kind: ProviderKind::OpenAICompatible,
+                extra_headers: std::collections::BTreeMap::new(),
+            },
+        )?;
+        store.update_provider(
+            provider.id,
+            NewProvider {
+                name: "p2".to_string(),
+                description: Some("d".to_string()),
+                base_url: "https://b".to_string(),
+                auth_token: "t2".to_string(),
+                kind: ProviderKind::Anthropic,
+                extra_headers: std::collections::BTreeMap::new(),
+            },
+        )?;
+        let updated = store.get_provider(provider.id)?.unwrap();
+        assert_eq!(updated.name, "p2");
+        assert_eq!(updated.base_url, "https://b");
+        assert_eq!(updated.auth_token, "t2");
+        assert_eq!(updated.kind, ProviderKind::Anthropic);
+
+        // Proxy edit + delete.
+        let proxy = store.create_proxy(profile.id.as_str(), "main", Some("x"))?;
+        store.update_proxy(proxy.id, "main2", None)?;
+        assert!(store.get_proxy_named(profile.id.as_str(), "main2")?.is_some());
+
+        // Route edit + strategy change + entry reorder/update/delete.
+        let route = store.create_route(proxy.id, "r", None, RoutingStrategy::Priority)?;
+        store.update_route(route.id, "r2", Some("desc"), RoutingStrategy::Weighted)?;
+        let route2 = store.get_route_named(proxy.id, "r2")?.unwrap();
+        assert_eq!(route2.strategy, RoutingStrategy::Weighted);
+
+        let e1 = store.add_route_entry(
+            route.id, provider.id, "m1", 1, 1.0, RouteCapabilities::default(),
+        )?;
+        let e2 = store.add_route_entry(
+            route.id, provider.id, "m2", 2, 1.0, RouteCapabilities::default(),
+        )?;
+        store.update_route_entry(e1.id, "m1b", provider.id, 2.0, RouteCapabilities::default())?;
+        store.set_route_entry_priority(e1.id, 2)?;
+        store.set_route_entry_priority(e2.id, 1)?;
+        let entries = store.route_entries(route.id)?;
+        assert_eq!(entries[0].model_id, "m2"); // e2 moved to the front
+        assert_eq!(entries[1].model_id, "m1b");
+        assert_eq!(entries[1].weight, 2.0);
+
+        store.delete_route_entry(e2.id)?;
+        assert_eq!(store.route_entries(route.id)?.len(), 1);
+
+        store.delete_route(route.id)?;
+        assert_eq!(store.list_routes(proxy.id)?.len(), 0);
+
+        store.delete_proxy(proxy.id)?;
+        assert_eq!(store.list_proxies(profile.id.as_str())?.len(), 0);
+
+        store.delete_provider(provider.id)?;
         store.delete_profile(profile.id.as_str())?;
         assert_eq!(store.list_profiles()?.len(), 0);
         Ok(())
