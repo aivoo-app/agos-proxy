@@ -22,12 +22,17 @@ use crate::router::{
 use crate::storage::Store;
 use crate::translator::{content_text, forward_non_streaming, ChatRequest, Message};
 
-/// Arguments for `agos-proxy chat`. None: the command is fully wizard-driven.
+/// Arguments for `agos-proxy chat`. The wizards pick profile → proxy → route.
 #[derive(Debug, Parser)]
-pub struct ChatArgs;
+pub struct ChatArgs {
+    /// Run the conversation in a full-screen terminal UI instead of the
+    /// line-by-line REPL.
+    #[arg(long)]
+    pub tui: bool,
+}
 
 /// Entry point for `agos-proxy chat`.
-pub fn run(_args: ChatArgs) -> Result<()> {
+pub fn run(args: ChatArgs) -> Result<()> {
     let store = open_store()?;
     let theme = ColorfulTheme::default();
 
@@ -39,12 +44,23 @@ pub fn run(_args: ChatArgs) -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
         .build()?;
+    let chain_len = store.route_entries(route.id)?.len();
+
+    if args.tui {
+        let session = super::tui::Session {
+            store: Arc::new(store),
+            profile,
+            model: model.clone(),
+            client,
+            chain_len,
+        };
+        return super::tui::run(session);
+    }
 
     println!();
     println!(
-        "Starting chat on {model} (profile {:?}, {} model(s) in the fallback chain).",
-        profile.name,
-        store.route_entries(route.id)?.len()
+        "Starting chat on {model} (profile {:?}, {chain_len} model(s) in the fallback chain).",
+        profile.name
     );
     println!("Type /help for commands, or Ctrl-D to exit.");
     println!();
@@ -222,7 +238,7 @@ async fn chat_session(
 
 /// Send one turn through the route's failover chain and return the assistant's
 /// reply text.
-async fn send_turn(
+pub(crate) async fn send_turn(
     store: &Arc<Store>,
     client: &reqwest::Client,
     routing: &RoutingState,

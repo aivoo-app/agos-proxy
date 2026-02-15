@@ -34,6 +34,7 @@ mod provider;
 mod proxy;
 mod route;
 mod setup;
+mod tui;
 mod usage;
 pub mod util;
 

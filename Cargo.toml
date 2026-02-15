@@ -53,6 +53,8 @@ futures = "0.3.31"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 clap_mangen = { version = "0.3.3", optional = true }
 clap_complete = { version = "4.6.9", optional = true }
+ratatui = "0.29"
+crossterm = "0.28"
 
 [dev-dependencies]
 tower = "0.5.3"

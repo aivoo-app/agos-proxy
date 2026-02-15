@@ -132,14 +132,9 @@ fn create(store: &crate::storage::Store, proxy_name: Option<String>) -> Result<(
 
     println!("Add at least one model to the route's fallback chain.");
     let mut priority = 1i32;
-    loop {
-        match prompt_route_entry(store, &profile, &theme, route.id, priority)? {
-            Some(model_id) => {
-                println!("  added model {model_id} at priority {priority}");
-                priority += 1;
-            }
-            None => break,
-        }
+    while let Some(model_id) = prompt_route_entry(store, &profile, &theme, route.id, priority)? {
+        println!("  added model {model_id} at priority {priority}");
+        priority += 1;
     }
 
     println!(

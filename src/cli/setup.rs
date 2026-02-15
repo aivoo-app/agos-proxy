@@ -283,14 +283,9 @@ fn prompt_route(
 
     println!("Add at least one model to the route's fallback chain.");
     let mut priority = 1i32;
-    loop {
-        match prompt_route_entry(store, theme, profile, route.id, priority)? {
-            Some(model_id) => {
-                println!("  added model {model_id} at priority {priority}");
-                priority += 1;
-            }
-            None => break,
-        }
+    while let Some(model_id) = prompt_route_entry(store, theme, profile, route.id, priority)? {
+        println!("  added model {model_id} at priority {priority}");
+        priority += 1;
     }
     println!(
         "Created route {:?} under proxy {:?} / profile {:?}.",
