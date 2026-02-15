@@ -1163,9 +1163,17 @@ mod tests {
             Some("new desc".to_string())
         );
         store.set_profile_password(profile.id.as_str(), "argon2:abc")?;
-        assert!(store.get_profile_by_name("acct2")?.unwrap().password_hash.is_some());
+        assert!(store
+            .get_profile_by_name("acct2")?
+            .unwrap()
+            .password_hash
+            .is_some());
         store.clear_profile_password(profile.id.as_str())?;
-        assert!(!store.get_profile_by_name("acct2")?.unwrap().password_hash.is_some());
+        assert!(!store
+            .get_profile_by_name("acct2")?
+            .unwrap()
+            .password_hash
+            .is_some());
 
         // Provider edit (token re-encrypted and readable).
         let provider = store.create_provider(
@@ -1199,7 +1207,9 @@ mod tests {
         // Proxy edit + delete.
         let proxy = store.create_proxy(profile.id.as_str(), "main", Some("x"))?;
         store.update_proxy(proxy.id, "main2", None)?;
-        assert!(store.get_proxy_named(profile.id.as_str(), "main2")?.is_some());
+        assert!(store
+            .get_proxy_named(profile.id.as_str(), "main2")?
+            .is_some());
 
         // Route edit + strategy change + entry reorder/update/delete.
         let route = store.create_route(proxy.id, "r", None, RoutingStrategy::Priority)?;
@@ -1208,10 +1218,20 @@ mod tests {
         assert_eq!(route2.strategy, RoutingStrategy::Weighted);
 
         let e1 = store.add_route_entry(
-            route.id, provider.id, "m1", 1, 1.0, RouteCapabilities::default(),
+            route.id,
+            provider.id,
+            "m1",
+            1,
+            1.0,
+            RouteCapabilities::default(),
         )?;
         let e2 = store.add_route_entry(
-            route.id, provider.id, "m2", 2, 1.0, RouteCapabilities::default(),
+            route.id,
+            provider.id,
+            "m2",
+            2,
+            1.0,
+            RouteCapabilities::default(),
         )?;
         store.update_route_entry(e1.id, "m1b", provider.id, 2.0, RouteCapabilities::default())?;
         store.set_route_entry_priority(e1.id, 2)?;

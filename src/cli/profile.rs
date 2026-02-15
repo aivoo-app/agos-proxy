@@ -4,7 +4,7 @@ use anyhow::{bail, Context as _, Result};
 use clap::Subcommand;
 use dialoguer::{theme::ColorfulTheme, Confirm, Input};
 
-use crate::cli::util::{ensure_password_ok, hash_password, open_store};
+use crate::cli::util::{ensure_password_ok, hash_password, open_store, pick_profile};
 use crate::storage::Store;
 
 /// Subcommands under `agos-proxy profile`.
@@ -33,6 +33,18 @@ pub enum ProfileArgs {
         /// New requests-per-minute ceiling; omit to just show the current one.
         rpm: Option<i64>,
     },
+    /// Edit a profile's name, description and password.
+    Edit {
+        /// Name of the profile to edit.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Delete a profile and everything under it.
+    Delete {
+        /// Name of the profile to delete.
+        #[arg(long)]
+        name: Option<String>,
+    },
 }
 
 /// Subcommands under `agos-proxy profile token`.
@@ -54,6 +66,8 @@ pub fn run(args: ProfileArgs) -> Result<()> {
         ProfileArgs::Show { name } => show(&store, &name),
         ProfileArgs::Token(TokenArgs::Rotate { name }) => rotate(&store, &name),
         ProfileArgs::Limit { name, rpm } => limit(&store, &name, rpm),
+        ProfileArgs::Edit { name } => edit(&store, name),
+        ProfileArgs::Delete { name } => delete(&store, name),
     }
 }
 
@@ -202,5 +216,93 @@ fn limit(store: &Store, name: &str, rpm: Option<i64>) -> Result<()> {
             println!("Rate limit for {:?}: {current} -> {updated}", profile.name);
         }
     }
+    Ok(())
+}
+
+/// Resolve a profile by name, or let the user pick one from a menu.
+fn resolve_profile(store: &Store, given: Option<String>) -> Result<crate::domain::Profile> {
+    use crate::cli::util::require_profile;
+    match given {
+        Some(n) if !n.is_empty() => require_profile(store, &n),
+        _ => pick_profile(store, "Profile"),
+    }
+}
+
+/// Interactively edit a profile: name, description and password.
+fn edit(store: &Store, name: Option<String>) -> Result<()> {
+    use dialoguer::{theme::ColorfulTheme, Confirm, Input};
+    let theme = ColorfulTheme::default();
+    let profile = resolve_profile(store, name)?;
+    ensure_password_ok(&profile)?;
+
+    let new_name: String = Input::<String>::with_theme(&theme)
+        .with_prompt("Profile name")
+        .default(profile.name.clone())
+        .interact_text()?;
+    if new_name != profile.name && store.get_profile_by_name(&new_name)?.is_some() {
+        anyhow::bail!("a profile named {new_name:?} already exists");
+    }
+    let description: String = Input::<String>::with_theme(&theme)
+        .with_prompt("Description (optional)")
+        .default(
+            profile
+                .description
+                .as_deref()
+                .map(|d| d.to_string())
+                .unwrap_or_default(),
+        )
+        .allow_empty(true)
+        .interact_text()?;
+    let wants_password = Confirm::with_theme(&theme)
+        .with_prompt("Protect this profile with a password?")
+        .default(profile.password_hash.is_some())
+        .interact()?;
+
+    if new_name != profile.name {
+        store.rename_profile(profile.id.as_str(), &new_name)?;
+    }
+    let new_desc: Option<&str> = if description.is_empty() {
+        None
+    } else {
+        Some(description.as_str())
+    };
+    store.set_profile_description(profile.id.as_str(), new_desc)?;
+    if wants_password {
+        let has_changed = Confirm::with_theme(&theme)
+            .with_prompt("Set a new password now?")
+            .default(false)
+            .interact()?;
+        if has_changed {
+            let pw = dialoguer::Password::with_theme(&theme)
+                .with_prompt("New password")
+                .interact()?;
+            store.set_profile_password(profile.id.as_str(), &hash_password(&pw)?)?;
+        }
+    } else if profile.password_hash.is_some() {
+        store.clear_profile_password(profile.id.as_str())?;
+    }
+    println!("Updated profile {:?}.", new_name);
+    Ok(())
+}
+
+/// Delete a profile and everything under it, after a confirmation.
+fn delete(store: &Store, name: Option<String>) -> Result<()> {
+    use dialoguer::{theme::ColorfulTheme, Confirm};
+    let theme = ColorfulTheme::default();
+    let profile = resolve_profile(store, name)?;
+    ensure_password_ok(&profile)?;
+    let sure = Confirm::with_theme(&theme)
+        .with_prompt(format!(
+            "Delete profile {:?} and ALL its providers, proxies and routes?",
+            profile.name
+        ))
+        .default(false)
+        .interact()?;
+    if !sure {
+        println!("Cancelled.");
+        return Ok(());
+    }
+    store.delete_profile(profile.id.as_str())?;
+    println!("Deleted profile {:?}.", profile.name);
     Ok(())
 }

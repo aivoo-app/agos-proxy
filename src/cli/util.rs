@@ -124,6 +124,130 @@ pub fn prompt_headers() -> Result<std::collections::BTreeMap<String, String>> {
     Ok(headers)
 }
 
+/// Pick a profile from an arrow-key select menu of the existing records.
+///
+/// Profiles are the only entity users have to type a name for from scratch, so
+/// the picker prefers a menu whenever at least one exists.
+pub fn pick_profile(store: &Store, prompt: &str) -> Result<crate::domain::Profile> {
+    use dialoguer::{theme::ColorfulTheme, Select};
+    let theme = ColorfulTheme::default();
+    let all = store.list_profiles()?;
+    if all.is_empty() {
+        bail!("no profiles configured yet; create one first");
+    }
+    if all.len() == 1 {
+        return Ok(all[0].clone());
+    }
+    let labels: Vec<String> = all.iter().map(|p| p.name.clone()).collect();
+    let idx = Select::with_theme(&theme)
+        .with_prompt(prompt)
+        .items(&labels)
+        .interact()?;
+    Ok(all[idx].clone())
+}
+
+/// Pick a provider belonging to `profile` from a select menu.
+///
+/// If only one provider exists it is returned directly, so "pick provider"
+/// flows stay fast and never feel like a dead end.
+pub fn pick_provider(
+    store: &Store,
+    profile: &crate::domain::Profile,
+    prompt: &str,
+) -> Result<crate::domain::Provider> {
+    use dialoguer::{theme::ColorfulTheme, Select};
+    let theme = ColorfulTheme::default();
+    let all = store.list_providers(profile.id.as_str())?;
+    if all.is_empty() {
+        bail!(
+            "no providers configured for {:?} yet; add one first",
+            profile.name
+        );
+    }
+    if all.len() == 1 {
+        return Ok(all[0].clone());
+    }
+    let labels: Vec<String> = all
+        .iter()
+        .map(|p| format!("{}  ({})", p.name, p.base_url))
+        .collect();
+    let idx = Select::with_theme(&theme)
+        .with_prompt(prompt)
+        .items(&labels)
+        .interact()?;
+    Ok(all[idx].clone())
+}
+
+/// Pick a proxy belonging to `profile` from a select menu.
+pub fn pick_proxy(
+    store: &Store,
+    profile: &crate::domain::Profile,
+    prompt: &str,
+) -> Result<crate::domain::Proxy> {
+    use dialoguer::{theme::ColorfulTheme, Select};
+    let theme = ColorfulTheme::default();
+    let all = store.list_proxies(profile.id.as_str())?;
+    if all.is_empty() {
+        bail!(
+            "no proxies configured for {:?} yet; create one first",
+            profile.name
+        );
+    }
+    if all.len() == 1 {
+        return Ok(all[0].clone());
+    }
+    let labels: Vec<String> = all
+        .iter()
+        .map(|p| {
+            if let Some(desc) = p.description.as_deref() {
+                format!("{}  ({})", p.name, desc)
+            } else {
+                p.name.clone()
+            }
+        })
+        .collect();
+    let idx = Select::with_theme(&theme)
+        .with_prompt(prompt)
+        .items(&labels)
+        .interact()?;
+    Ok(all[idx].clone())
+}
+
+/// Pick a route belonging to `proxy` from a select menu.
+pub fn pick_route(
+    store: &Store,
+    proxy: &crate::domain::Proxy,
+    prompt: &str,
+) -> Result<crate::domain::Route> {
+    use dialoguer::{theme::ColorfulTheme, Select};
+    let theme = ColorfulTheme::default();
+    let all = store.list_routes(proxy.id)?;
+    if all.is_empty() {
+        bail!(
+            "no routes under proxy {:?} yet; create one first",
+            proxy.name
+        );
+    }
+    if all.len() == 1 {
+        return Ok(all[0].clone());
+    }
+    let labels: Vec<String> = all
+        .iter()
+        .map(|r| {
+            if let Some(desc) = r.description.as_deref() {
+                format!("{}  ({})", r.name, desc)
+            } else {
+                r.name.clone()
+            }
+        })
+        .collect();
+    let idx = Select::with_theme(&theme)
+        .with_prompt(prompt)
+        .items(&labels)
+        .interact()?;
+    Ok(all[idx].clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
