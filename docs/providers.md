@@ -1,0 +1,252 @@
+# Providers
+
+What provider kinds AGOS Proxy supports, how the request/response translation
+works, and notes for setting up common providers.
+
+## Provider kinds
+
+AGOS Proxy classifies providers by the wire protocol they speak. The kind
+determines how AGOS Proxy shapes the request before sending it and how it
+interprets the response after receiving it.
+
+| Kind                  | Protocol                     | Notes                                              |
+|-----------------------|------------------------------|-----------------------------------------------------|
+| `OpenAICompatible`  | OpenAI REST (pass-through)   | Most providers: DeepSeek, OpenRouter, Ollama, etc. |
+| `Anthropic`          | Anthropic `/v1/messages`     | Native translation of chat completions.            |
+| `Google`             | Gemini `generateContent`     | Native translation of chat completions.            |
+| `Custom`             | Reserved for future use      | Not implemented yet.                               |
+
+The kind is set when you add a provider and is used to pick the right
+translator at request time.
+
+## Provider model naming
+
+AGOS Proxy does not enforce any provider naming convention. You decide:
+
+- The provider `name` is a label you choose (e.g. `deepseek`, `claude`,
+  `google`).
+- The model `id` is whatever string the provider expects (e.g. `deepseek-chat`,
+  `claude-sonnet-4-5`, `gemini-2.5-pro-exp`).
+
+These are the values you configure in route entries. AGOS Proxy does not try to
+validate them against a registry — it sends them verbatim to the provider.
+
+## OpenAI-compatible providers
+
+Most providers speak an OpenAI-compatible API. For these, AGOS Proxy forwards
+the request mostly as-is and parses the response as an OpenAI-style completion.
+
+Supported paths:
+
+| Path                          | Notes                                              |
+|-------------------------------|----------------------------------------------------|
+| `POST /v1/chat/completions`   | Streaming and non-streaming.                       |
+| `POST /v1/completions`        | Text completion.                                   |
+| `POST /v1/embeddings`         | Embedding vectors.                                 |
+| `GET  /v1/models`             | Auto-listed from routes in non-streaming contexts. |
+
+This covers the bulk of providers you are likely to configure: DeepSeek,
+OpenRouter, Together AI, Ollama, local servers, and any other OpenAI-compatible
+endpoint.
+
+### Extra headers
+
+Some providers need extra headers beyond `Authorization`. You can configure them
+per provider:
+
+```sh
+atos-proxy provider edit --profile coder1 --name deepseek
+# then add headers when prompted, or use the flag-driven path
+```
+
+Headers are sent verbatim with every request to that provider.
+
+### Setting up DeepSeek
+
+```sh
+atos-proxy provider add --profile coder1
+# name: deepseek
+# base_url: https://api.deepseek.com
+# auth_token: sk-... (your DeepSeek API key)
+# kind: openai_compatible
+```
+
+Route entry:
+
+```json
+{ "provider": "deepseek", "model": "deepseek-chat" }
+```
+
+### Setting up OpenRouter
+
+```sh
+atos-proxy provider add --profile coder1
+# name: openrouter
+# base_url: https://openrouter.ai/api/v1
+# auth_token: sk-or-v1-...
+# kind: openai_compatible
+```
+
+Route entry:
+
+```json
+{ "provider": "openrouter", "model": "openai/gpt-4o" }
+```
+
+### Setting up a local / self-hosted server (Ollama, lmstudio, etc.)
+
+```sh
+atos-proxy provider add --profile coder1
+# name: ollama
+# base_url: http://localhost:11434/v1
+# auth_token: (empty if no auth)
+# kind: openai_compatible
+```
+
+Route entry:
+
+```json
+{ "provider": "ollama", "model": "llama3" }
+```
+
+### OpenAI itself
+
+OpenAI is just an OpenAI-compatible provider:
+
+```sh
+atos-proxy provider add --profile coder1
+# name: openai
+# base_url: https://api.openai.com/v1
+# auth_token: sk-...
+# kind: openai_compatible
+```
+
+Route entry:
+
+```json
+{ "provider": "openai", "model": "gpt-4o" }
+```
+
+## Anthropic
+
+Anthropic's API uses `/v1/messages` with a different body shape than OpenAI.
+AGOS Proxy translates between the OpenAI-style chat completion body it receives
+from callers and the Anthropic `/v1/messages` shape it sends upstream.
+
+Supported paths via the Anthropic translator:
+
+| Path                     | Notes                                        |
+|--------------------------|----------------------------------------------|
+| `POST /v1/messages`      | Chat completions (streaming and non-streaming). |
+
+Anthropic does not expose `/v1/completions`, `/v1/embeddings`, or
+`/v1/models` in the same shape as OpenAI. The translator handles what is
+supported; unsupported paths are rejected appropriately.
+
+### Setting up Anthropic
+
+```sh
+atos-proxy provider add --profile coder1
+# name: claude
+# base_url: https://api.anthropic.com
+# auth_token: sk-ant-...
+# kind: anthropic
+```
+
+Route entry:
+
+```json
+{ "provider": "claude", "model": "claude-sonnet-4-5" }
+```
+
+### Anthropic-specific notes
+
+- Anthropic bills by input/output tokens differently from OpenAI. AGOS Proxy
+  logs what the provider reports; the numbers are what Anthropic returns.
+- System prompts are mapped into the `messages` array appropriately for
+  Anthropic.
+- Tool/function calling is supported through the translator where the provider
+  supports it.
+
+## Google Gemini
+
+Gemini uses `generateContent` (and `streamGenerateContent`) rather than the
+OpenAI chat completions shape. AGOS Proxy translates the OpenAI-style body it
+receives from callers into the Gemini request shape.
+
+Supported paths via the Google translator:
+
+| Path                          | Notes                                        |
+|-------------------------------|----------------------------------------------|
+| `POST /v1/.../generateContent`| Chat completions (streaming and non-streaming). |
+
+### Setting up Google AI Studio
+
+```sh
+atos-proxy provider add --profile coder1
+# name: google
+# base_url: https://generativelanguage.googleapis.com/v1beta
+# auth_token: AIza...
+# kind: google
+```
+
+Route entry:
+
+```json
+{ "provider": "google", "model": "gemini-2.5-pro-exp" }
+```
+
+### Google-specific notes
+
+- Google's API key is passed as a query parameter (`key=...`) by the translator
+  when the base URL and provider kind indicate Google.
+- Streaming is supported through the Gemini streaming endpoint.
+- Token usage is reported as Google returns it.
+
+## Provider-specific headers and auth styles
+
+Different providers authenticate differently:
+
+| Provider        | Auth style                         | Configured as                        |
+|-----------------|------------------------------------|--------------------------------------|
+| OpenAI          | `Authorization: Bearer <key>`      | `auth_token` field.                  |
+| DeepSeek        | `Authorization: Bearer <key>`      | `auth_token` field.                  |
+| OpenRouter      | `Authorization: Bearer <key>`      | `auth_token` field.                  |
+| Anthropic       | `x-api-key` + `anthropic-version`  | `auth_token` field + headers may be set. |
+| Google          | `?key=...` query param             | `auth_token` field; translator adds it.   |
+| Ollama/local    | Often none                         | Empty `auth_token`; rely on network isolation. |
+
+If a provider has a non-standard auth mechanism that is not covered by the
+`auth_token` field or extra headers, let us know — we can add support.
+
+## Provider notes and limitations
+
+- AGOS Proxy does not validate provider configuration against the provider's
+  actual API at config time. It attempts the real call at request time. If a
+  provider is misconfigured, you will see failures in the usage log and the
+  route entry will be marked unhealthy.
+- Rate limits are provider-specific. AGOS Proxy's own rate limiter is per-profile
+  and separate from provider rate limits. If a provider returns 429, AGOS Proxy
+  treats that as a failure for failover purposes and marks the entry unhealthy
+  temporarily.
+- Streaming passthrough depends on the provider supporting streaming. If a
+  provider does not support streaming, mark that route entry's streaming
+  capability accordingly (or just do not stream to it).
+- Some providers return non-standard error shapes. AGOS Proxy parses the OpenAI-
+  style error envelope where possible; provider-specific error translation is
+  limited today.
+
+## Adding a new provider kind
+
+If you need native support for a provider that is not OpenAI-compatible,
+Anthropic, or Google:
+
+1. Add the kind to the `ProviderKind` enum in `domain/mod.rs`.
+2. Add a translator module in `translator/` that converts an incoming
+   OpenAI-compatible body to the provider's shape and back.
+3. Wire the translator selection into the request path.
+4. Add provider setup notes here.
+5. Update the architecture and API docs.
+
+Provider-specific native integrations are welcome as contributions. See
+`CONTRIBUTING.md`.
