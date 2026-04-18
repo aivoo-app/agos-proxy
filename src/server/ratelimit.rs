@@ -27,9 +27,16 @@ impl RateLimiter {
     /// Record a hit for `key`. Returns `false` when the caller has already
     /// reached `rpm_limit` requests inside the current window and should be
     /// refused; the refused request is *not* recorded.
+    ///
+    /// If the mutex is poisoned (a previous check panicked mid-lock), we
+    /// recover the inner data and continue — better to keep serving than to
+    /// crash the whole process.
     pub fn check(&self, key: &str, rpm_limit: i64) -> bool {
         let now = Instant::now();
-        let mut windows = self.windows.lock().expect("rate limiter mutex poisoned");
+        let mut windows = self
+            .windows
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let window = windows.entry(key.to_string()).or_default();
         while let Some(front) = window.front() {
             if now.duration_since(*front) >= WINDOW {
