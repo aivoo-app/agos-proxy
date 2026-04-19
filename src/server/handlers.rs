@@ -12,6 +12,11 @@ use crate::router::{execute_with_failover, resolve_targets_with_strategy, Routin
 use crate::storage::Store;
 use crate::translator::{self, ChatRequest};
 
+/// Per-handler body size cap. The outer tower-http layer enforces 10 MB on
+/// the raw stream; this tighter cap protects the JSON layer from allocating
+/// huge intermediate buffers for malformed but technically-in-range payloads.
+const HANDLER_BODY_LIMIT: usize = 5 * 1024 * 1024;
+
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<Store>,
@@ -51,7 +56,7 @@ pub async fn chat_completions(State(state): State<AppState>, req: Request) -> Re
         Some(id) => id.clone(),
         None => return bad_request("unauthenticated"),
     };
-    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+    let bytes = match axum::body::to_bytes(body, HANDLER_BODY_LIMIT).await {
         Ok(b) => b,
         Err(e) => return bad_request(format!("failed to read body: {e}")),
     };
@@ -79,7 +84,7 @@ pub async fn completions(State(state): State<AppState>, req: Request) -> Respons
         Some(id) => id.clone(),
         None => return bad_request("unauthenticated"),
     };
-    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+    let bytes = match axum::body::to_bytes(body, HANDLER_BODY_LIMIT).await {
         Ok(b) => b,
         Err(e) => return bad_request(format!("failed to read body: {e}")),
     };
@@ -106,7 +111,7 @@ pub async fn embeddings(State(state): State<AppState>, req: Request) -> Response
         Some(id) => id.clone(),
         None => return bad_request("unauthenticated"),
     };
-    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+    let bytes = match axum::body::to_bytes(body, HANDLER_BODY_LIMIT).await {
         Ok(b) => b,
         Err(e) => return bad_request(format!("failed to read body: {e}")),
     };
@@ -135,9 +140,20 @@ async fn handle_non_streaming(
         needs,
         &state.routing_state,
     ) {
-        Ok(t) if t.is_empty() => return bad_request("no healthy targets for this route"),
+        Ok(t) if t.is_empty() => {
+            return service_unavailable("no healthy providers available for this route")
+        }
         Ok(t) => t,
-        Err(e) => return bad_request(format!("route resolution failed: {e}")),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("no proxy named") || msg.contains("no route named") {
+                return not_found(msg);
+            }
+            if msg.contains("must be in") {
+                return bad_request(msg);
+            }
+            return bad_request(format!("route resolution failed: {e}"));
+        }
     };
     let result = execute_with_failover(
         state.store.clone(),
@@ -254,13 +270,23 @@ async fn handle_streaming(
         ) {
             Ok(t) if t.is_empty() => {
                 let _ = tx
-                    .send(Err(std::io::Error::other("no healthy targets")))
+                    .send(Err(std::io::Error::other(
+                        "no healthy providers available for this route",
+                    )))
                     .await;
                 return;
             }
             Ok(t) => t,
             Err(e) => {
-                let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
+                let msg = e.to_string();
+                let err_msg = if msg.contains("no proxy named") || msg.contains("no route named") {
+                    format!("model not found: {msg}")
+                } else if msg.contains("must be in") {
+                    msg
+                } else {
+                    format!("route resolution failed: {msg}")
+                };
+                let _ = tx.send(Err(std::io::Error::other(err_msg))).await;
                 return;
             }
         };
@@ -421,9 +447,20 @@ async fn handle_completion(
         crate::router::RequestNeeds::default(),
         &state.routing_state,
     ) {
-        Ok(t) if t.is_empty() => return bad_request("no healthy targets for this route"),
+        Ok(t) if t.is_empty() => {
+            return service_unavailable("no healthy providers available for this route")
+        }
         Ok(t) => t,
-        Err(e) => return bad_request(format!("route resolution failed: {e}")),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("no proxy named") || msg.contains("no route named") {
+                return not_found(msg);
+            }
+            if msg.contains("must be in") {
+                return bad_request(msg);
+            }
+            return bad_request(format!("route resolution failed: {e}"));
+        }
     };
 
     let result = execute_with_failover(
@@ -507,9 +544,20 @@ async fn handle_completion_streaming(
         crate::router::RequestNeeds::default(),
         &state.routing_state,
     ) {
-        Ok(t) if t.is_empty() => return bad_request("no healthy targets for this route"),
+        Ok(t) if t.is_empty() => {
+            return service_unavailable("no healthy providers available for this route")
+        }
         Ok(t) => t,
-        Err(e) => return bad_request(format!("route resolution failed: {e}")),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("no proxy named") || msg.contains("no route named") {
+                return not_found(msg);
+            }
+            if msg.contains("must be in") {
+                return bad_request(msg);
+            }
+            return bad_request(format!("route resolution failed: {e}"));
+        }
     };
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
@@ -524,7 +572,17 @@ async fn handle_completion_streaming(
             let base = target.provider.base_url.trim_end_matches('/');
             let url = format!("{base}/v1/completions");
 
-            let mut body = serde_json::to_value(&req).unwrap_or(serde_json::Value::Null);
+            let mut body = match serde_json::to_value(&req) {
+                Ok(b) => b,
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(std::io::Error::other(format!(
+                            "serialization failed: {e}"
+                        ))))
+                        .await;
+                    continue;
+                }
+            };
             if let Some(obj) = body.as_object_mut() {
                 obj.insert(
                     "model".to_string(),
@@ -658,9 +716,20 @@ async fn handle_embeddings(
         crate::router::RequestNeeds::default(),
         &state.routing_state,
     ) {
-        Ok(t) if t.is_empty() => return bad_request("no healthy targets for this route"),
+        Ok(t) if t.is_empty() => {
+            return service_unavailable("no healthy providers available for this route")
+        }
         Ok(t) => t,
-        Err(e) => return bad_request(format!("route resolution failed: {e}")),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("no proxy named") || msg.contains("no route named") {
+                return not_found(msg);
+            }
+            if msg.contains("must be in") {
+                return bad_request(msg);
+            }
+            return bad_request(format!("route resolution failed: {e}"));
+        }
     };
 
     let result = execute_with_failover(
@@ -746,12 +815,14 @@ pub async fn list_models(State(state): State<AppState>, req: Request) -> Respons
         Err(e) => return bad_request(format!("failed to list proxies: {e}")),
     };
     let mut models = Vec::new();
+    let now = chrono::Utc::now().timestamp();
     for proxy in proxies {
         if let Ok(routes) = state.store.list_routes(proxy.id) {
             for route in routes {
                 models.push(serde_json::json!({
                     "id": format!("{}/{}", proxy.name, route.name),
                     "object": "model",
+                    "created": now,
                     "owned_by": "agos",
                 }));
             }
@@ -771,6 +842,28 @@ fn bad_request(msg: impl Into<String>) -> Response {
         serde_json::json!({ "error": { "message": msg.into(), "type": "invalid_request_error" } });
     axum::response::Response::builder()
         .status(axum::http::StatusCode::BAD_REQUEST)
+        .header("Content-Type", "application/json")
+        .body(axum::body::Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// 404 Not Found — model/route does not exist.
+fn not_found(msg: impl Into<String>) -> Response {
+    let body =
+        serde_json::json!({ "error": { "message": msg.into(), "type": "not_found_error" } });
+    axum::response::Response::builder()
+        .status(axum::http::StatusCode::NOT_FOUND)
+        .header("Content-Type", "application/json")
+        .body(axum::body::Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// 503 Service Unavailable — no healthy provider in the route chain.
+fn service_unavailable(msg: impl Into<String>) -> Response {
+    let body =
+        serde_json::json!({ "error": { "message": msg.into(), "type": "service_unavailable_error" } });
+    axum::response::Response::builder()
+        .status(axum::http::StatusCode::SERVICE_UNAVAILABLE)
         .header("Content-Type", "application/json")
         .body(axum::body::Body::from(body.to_string()))
         .unwrap()
