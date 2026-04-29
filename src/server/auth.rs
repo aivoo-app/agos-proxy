@@ -16,6 +16,13 @@ pub async fn auth_middleware(
     mut request: Request,
     next: Next,
 ) -> Response {
+    // Health endpoints are intentionally unauthenticated so orchestrators can
+    // probe them without a bearer token.
+    let path = request.uri().path();
+    if path == "/health" || path == "/ready" {
+        return next.run(request).await;
+    }
+
     let token = request
         .headers()
         .get("Authorization")
@@ -46,9 +53,11 @@ pub async fn auth_middleware(
                     .body(axum::body::Body::from(body.to_string()))
                     .unwrap();
             }
-            request
-                .extensions_mut()
-                .insert(token.expect("token present"));
+            // Token is guaranteed present here because `get_profile_by_id`
+            // returned `Some` only when `token` was `Some`.
+            if let Some(token) = token {
+                request.extensions_mut().insert(token);
+            }
             next.run(request).await
         }
         _ => {
