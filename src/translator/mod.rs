@@ -99,7 +99,24 @@ pub fn build_upstream_request(
             Ok((url, headers, body))
         }
         ProviderKind::Custom => {
-            anyhow::bail!("custom providers need an explicit OpenAI-compatible base URL")
+            // Custom providers are treated as OpenAI-compatible — the caller
+            // supplies their own base URL and the request passes through as-is.
+            let base = target.provider.base_url.trim_end_matches('/');
+            let url = format!("{base}/v1/chat/completions");
+            let mut headers = target.provider.extra_headers.clone();
+            headers.insert(
+                "Authorization".to_string(),
+                format!("Bearer {}", target.provider.auth_token),
+            );
+            headers.insert("Content-Type".to_string(), "application/json".to_string());
+            let mut body = serde_json::to_value(chat_req)?;
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert(
+                    "model".to_string(),
+                    serde_json::Value::String(target.entry.model_id.clone()),
+                );
+            }
+            Ok((url, headers, body))
         }
     }
 }
@@ -331,7 +348,7 @@ pub fn build_completion_upstream_request(
     req: &CompletionRequest,
 ) -> Result<(String, BTreeMap<String, String>, serde_json::Value)> {
     match target.provider.kind {
-        ProviderKind::OpenAICompatible => {
+        ProviderKind::OpenAICompatible | ProviderKind::Custom => {
             let base = target.provider.base_url.trim_end_matches('/');
             let url = format!("{base}/v1/completions");
             let mut headers = target.provider.extra_headers.clone();
@@ -363,7 +380,7 @@ pub fn build_embedding_upstream_request(
     req: &EmbeddingRequest,
 ) -> Result<(String, BTreeMap<String, String>, serde_json::Value)> {
     match target.provider.kind {
-        ProviderKind::OpenAICompatible => {
+        ProviderKind::OpenAICompatible | ProviderKind::Custom => {
             let base = target.provider.base_url.trim_end_matches('/');
             let url = format!("{base}/v1/embeddings");
             let mut headers = target.provider.extra_headers.clone();
