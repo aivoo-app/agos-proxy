@@ -30,7 +30,7 @@ pub fn spawn(store: Arc<Store>, http_client: reqwest::Client) -> tokio::task::Jo
         ticker.tick().await; // first tick fires immediately
         loop {
             ticker.tick().await;
-            if let Err(e) = run_once(&store, &http_client).await {
+            if let Err(e) = run_once(store.clone(), &http_client).await {
                 tracing::warn!(error = %e, "health probe iteration failed");
             }
         }
@@ -38,8 +38,14 @@ pub fn spawn(store: Arc<Store>, http_client: reqwest::Client) -> tokio::task::Jo
 }
 
 /// One probe cycle: fetch candidates, ping each, update status.
-async fn run_once(store: &Store, client: &reqwest::Client) -> Result<()> {
-    let candidates = tokio::task::block_in_place(|| store.entries_needing_probe())?;
+async fn run_once(store: Arc<Store>, client: &reqwest::Client) -> Result<()> {
+    // Fetch candidates in a blocking task to avoid blocking the async runtime.
+    let candidates = tokio::task::spawn_blocking({
+        let store = store.clone();
+        move || store.entries_needing_probe()
+    })
+    .await??;
+
     if candidates.is_empty() {
         return Ok(());
     }
@@ -50,7 +56,10 @@ async fn run_once(store: &Store, client: &reqwest::Client) -> Result<()> {
         let outcome = ping(client, &provider).await;
         let new_status = decide_status(&entry.status, outcome);
         if new_status != entry.status {
-            tokio::task::block_in_place(|| store.set_route_entry_status(entry.id, new_status))?;
+            // Update status in a blocking task to avoid blocking the async runtime.
+            let store = store.clone();
+            tokio::task::spawn_blocking(move || store.set_route_entry_status(entry.id, new_status))
+                .await??;
             tracing::info!(old = ?entry.status, new = ?new_status, "entry status changed");
         }
     }

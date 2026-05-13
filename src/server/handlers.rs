@@ -849,8 +849,7 @@ fn bad_request(msg: impl Into<String>) -> Response {
 
 /// 404 Not Found — model/route does not exist.
 fn not_found(msg: impl Into<String>) -> Response {
-    let body =
-        serde_json::json!({ "error": { "message": msg.into(), "type": "not_found_error" } });
+    let body = serde_json::json!({ "error": { "message": msg.into(), "type": "not_found_error" } });
     axum::response::Response::builder()
         .status(axum::http::StatusCode::NOT_FOUND)
         .header("Content-Type", "application/json")
@@ -860,8 +859,7 @@ fn not_found(msg: impl Into<String>) -> Response {
 
 /// 503 Service Unavailable — no healthy provider in the route chain.
 fn service_unavailable(msg: impl Into<String>) -> Response {
-    let body =
-        serde_json::json!({ "error": { "message": msg.into(), "type": "service_unavailable_error" } });
+    let body = serde_json::json!({ "error": { "message": msg.into(), "type": "service_unavailable_error" } });
     axum::response::Response::builder()
         .status(axum::http::StatusCode::SERVICE_UNAVAILABLE)
         .header("Content-Type", "application/json")

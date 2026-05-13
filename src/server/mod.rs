@@ -7,7 +7,7 @@
 //! profile's per-minute rate limit when one is set.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use axum::extract::State;
@@ -34,6 +34,9 @@ const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
 /// Total request timeout (120 seconds). Protects against slow clients consuming
 /// resources indefinitely.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Server start time for uptime tracking.
+static SERVER_START_TIME: once_cell::sync::Lazy<Instant> = once_cell::sync::Lazy::new(Instant::now);
 
 /// Build the axum router with all routes and shared state.
 pub fn create_app(
@@ -64,7 +67,10 @@ pub fn create_app(
         .route("/health", axum::routing::get(health_check))
         .route("/ready", axum::routing::get(readiness_check))
         .route("/metrics", axum::routing::get(metrics_handler))
-        .route("/v1/providers/health", axum::routing::get(provider_health_handler))
+        .route(
+            "/v1/providers/health",
+            axum::routing::get(provider_health_handler),
+        )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::auth_middleware,
@@ -72,7 +78,9 @@ pub fn create_app(
         // Security hardening applied to every response.
         .layer(axum::middleware::from_fn(middleware::security_headers))
         // Request id propagation + structured access logging.
-        .layer(axum::middleware::from_fn(middleware::request_id_and_logging))
+        .layer(axum::middleware::from_fn(
+            middleware::request_id_and_logging,
+        ))
         // CORS — allow web clients to call the API directly. Permissive by
         // default; tighten with a custom layer in production if needed.
         .layer(
@@ -104,9 +112,7 @@ async fn health_check() -> axum::response::Response {
 }
 
 /// Readiness probe — returns 200 only when the store is reachable.
-async fn readiness_check(
-    State(state): State<AppState>,
-) -> axum::response::Response {
+async fn readiness_check(State(state): State<AppState>) -> axum::response::Response {
     match state.store.list_profiles() {
         Ok(_) => axum::response::Response::builder()
             .status(200)
@@ -118,9 +124,7 @@ async fn readiness_check(
             axum::response::Response::builder()
                 .status(503)
                 .header("Content-Type", "application/json")
-                .body(axum::body::Body::from(
-                    r#"{"status":"not ready"}"#,
-                ))
+                .body(axum::body::Body::from(r#"{"status":"not ready"}"#))
                 .unwrap()
         }
     }
@@ -159,9 +163,7 @@ pub async fn serve(bind_addr: &str) -> Result<()> {
 }
 
 /// Basic metrics endpoint — returns request counts and uptime.
-async fn metrics_handler(
-    State(state): State<AppState>,
-) -> axum::response::Response {
+async fn metrics_handler(State(state): State<AppState>) -> axum::response::Response {
     let profiles = state.store.list_profiles().unwrap_or_default();
     let total_profiles = profiles.len();
     let mut total_providers = 0;
@@ -180,7 +182,8 @@ async fn metrics_handler(
                 let entries = state.store.route_entries(route.id).unwrap_or_default();
                 for entry in &entries {
                     match entry.status {
-                        crate::domain::ModelStatus::Healthy | crate::domain::ModelStatus::Degraded => {
+                        crate::domain::ModelStatus::Healthy
+                        | crate::domain::ModelStatus::Degraded => {
                             healthy_entries += 1;
                         }
                         _ => {
@@ -192,12 +195,15 @@ async fn metrics_handler(
         }
     }
 
+    let uptime_seconds = SERVER_START_TIME.elapsed().as_secs();
+
     let metrics = serde_json::json!({
         "profiles": total_profiles,
         "proxies": total_providers,
         "routes": total_routes,
         "healthy_entries": healthy_entries,
         "unhealthy_entries": unhealthy_entries,
+        "uptime_seconds": uptime_seconds,
     });
 
     axum::response::Response::builder()
@@ -208,9 +214,7 @@ async fn metrics_handler(
 }
 
 /// Provider health status endpoint — returns health status of all route entries.
-async fn provider_health_handler(
-    State(state): State<AppState>,
-) -> axum::response::Response {
+async fn provider_health_handler(State(state): State<AppState>) -> axum::response::Response {
     let mut entries = Vec::new();
     let profiles = state.store.list_profiles().unwrap_or_default();
 

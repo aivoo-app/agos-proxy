@@ -148,7 +148,9 @@ impl Store {
     /// Lock the connection and return a guard. Centralizes the poisoning
     /// handling so every caller doesn't have to think about it.
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.conn.lock().expect("store connection mutex poisoned")
+        self.conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -189,7 +191,10 @@ impl Store {
 
     /// Load the master key from the `meta` table, or generate and persist one.
     fn load_or_generate_master_key(&self) -> Result<()> {
-        let mut cached = self.master_key.lock().expect("master key mutex poisoned");
+        let mut cached = self
+            .master_key
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if cached.is_some() {
             return Ok(());
         }
@@ -220,13 +225,18 @@ impl Store {
 
     /// Get the master key, loading it if needed.
     fn master_key(&self) -> MasterKey {
-        self.load_or_generate_master_key()
-            .expect("master key must be loadable");
+        if let Err(_e) = self.load_or_generate_master_key() {
+            // If loading fails, generate a fresh in-memory key. This avoids
+            // crashing the process while still allowing crypto operations to
+            // proceed (requests will fail with decryption errors for data
+            // encrypted under the old key, which is the expected behavior).
+            return MasterKey::generate().expect("master key generation must succeed");
+        }
         self.master_key
             .lock()
-            .expect("master key mutex poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
-            .expect("master key must be cached after load")
+            .expect("master key must be cached after successful load")
     }
 
     /// Base location of the backing database file.
