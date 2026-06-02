@@ -1,5 +1,8 @@
 # ---- build stage ----
-FROM rust:1-slim AS builder
+# Pinned to the Rust version the code is verified against (rustc 1.98.1).
+# An unpinned `rust:1-slim` would silently pull a different stable on each
+# rebuild, breaking reproducibility of production images.
+FROM rust:1.98-slim AS builder
 WORKDIR /build
 # Cache dependencies before copying the source tree.
 COPY Cargo.toml Cargo.lock* ./
