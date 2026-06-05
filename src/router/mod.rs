@@ -30,7 +30,13 @@ impl RoutingState {
         if targets.len() <= 1 {
             return;
         }
-        let mut counters = self.round_robin.lock().expect("poisoned");
+        // Recover from a poisoned lock (a prior panic mid-lock) rather than
+        // crashing a live request: the routing counter is non-critical state,
+        // so it is always safe to continue with the recovered data.
+        let mut counters = self
+            .round_robin
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let idx = counters.entry(route_id).or_insert(0);
         let len = targets.len();
         let split = *idx % len;

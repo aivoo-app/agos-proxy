@@ -181,8 +181,10 @@ pub struct ProviderError {
 }
 
 /// Check whether a provider kind is supported by the current translator set.
-pub fn is_supported(kind: ProviderKind) -> bool {
-    !matches!(kind, ProviderKind::Custom)
+pub fn is_supported(_kind: ProviderKind) -> bool {
+    // Custom providers are treated as OpenAI-compatible passthrough,
+    // so they are supported.
+    true
 }
 
 #[cfg(test)]
