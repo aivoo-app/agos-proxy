@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agos::domain::{ProviderKind, RoutingStrategy};
-use agos::server::create_app;
+use agos::server::{create_app, AppState};
 use agos::storage::Store;
 use tower::util::ServiceExt;
 
@@ -90,7 +90,15 @@ async fn chat_completions_routes_through_mock_upstream() {
         .timeout(Duration::from_secs(5))
         .build()
         .expect("build client");
-    let app = create_app(Arc::new(store), Duration::from_secs(5), http_client);
+    let state = AppState {
+        store: Arc::new(store),
+        attempt_timeout: Duration::from_secs(5),
+        http_client,
+        routing_state: agos::router::RoutingState::default(),
+        rate_limiter: Arc::new(agos::server::ratelimit::RateLimiter::new()),
+        require_auth_on_health: false,
+    };
+    let app = create_app(state);
 
     let req_body = serde_json::json!({
         "model": "programmer/php-dev",
@@ -127,7 +135,15 @@ async fn chat_completions_rejects_missing_auth() {
 
     let (store, _profile_id) = setup_store(&mock_base);
     let http_client = reqwest::Client::new();
-    let app = create_app(Arc::new(store), Duration::from_secs(5), http_client);
+    let state = AppState {
+        store: Arc::new(store),
+        attempt_timeout: Duration::from_secs(5),
+        http_client,
+        routing_state: agos::router::RoutingState::default(),
+        rate_limiter: Arc::new(agos::server::ratelimit::RateLimiter::new()),
+        require_auth_on_health: false,
+    };
+    let app = create_app(state);
 
     let req_body = serde_json::json!({
         "model": "programmer/php-dev",
@@ -158,7 +174,15 @@ async fn list_models_returns_caller_routes() {
 
     let (store, profile_id) = setup_store(&mock_base);
     let http_client = reqwest::Client::new();
-    let app = create_app(Arc::new(store), Duration::from_secs(5), http_client);
+    let state = AppState {
+        store: Arc::new(store),
+        attempt_timeout: Duration::from_secs(5),
+        http_client,
+        routing_state: agos::router::RoutingState::default(),
+        rate_limiter: Arc::new(agos::server::ratelimit::RateLimiter::new()),
+        require_auth_on_health: false,
+    };
+    let app = create_app(state);
 
     let request = axum::http::Request::builder()
         .method("GET")

@@ -9,14 +9,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use tokio::time::interval;
+use tokio::time::{interval, timeout};
 use tracing::info_span;
 
 use crate::domain::ModelStatus;
+use crate::server::ratelimit::RateLimiter;
 use crate::storage::Store;
 
 /// How often the probe loop wakes up and scans for entries to check.
 const PROBE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Maximum time to wait for a health ping before considering the provider down.
+const PING_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Lightweight ping request: ask the upstream for its model list. Cheap, fast,
 /// and works across every OpenAI-compatible provider.
@@ -24,12 +28,44 @@ const PING_PATH: &str = "/v1/models";
 
 /// Start the background health-probe runner. Returns a JoinHandle so the caller
 /// can abort it on shutdown.
-pub fn spawn(store: Arc<Store>, http_client: reqwest::Client) -> tokio::task::JoinHandle<()> {
+pub fn spawn(
+    store: Arc<Store>,
+    http_client: reqwest::Client,
+    rate_limiter: Option<Arc<RateLimiter>>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = interval(PROBE_INTERVAL);
+        let mut prune_counter: u32 = 0;
+        let mut rate_limit_prune_counter: u32 = 0;
         ticker.tick().await; // first tick fires immediately
         loop {
             ticker.tick().await;
+            prune_counter += 1;
+            rate_limit_prune_counter += 1;
+
+            // Prune usage log every 12 probe cycles (~6 minutes): keep 30 days
+            if prune_counter >= 12 {
+                prune_counter = 0;
+                if let Err(e) = tokio::task::spawn_blocking({
+                    let store = store.clone();
+                    move || store.prune_usage_log(30)
+                })
+                .await
+                {
+                    tracing::warn!(error = %e, "usage log pruning failed");
+                } else {
+                    tracing::debug!("pruned old usage records");
+                }
+            }
+
+            // Prune rate limiter every 60 probe cycles (~30 minutes)
+            if rate_limit_prune_counter >= 60 {
+                rate_limit_prune_counter = 0;
+                if let Some(rl) = rate_limiter.clone() {
+                    rl.prune(Duration::from_secs(30 * 60)); // 30 minutes
+                }
+            }
+
             if let Err(e) = run_once(store.clone(), &http_client).await {
                 tracing::warn!(error = %e, "health probe iteration failed");
             }
@@ -74,16 +110,20 @@ async fn ping(client: &reqwest::Client, provider: &crate::domain::Provider) -> b
     if !provider.auth_token.is_empty() {
         req = req.bearer_auth(&provider.auth_token);
     }
-    match req.send().await {
-        Ok(resp) => {
+    match timeout(PING_TIMEOUT, req.send()).await {
+        Ok(Ok(resp)) => {
             let ok = resp.status().is_success();
             if !ok {
                 tracing::debug!(status = %resp.status(), "ping non-success");
             }
             ok
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             tracing::debug!(error = %e, "ping failed");
+            false
+        }
+        Err(_) => {
+            tracing::debug!("ping timed out after {:?}", PING_TIMEOUT);
             false
         }
     }

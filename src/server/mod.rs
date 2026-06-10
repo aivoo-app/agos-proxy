@@ -1,16 +1,17 @@
 //! The HTTP surface exposed to callers.
 //!
-//! AGOS Proxy speaks the OpenAI-compatible API — `/v1/chat/completions`,
-//! `/v1/completions`, `/v1/embeddings`, `/v1/models` — so an existing OpenAI
+//! AGOS Proxy speaks the OpenAI-compatible API - `/v1/chat/completions`,
+//! `/v1/completions`, `/v1/embeddings`, `/v1/models` - so an existing OpenAI
 //! SDK client can be pointed at this server unchanged. Requests are
 //! authenticated with the caller profile's bearer token and subject to the
 //! profile's per-minute rate limit when one is set.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Result;
 use axum::extract::State;
+use axum::http::HeaderValue;
 use axum::Router;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
@@ -35,22 +36,55 @@ const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
 /// resources indefinitely.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Server start time for uptime tracking.
-static SERVER_START_TIME: once_cell::sync::Lazy<Instant> = once_cell::sync::Lazy::new(Instant::now);
+/// Build a CORS layer based on the AGOS_CORS_ORIGINS environment variable.
+/// When the env var is set, only the specified origins are allowed.
+/// When not set, permissive CORS is used for backward compatibility.
+fn build_cors_layer() -> tower_http::cors::CorsLayer {
+    let origins: Option<Vec<String>> = std::env::var("AGOS_CORS_ORIGINS")
+        .ok()
+        .map(|s| s.split(',').map(|o| o.trim().to_string()).collect());
+
+    if let Some(origin_strs) = origins {
+        let mut cors = tower_http::cors::CorsLayer::new()
+            .allow_methods([
+                axum::http::Method::POST,
+                axum::http::Method::GET,
+                axum::http::Method::OPTIONS,
+            ])
+            .allow_headers([
+                axum::http::header::AUTHORIZATION,
+                axum::http::header::CONTENT_TYPE,
+                axum::http::header::HeaderName::from_static("x-request-id"),
+            ]);
+        // Parse each origin; skip any that are malformed rather than panicking
+        // on a bad environment value, which would take the whole server down
+        // at startup. Log a warning for operators to catch the mistake.
+        let header_values: Vec<HeaderValue> = origin_strs
+            .iter()
+            .filter_map(|o| match o.parse() {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!(origin = %o, error = %e, "ignoring invalid origin in AGOS_CORS_ORIGINS");
+                    None
+                }
+            })
+            .collect();
+        cors = cors.allow_origin(header_values);
+        cors
+    } else {
+        // Default to restrictive CORS when no origins configured.
+        // Only allow same-origin requests (no CORS headers sent).
+        tower_http::cors::CorsLayer::new()
+            .allow_origin([])
+            .allow_methods([])
+            .allow_headers([])
+    }
+}
 
 /// Build the axum router with all routes and shared state.
-pub fn create_app(
-    store: Arc<Store>,
-    attempt_timeout: Duration,
-    http_client: reqwest::Client,
-) -> Router {
-    let state = AppState {
-        store,
-        attempt_timeout,
-        http_client,
-        routing_state: RoutingState::default(),
-        rate_limiter: Arc::new(ratelimit::RateLimiter::new()),
-    };
+pub fn create_app(state: AppState) -> Router {
+    let cors_layer = build_cors_layer();
+
     Router::new()
         .route(
             "/v1/chat/completions",
@@ -62,47 +96,26 @@ pub fn create_app(
         )
         .route("/v1/embeddings", axum::routing::post(handlers::embeddings))
         .route("/v1/models", axum::routing::get(handlers::list_models))
-        // Health endpoints are intentionally outside the auth layer so
-        // orchestrators can probe them without a bearer token.
         .route("/health", axum::routing::get(health_check))
         .route("/ready", axum::routing::get(readiness_check))
         .route("/metrics", axum::routing::get(metrics_handler))
-        .route(
-            "/v1/providers/health",
-            axum::routing::get(provider_health_handler),
-        )
+        .route("/v1/providers/health", axum::routing::get(provider_health_handler))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::auth_middleware,
         ))
-        // Security hardening applied to every response.
         .layer(axum::middleware::from_fn(middleware::security_headers))
-        // Request id propagation + structured access logging.
-        .layer(axum::middleware::from_fn(
-            middleware::request_id_and_logging,
-        ))
-        // CORS — allow web clients to call the API directly. Permissive by
-        // default; tighten with a custom layer in production if needed.
-        .layer(
-            tower_http::cors::CorsLayer::new()
-                .allow_origin(tower_http::cors::Any)
-                .allow_methods(tower_http::cors::Any)
-                .allow_headers(tower_http::cors::Any),
-        )
-        // Response compression — gzip responses when the client supports it.
+        .layer(axum::middleware::from_fn(middleware::request_id_and_logging))
+        .layer(cors_layer)
         .layer(tower_http::compression::CompressionLayer::new())
-        // Request timeout — drop requests that take too long.
         .layer(tower_http::timeout::TimeoutLayer::with_status_code(
             axum::http::StatusCode::REQUEST_TIMEOUT,
             REQUEST_TIMEOUT,
         ))
-        // Body size limit applied as the outermost layer so it short-circuits
-        // before any deserialization work.
         .layer(tower_http::limit::RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .with_state(state)
 }
 
-/// Liveness probe — always returns 200 once the server is up.
 async fn health_check() -> axum::response::Response {
     axum::response::Response::builder()
         .status(200)
@@ -111,8 +124,9 @@ async fn health_check() -> axum::response::Response {
         .unwrap()
 }
 
-/// Readiness probe — returns 200 only when the store is reachable.
-async fn readiness_check(State(state): State<AppState>) -> axum::response::Response {
+async fn readiness_check(
+    State(state): State<AppState>,
+) -> axum::response::Response {
     match state.store.list_profiles() {
         Ok(_) => axum::response::Response::builder()
             .status(200)
@@ -130,7 +144,6 @@ async fn readiness_check(State(state): State<AppState>) -> axum::response::Respo
     }
 }
 
-/// Initialize tracing and start the server on `bind_addr`.
 pub async fn serve(bind_addr: &str) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -142,28 +155,42 @@ pub async fn serve(bind_addr: &str) -> Result<()> {
     std::fs::create_dir_all(&home)?;
     let store = Arc::new(Store::open(Store::default_path(&home))?);
     let http_client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(30))
-        .pool_max_idle_per_host(10)
-        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_max_idle_per_host(50)
+        .pool_idle_timeout(Duration::from_secs(300))
         .build()?;
-    let app = create_app(store.clone(), Duration::from_secs(10), http_client.clone());
+    let rate_limiter = Arc::new(ratelimit::RateLimiter::new());
+    let state = AppState {
+        store: store.clone(),
+        attempt_timeout: Duration::from_secs(10),
+        http_client: http_client.clone(),
+        routing_state: RoutingState::default(),
+        rate_limiter: rate_limiter.clone(),
+        require_auth_on_health: false,
+    };
+    let app = create_app(state);
 
-    // Start the background health-probe runner so dead entries can recover.
-    health::spawn(store, http_client);
+    let health_handle = health::spawn(
+        store,
+        http_client,
+        Some(rate_limiter),
+    );
 
     let listener = TcpListener::bind(bind_addr).await?;
     tracing::info!("AGOS Proxy listening on {bind_addr}");
 
-    // Graceful shutdown on Ctrl+C or SIGTERM so in-flight requests finish.
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 
+    health_handle.abort();
     Ok(())
 }
 
-/// Basic metrics endpoint — returns request counts and uptime.
-async fn metrics_handler(State(state): State<AppState>) -> axum::response::Response {
+async fn metrics_handler(
+    State(state): State<AppState>,
+) -> axum::response::Response {
     let profiles = state.store.list_profiles().unwrap_or_default();
     let total_profiles = profiles.len();
     let mut total_providers = 0;
@@ -171,10 +198,16 @@ async fn metrics_handler(State(state): State<AppState>) -> axum::response::Respo
     let mut healthy_entries = 0;
     let mut unhealthy_entries = 0;
 
+    let mut total_proxies = 0;
+
     for profile in &profiles {
-        let providers = state.store.list_proxies(&profile.id).unwrap_or_default();
-        total_providers += providers.len();
+        // Count actual providers (not proxies)
+        let profile_providers = state.store.list_providers(&profile.id).unwrap_or_default();
+        total_providers += profile_providers.len();
+
         let proxies = state.store.list_proxies(&profile.id).unwrap_or_default();
+        total_proxies += proxies.len();
+
         for proxy in &proxies {
             let routes = state.store.list_routes(proxy.id).unwrap_or_default();
             total_routes += routes.len();
@@ -195,15 +228,13 @@ async fn metrics_handler(State(state): State<AppState>) -> axum::response::Respo
         }
     }
 
-    let uptime_seconds = SERVER_START_TIME.elapsed().as_secs();
-
     let metrics = serde_json::json!({
         "profiles": total_profiles,
-        "proxies": total_providers,
+        "providers": total_providers,
+        "proxies": total_proxies,
         "routes": total_routes,
         "healthy_entries": healthy_entries,
         "unhealthy_entries": unhealthy_entries,
-        "uptime_seconds": uptime_seconds,
     });
 
     axum::response::Response::builder()
@@ -213,8 +244,9 @@ async fn metrics_handler(State(state): State<AppState>) -> axum::response::Respo
         .unwrap()
 }
 
-/// Provider health status endpoint — returns health status of all route entries.
-async fn provider_health_handler(State(state): State<AppState>) -> axum::response::Response {
+async fn provider_health_handler(
+    State(state): State<AppState>,
+) -> axum::response::Response {
     let mut entries = Vec::new();
     let profiles = state.store.list_profiles().unwrap_or_default();
 
@@ -250,7 +282,6 @@ async fn provider_health_handler(State(state): State<AppState>) -> axum::respons
         .unwrap()
 }
 
-/// Future that resolves when a shutdown signal is received.
 async fn shutdown_signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c()

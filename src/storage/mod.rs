@@ -460,7 +460,7 @@ impl Store {
                     spec.base_url.as_str(),
                     encrypted_token,
                     provider_kind_tag(spec.kind),
-                    serde_json::to_string(&spec.extra_headers).unwrap(),
+                    serde_json::to_string(&spec.extra_headers).expect("BTreeMap<String,String> always serializable"),
                 ),
             )
             .context("inserting the provider")?;
@@ -583,7 +583,7 @@ impl Store {
                     spec.base_url.as_str(),
                     encrypted_token,
                     provider_kind_tag(spec.kind),
-                    serde_json::to_string(&spec.extra_headers).unwrap(),
+                    serde_json::to_string(&spec.extra_headers).expect("BTreeMap<String,String> always serializable"),
                     id,
                 ),
             )
@@ -817,7 +817,7 @@ impl Store {
                     priority,
                     weight,
                     status_tag(ModelStatus::Healthy),
-                    serde_json::to_string(&capabilities).unwrap(),
+                    serde_json::to_string(&capabilities).expect("RouteCapabilities always serializable"),
                 ),
             )
             .context("inserting the route model")?;
@@ -899,7 +899,7 @@ impl Store {
                     model_id,
                     provider_id,
                     weight,
-                    serde_json::to_string(&capabilities).unwrap(),
+                    serde_json::to_string(&capabilities).expect("RouteCapabilities always serializable"),
                     id,
                 ),
             )
@@ -1086,6 +1086,19 @@ impl Store {
             out.push(item?);
         }
         Ok(out)
+    }
+
+    /// Remove usage records older than `keep_days` days. Returns the number of rows deleted.
+    /// Called periodically to prevent unbounded database growth.
+    pub fn prune_usage_log(&self, keep_days: u32) -> Result<usize> {
+        let cutoff = chrono::Utc::now()
+            .checked_sub_signed(chrono::Duration::days(keep_days as i64))
+            .expect("invalid cutoff date")
+            .timestamp_millis();
+        let deleted = self
+            .conn()
+            .execute("DELETE FROM usage_log WHERE created_at < ?1", (cutoff,))?;
+        Ok(deleted)
     }
 }
 

@@ -24,6 +24,8 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     pub routing_state: RoutingState,
     pub rate_limiter: Arc<crate::server::ratelimit::RateLimiter>,
+    /// When true, the /ready endpoint requires authentication.
+    pub require_auth_on_health: bool,
 }
 
 /// Legacy OpenAI completions request (non-streaming passthrough).

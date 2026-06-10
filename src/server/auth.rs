@@ -16,13 +16,20 @@ pub async fn auth_middleware(
     mut request: Request,
     next: Next,
 ) -> Response {
-    // Health endpoints are intentionally unauthenticated so orchestrators can
-    // probe them without a bearer token.
     let path = request.uri().path();
-    if path == "/health" || path == "/ready" {
+
+    // Health endpoints may be authenticated depending on configuration.
+    // /health is always unauthenticated for basic liveness probing.
+    // /ready can be gated if require_auth_on_health is set.
+    if path == "/health" {
         return next.run(request).await;
     }
 
+    if path == "/ready" && !state.require_auth_on_health {
+        return next.run(request).await;
+    }
+
+    // All other endpoints (including /ready when auth is required) need auth.
     let token = request
         .headers()
         .get("Authorization")
@@ -51,7 +58,13 @@ pub async fn auth_middleware(
                     .header("Content-Type", "application/json")
                     .header("Retry-After", "60")
                     .body(axum::body::Body::from(body.to_string()))
-                    .unwrap();
+                    .unwrap_or_else(|_| {
+                        axum::response::Response::builder()
+                            .status(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+                            .header("Content-Type", "application/json")
+                            .body(axum::body::Body::from("internal error"))
+                            .unwrap()
+                    });
             }
             // Token is guaranteed present here because `get_profile_by_id`
             // returned `Some` only when `token` was `Some`.
@@ -71,7 +84,13 @@ pub async fn auth_middleware(
                 .status(axum::http::StatusCode::UNAUTHORIZED)
                 .header("Content-Type", "application/json")
                 .body(axum::body::Body::from(body.to_string()))
-                .unwrap()
+                .unwrap_or_else(|_| {
+                    axum::response::Response::builder()
+                        .status(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+                        .header("Content-Type", "application/json")
+                        .body(axum::body::Body::from("internal error"))
+                        .unwrap()
+                })
         }
     }
 }

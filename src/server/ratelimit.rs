@@ -51,6 +51,23 @@ impl RateLimiter {
         window.push_back(now);
         true
     }
+
+    /// Remove entries for keys that haven't been seen recently.
+    /// Called periodically to prevent unbounded memory growth.
+    /// Keys whose entire window is older than `max_age` are removed.
+    pub fn prune(&self, max_age: Duration) {
+        let mut windows = self
+            .windows
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Instant::now();
+        windows.retain(|_key, deque| {
+            // Remove timestamps older than max_age
+            deque.retain(|&t| now.duration_since(t) < max_age);
+            // Keep the entry only if there are still recent timestamps
+            !deque.is_empty()
+        });
+    }
 }
 
 #[cfg(test)]
