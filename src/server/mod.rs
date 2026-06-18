@@ -247,18 +247,48 @@ async fn metrics_handler(
 async fn provider_health_handler(
     State(state): State<AppState>,
 ) -> axum::response::Response {
+    // Any store failure is surfaced as a 500 so the caller knows the reported
+    // health is incomplete rather than silently returning an empty list.
+    let entries = match collect_provider_health(&state.store) {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to collect provider health");
+            return axum::response::Response::builder()
+                .status(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+                .header("Content-Type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({ "error": "failed to read provider health" }).to_string(),
+                ))
+                .unwrap();
+        }
+    };
+
+    axum::response::Response::builder()
+        .status(200)
+        .header("Content-Type", "application/json")
+        .body(axum::body::Body::from(
+            serde_json::json!({ "entries": entries }).to_string(),
+        ))
+        .unwrap()
+}
+
+/// Collect per-entry health information across every profile. Returns a typed
+/// error on any store failure instead of silently skipping rows, so the caller
+/// can respond with a 5xx rather than an incomplete 200.
+fn collect_provider_health(store: &Store) -> anyhow::Result<Vec<serde_json::Value>> {
     let mut entries = Vec::new();
-    let profiles = state.store.list_profiles().unwrap_or_default();
+    let profiles = store.list_profiles()?;
 
     for profile in &profiles {
-        let proxies = state.store.list_proxies(&profile.id).unwrap_or_default();
+        let proxies = store.list_proxies(&profile.id)?;
         for proxy in &proxies {
-            let routes = state.store.list_routes(proxy.id).unwrap_or_default();
+            let routes = store.list_routes(proxy.id)?;
             for route in &routes {
-                let route_entries = state.store.route_entries(route.id).unwrap_or_default();
-                for entry in &route_entries {
-                    let provider = state.store.get_provider(entry.provider_id).ok().flatten();
-                    let provider_name = provider.map(|p| p.name.clone()).unwrap_or_default();
+                for entry in store.route_entries(route.id)? {
+                    let provider_name = store
+                        .get_provider(entry.provider_id)?
+                        .map(|provider| provider.name)
+                        .unwrap_or_default();
                     entries.push(serde_json::json!({
                         "entry_id": entry.id,
                         "profile": profile.name,
@@ -273,13 +303,7 @@ async fn provider_health_handler(
         }
     }
 
-    axum::response::Response::builder()
-        .status(200)
-        .header("Content-Type", "application/json")
-        .body(axum::body::Body::from(
-            serde_json::json!({ "entries": entries }).to_string(),
-        ))
-        .unwrap()
+    Ok(entries)
 }
 
 async fn shutdown_signal() {
