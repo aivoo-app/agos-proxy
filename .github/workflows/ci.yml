@@ -78,8 +78,7 @@ jobs:
       - name: Wait for proxy to be ready
         run: |
           for i in $(seq 1 30); do
-            if curl -sf -H 'Authorization: Bearer dummy' \
-              http://localhost:8080/v1/models >/dev/null 2>&1; then
+            if curl -sf http://localhost:8080/ready >/dev/null 2>&1; then
               echo 'proxy ready'
               exit 0
             fi
