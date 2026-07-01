@@ -253,17 +253,45 @@ impl Store {
         description: Option<&str>,
         password_hash: Option<&str>,
     ) -> Result<Profile> {
-        let now = now_millis();
         let id = fresh_token()?;
+        self.insert_profile(name, description, password_hash, &id)
+    }
+
+    /// Create a profile with an explicitly supplied token (its id / bearer).
+    ///
+    /// Used by scripted and container provisioning where the caller must know
+    /// the API token up front (e.g. the docker-compose smoke tests). The token
+    /// must be unique; passing one that already exists is an error.
+    pub fn create_profile_with_token(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        password_hash: Option<&str>,
+        token: &str,
+    ) -> Result<Profile> {
+        if token.is_empty() {
+            bail!("profile token must not be empty");
+        }
+        self.insert_profile(name, description, password_hash, token)
+    }
+
+    fn insert_profile(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        password_hash: Option<&str>,
+        id: &str,
+    ) -> Result<Profile> {
+        let now = now_millis();
         self.conn()
             .execute(
                 "INSERT INTO profiles (id, name, description, password_hash, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                (&id, name, description, password_hash, now, now),
+                (id, name, description, password_hash, now, now),
             )
             .context("inserting the profile")?;
         Ok(Profile {
-            id,
+            id: id.to_string(),
             name: name.to_string(),
             description: description.map(|d| d.to_string()),
             password_hash: password_hash.map(|p| p.to_string()),

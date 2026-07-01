@@ -50,6 +50,11 @@ pub struct Setup {
     /// Optional free-text description for the profile.
     #[serde(default)]
     pub description: Option<String>,
+    /// Optional explicit API token (bearer) for the profile. When omitted, a
+    /// random one is generated and printed. Useful for scripted or container
+    /// provisioning where the caller must know the token ahead of time.
+    #[serde(default)]
+    pub token: Option<String>,
     /// Upstreams to register under the profile.
     #[serde(default)]
     pub providers: Vec<ProviderSpec>,
@@ -168,7 +173,15 @@ fn parse_strategy(raw: Option<&str>) -> Result<RoutingStrategy> {
 fn apply(setup: Setup) -> Result<()> {
     let store = open_store()?;
 
-    let profile = store.create_profile(&setup.profile, setup.description.as_deref(), None)?;
+    let profile = match setup.token.as_deref() {
+        Some(token) => store.create_profile_with_token(
+            &setup.profile,
+            setup.description.as_deref(),
+            None,
+            token,
+        )?,
+        None => store.create_profile(&setup.profile, setup.description.as_deref(), None)?,
+    };
     println!("profile: {}", profile.name);
 
     let mut provider_ids = std::collections::BTreeMap::new();

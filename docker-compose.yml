@@ -24,6 +24,7 @@ services:
         {
           "profile": "docker-tenant",
           "description": "created by docker compose",
+          "token": "sk-mock",
           "providers": [
             {"name": "mock", "base_url": "http://mock:9999", "auth_token": "sk-mock", "kind": "openai_compatible"}
           ],
