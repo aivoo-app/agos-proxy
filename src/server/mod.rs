@@ -99,13 +99,18 @@ pub fn create_app(state: AppState) -> Router {
         .route("/health", axum::routing::get(health_check))
         .route("/ready", axum::routing::get(readiness_check))
         .route("/metrics", axum::routing::get(metrics_handler))
-        .route("/v1/providers/health", axum::routing::get(provider_health_handler))
+        .route(
+            "/v1/providers/health",
+            axum::routing::get(provider_health_handler),
+        )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::auth_middleware,
         ))
         .layer(axum::middleware::from_fn(middleware::security_headers))
-        .layer(axum::middleware::from_fn(middleware::request_id_and_logging))
+        .layer(axum::middleware::from_fn(
+            middleware::request_id_and_logging,
+        ))
         .layer(cors_layer)
         .layer(tower_http::compression::CompressionLayer::new())
         .layer(tower_http::timeout::TimeoutLayer::with_status_code(
@@ -124,9 +129,7 @@ async fn health_check() -> axum::response::Response {
         .unwrap()
 }
 
-async fn readiness_check(
-    State(state): State<AppState>,
-) -> axum::response::Response {
+async fn readiness_check(State(state): State<AppState>) -> axum::response::Response {
     match state.store.list_profiles() {
         Ok(_) => axum::response::Response::builder()
             .status(200)
@@ -171,11 +174,7 @@ pub async fn serve(bind_addr: &str) -> Result<()> {
     };
     let app = create_app(state);
 
-    let health_handle = health::spawn(
-        store,
-        http_client,
-        Some(rate_limiter),
-    );
+    let health_handle = health::spawn(store, http_client, Some(rate_limiter));
 
     let listener = TcpListener::bind(bind_addr).await?;
     tracing::info!("AGOS Proxy listening on {bind_addr}");
@@ -188,9 +187,7 @@ pub async fn serve(bind_addr: &str) -> Result<()> {
     Ok(())
 }
 
-async fn metrics_handler(
-    State(state): State<AppState>,
-) -> axum::response::Response {
+async fn metrics_handler(State(state): State<AppState>) -> axum::response::Response {
     let profiles = state.store.list_profiles().unwrap_or_default();
     let total_profiles = profiles.len();
     let mut total_providers = 0;
@@ -244,9 +241,7 @@ async fn metrics_handler(
         .unwrap()
 }
 
-async fn provider_health_handler(
-    State(state): State<AppState>,
-) -> axum::response::Response {
+async fn provider_health_handler(State(state): State<AppState>) -> axum::response::Response {
     // Any store failure is surfaced as a 500 so the caller knows the reported
     // health is incomplete rather than silently returning an empty list.
     let entries = match collect_provider_health(&state.store) {
