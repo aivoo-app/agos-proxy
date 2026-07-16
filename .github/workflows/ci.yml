@@ -50,7 +50,7 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Tests
-        run: cargo test --all-targets -- --test-threads=auto
+        run: cargo test --all-targets
 
       - name: Release build
         run: cargo build --release
