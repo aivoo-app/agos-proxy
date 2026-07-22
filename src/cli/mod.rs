@@ -18,6 +18,7 @@
 //! ├── route     create  status  manage routes and their model chains
 //! ├── chat                      test a proxy/route interactively
 //! ├── setup                     guided terminal setup wizard
+//! ├── gen-docs                  generate CLI reference, man pages, completions
 //! └── config    export  import  move a profile setup between machines
 //! ```
 
@@ -29,6 +30,7 @@ use clap::{Parser, Subcommand};
 mod bootstrap;
 mod chat;
 mod config;
+pub mod gen_docs;
 mod profile;
 mod provider;
 mod proxy;
@@ -84,6 +86,15 @@ pub enum Command {
     Bootstrap(bootstrap::BootstrapArgs),
     /// Guided terminal setup wizard: profile -> providers -> proxies -> routes.
     Setup(setup::SetupArgs),
+    /// Generate developer documentation (CLI reference, man pages, completions).
+    GenDocs {
+        /// Directory to write the generated docs into (created if missing).
+        #[arg(long, value_name = "DIR", default_value = "./target/docs")]
+        output_dir: PathBuf,
+        /// Also generate the roff man page and shell completions.
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 /// Where AGOS Proxy looks for its working files. Uses the platform config dir
@@ -112,13 +123,17 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Usage(args) => usage::run(args),
         Command::Bootstrap(args) => bootstrap::run(args),
         Command::Setup(args) => setup::run(args),
+        Command::GenDocs { output_dir, all } => gen_docs::run(output_dir, all),
     }
 }
 
 fn server_command(bind: &str) -> Result<()> {
-    // The runtime is intentionally small: open the store, build the router, and
-    // hand off to tokio. All the interesting work happens inside the handlers.
+    let worker_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2)
+        .clamp(2, 4);
     let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
         .enable_all()
         .build()?;
     let addr = bind.to_string();

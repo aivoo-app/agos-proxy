@@ -22,8 +22,10 @@ required-features = ["gen-docs"]
 
 [features]
 default = []
-# Enables the gen-docs binary (pulls in clap_mangen + clap_complete).
-gen-docs = ["clap_mangen", "clap_complete"]
+# Marker enabling the standalone gen-docs binary. The doc tooling itself is a
+# first-class `gen-docs` subcommand of the main binary, so the supporting crates
+# are always compiled; this feature only gates the extra developer-only binary.
+gen-docs = []
 
 [dependencies]
 anyhow = "1"
@@ -51,8 +53,8 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 clap-markdown = "0.1.5"
 futures = "0.3.31"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
-clap_mangen = { version = "0.3.3", optional = true }
-clap_complete = { version = "4.6.9", optional = true }
+clap_mangen = { version = "0.3.3" }
+clap_complete = { version = "4.6.9" }
 ratatui = "0.29"
 crossterm = "0.28"
 tower-http = { version = "0.6", features = ["cors", "limit", "request-id", "trace", "compression-gzip", "timeout"] }

@@ -48,6 +48,9 @@ RUST_LOG=agos_proxy=debug   agos-proxy serve
 RUST_LOG=off      agos-proxy serve
 ```
 
+When set to `off`, the logging layer is entirely skipped at startup,
+reducing idle memory and eliminating per-request formatting overhead.
+
 ## CLI configuration workflow
 
 The CLI is the only way to configure AGOS Proxy. The typical sequence:

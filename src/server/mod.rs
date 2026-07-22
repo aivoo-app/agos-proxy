@@ -148,11 +148,13 @@ async fn readiness_check(State(state): State<AppState>) -> axum::response::Respo
 }
 
 pub async fn serve(bind_addr: &str) -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    if std::env::var("RUST_LOG").unwrap_or_default() != "off" {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            )
+            .init();
+    }
 
     let home = data_dir()?;
     std::fs::create_dir_all(&home)?;
@@ -160,8 +162,8 @@ pub async fn serve(bind_addr: &str) -> Result<()> {
     let http_client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(30))
-        .pool_max_idle_per_host(50)
-        .pool_idle_timeout(Duration::from_secs(300))
+        .pool_max_idle_per_host(5)
+        .pool_idle_timeout(Duration::from_secs(60))
         .build()?;
     let rate_limiter = Arc::new(ratelimit::RateLimiter::new());
     let state = AppState {

@@ -7,6 +7,10 @@
 pub const SCHEMA: &str = "
     PRAGMA journal_mode = WAL;
     PRAGMA foreign_keys = ON;
+    PRAGMA cache_size = -65536;
+    PRAGMA mmap_size = 268435456;
+    PRAGMA synchronous = NORMAL;
+    PRAGMA temp_store = MEMORY;
 
     CREATE TABLE IF NOT EXISTS meta (
         key   TEXT PRIMARY KEY,
