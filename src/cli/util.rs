@@ -102,6 +102,168 @@ pub fn require_profile(store: &Store, name: &str) -> Result<crate::domain::Profi
         .with_context(|| format!("no profile named {name:?}"))
 }
 
+/// Mask a token for display: keep the first 6 and last 4 characters, hide the
+/// rest. Short tokens are fully masked.
+pub fn mask_token(token: &str) -> String {
+    let chars: Vec<char> = token.chars().collect();
+    if chars.len() <= 12 {
+        return "*".repeat(chars.len());
+    }
+    let head: String = chars[..6].iter().collect();
+    let tail: String = chars[chars.len() - 4..].iter().collect();
+    format!("{head}…{tail}")
+}
+
+/// Prompt for an API token with paste verification.
+///
+/// The value is read hidden (so bystanders don't see it), trimmed (pasted
+/// tokens often carry a trailing newline), shown masked with its length, and
+/// then confirmed — with an option to reveal it in full — before it is
+/// accepted. Re-enters the loop until the user confirms.
+///
+/// With `allow_empty` the user may submit an empty value (used by flows that
+/// treat "empty" as "keep the current token").
+pub fn prompt_token(
+    theme: &dialoguer::theme::ColorfulTheme,
+    prompt: &str,
+    allow_empty: bool,
+) -> Result<String> {
+    use dialoguer::{Confirm, Password, Select};
+    loop {
+        let raw: String = Password::with_theme(theme)
+            .with_prompt(prompt)
+            .allow_empty_password(allow_empty)
+            .interact()?;
+        let token = raw.trim().to_string();
+        if token.is_empty() {
+            if allow_empty {
+                return Ok(token);
+            }
+            println!("The token is empty — please paste it again.");
+            continue;
+        }
+        println!(
+            "Token: {} ({} characters, trailing whitespace stripped)",
+            mask_token(&token),
+            token.len()
+        );
+        let choices = ["Yes — save it", "Reveal the full token", "No — re-enter it"];
+        let idx = Select::with_theme(theme)
+            .with_prompt("Is this the token you meant to paste?")
+            .items(&choices)
+            .default(0)
+            .interact()?;
+        match idx {
+            0 => return Ok(token),
+            1 => {
+                println!("{token}");
+                let sure = Confirm::with_theme(theme)
+                    .with_prompt("Save this token?")
+                    .default(true)
+                    .interact()?;
+                if sure {
+                    return Ok(token);
+                }
+            }
+            _ => continue,
+        }
+    }
+}
+
+/// Fetch the model catalogue from an OpenAI-compatible provider
+/// (`GET {base}/models` with the provider's bearer token). Returns sorted
+/// model IDs.
+pub fn fetch_provider_models(provider: &crate::domain::Provider) -> Result<Vec<String>> {
+    use anyhow::Context as _;
+    let provider = provider.clone();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let ids = rt.block_on(async move {
+        let base = crate::translator::normalize_base(&provider.base_url);
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .context("building the HTTP client")?;
+        let mut req = client.get(format!("{base}/models"));
+        if !provider.auth_token.is_empty() {
+            req = req.bearer_auth(&provider.auth_token);
+        }
+        let resp = req.send().await.context("reaching the provider")?;
+        let status = resp.status();
+        let json: serde_json::Value = resp
+            .json()
+            .await
+            .context("parsing the provider's model list")?;
+        anyhow::ensure!(status.is_success(), "provider returned {status}");
+        let mut ids: Vec<String> = json
+            .get("data")
+            .and_then(|d| d.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| m.get("id").and_then(|v| v.as_str()).map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        ids.sort();
+        Ok(ids)
+    })?;
+    Ok(ids)
+}
+
+/// Pick a model ID for `provider`: either browse the provider's live model
+/// catalogue with a searchable menu, or type an ID manually. Falls back to
+/// manual input when the catalogue cannot be fetched (offline, bad token, or a
+/// provider kind that does not expose an OpenAI-style model list).
+pub fn prompt_model_id(
+    theme: &dialoguer::theme::ColorfulTheme,
+    provider: &crate::domain::Provider,
+    prompt: &str,
+) -> Result<String> {
+    use dialoguer::{FuzzySelect, Input, Select};
+    let browseable = matches!(
+        provider.kind,
+        crate::domain::ProviderKind::OpenAICompatible | crate::domain::ProviderKind::Custom
+    );
+    loop {
+        if browseable {
+            let choices = [
+                format!("Browse models from {:?} (fetch from the API)", provider.name),
+                "Type the model ID manually".to_string(),
+            ];
+            let idx = Select::with_theme(theme)
+                .with_prompt(prompt)
+                .items(&choices)
+                .default(0)
+                .interact()?;
+            if idx == 0 {
+                println!("Fetching models from {} …", provider.base_url);
+                match fetch_provider_models(provider) {
+                    Ok(ids) if !ids.is_empty() => {
+                        let sel = FuzzySelect::with_theme(theme)
+                            .with_prompt(format!("Search models from {:?}", provider.name))
+                            .items(&ids)
+                            .interact()?;
+                        return Ok(ids[sel].clone());
+                    }
+                    Ok(_) => println!("The provider returned an empty model list."),
+                    Err(e) => println!("Could not fetch the model list: {e:#}"),
+                }
+                continue;
+            }
+        }
+        let model_id: String = Input::<String>::with_theme(theme)
+            .with_prompt("Model ID (e.g. deepseek/deepseek-v4-flash)")
+            .interact_text()?;
+        let model_id = model_id.trim().to_string();
+        if model_id.is_empty() {
+            println!("The model ID is empty — please enter it again.");
+            continue;
+        }
+        return Ok(model_id);
+    }
+}
+
 /// Collect extra headers interactively; empty input finishes the loop.
 pub fn prompt_headers() -> Result<std::collections::BTreeMap<String, String>> {
     use dialoguer::{theme::ColorfulTheme, Input};
@@ -283,5 +445,11 @@ mod tests {
     #[test]
     fn unknown_hash_format_is_rejected() {
         assert!(verify_password("plaintext", "x").is_err());
+    }
+
+    #[test]
+    fn mask_token_hides_middle() {
+        assert_eq!(mask_token("sk-or-v1-abcdef1234567890"), "sk-or-…7890");
+        assert_eq!(mask_token("short"), "*****");
     }
 }

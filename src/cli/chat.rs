@@ -36,6 +36,20 @@ pub fn run(args: ChatArgs) -> Result<()> {
     let store = open_store()?;
     let theme = ColorfulTheme::default();
 
+    // Surface the failover chain's warnings (attempt failed / timed out) in the
+    // REPL so a silent chain is never mistaken for a hang. The TUI gets its own
+    // tracing setup (or none) because raw log lines would corrupt its rendering.
+    if !args.tui {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+            )
+            .with_target(false)
+            .with_writer(std::io::stderr)
+            .try_init();
+    }
+
     let profile = select_profile(&store, &theme)?;
     let proxy = select_proxy(&store, &theme, &profile)?;
     let route = select_route(&store, &theme, &proxy)?;
@@ -75,6 +89,7 @@ pub fn run(args: ChatArgs) -> Result<()> {
             RoutingState::default(),
             profile.id.clone(),
             model,
+            chain_len,
             Duration::from_secs(60),
         )
         .await
@@ -174,6 +189,7 @@ async fn chat_session(
     routing: RoutingState,
     profile_id: String,
     model: String,
+    chain_len: usize,
     attempt_timeout: Duration,
 ) -> Result<()> {
     let mut history: Vec<Message> = Vec::new();
@@ -206,6 +222,7 @@ async fn chat_session(
                     content: serde_json::Value::String(text.to_string()),
                 });
 
+                eprintln!("thinking… (failover chain: {chain_len} model(s))");
                 match send_turn(
                     &store,
                     &client,
@@ -218,14 +235,14 @@ async fn chat_session(
                 .await
                 {
                     Ok(reply) => {
-                        println!("assistant> {reply}");
                         history.push(Message {
                             role: "assistant".into(),
-                            content: serde_json::Value::String(reply),
+                            content: serde_json::Value::String(reply.clone()),
                         });
+                        println!("assistant> {reply}");
                     }
                     Err(e) => {
-                        eprintln!("(no reply — {e}; use /clear if the context feels stale)");
+                        eprintln!("(no reply — {e:#}; use /clear if the context feels stale)");
                     }
                 }
             }

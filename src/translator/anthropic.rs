@@ -10,11 +10,11 @@ use anyhow::{Context as _, Result};
 
 use crate::domain::ProviderKind;
 use crate::router::Target;
-use crate::translator::{content_text, ChatRequest};
+use crate::translator::{content_text, normalize_base, ChatRequest};
 
 /// Build the upstream URL for an Anthropic request.
 pub fn build_url(target: &Target) -> String {
-    let base = target.provider.base_url.trim_end_matches('/');
+    let base = normalize_base(&target.provider.base_url);
     format!("{base}/v1/messages")
 }
 

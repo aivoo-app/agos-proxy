@@ -953,6 +953,7 @@ impl Store {
     /// the health probe should check.
     pub fn entries_needing_probe(&self) -> Result<Vec<(RouteEntry, Provider)>> {
         let conn = self.conn();
+        let key = self.master_key().clone();
         let mut stmt = conn.prepare(
             "SELECT e.id, e.route_id, e.provider_id, e.model_id, e.priority,
                     e.weight, e.status, e.capabilities,
@@ -972,6 +973,16 @@ impl Store {
                 let caps_json: String = row.get(7)?;
                 let kind_tag: String = row.get(14)?;
                 let extra_json: String = row.get(15)?;
+                // The auth token is stored encrypted (BLOB); decrypt it here
+                // the same way `list_providers` / `get_provider` do.
+                let enc_token: Vec<u8> = row.get(13)?;
+                let auth_token = crate::crypto::decrypt(&key, &enc_token).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        13,
+                        rusqlite::types::Type::Blob,
+                        format!("decrypting the provider auth token: {e}").into(),
+                    )
+                })?;
                 Ok((
                     RouteEntry {
                         id: row.get(0)?,
@@ -991,7 +1002,7 @@ impl Store {
                         name: row.get(10)?,
                         description: row.get(11)?,
                         base_url: row.get(12)?,
-                        auth_token: row.get(13)?,
+                        auth_token,
                         kind: provider_kind_from_tag(&kind_tag).expect("invalid kind in store"),
                         extra_headers: serde_json::from_str(&extra_json)
                             .expect("invalid headers in store"),

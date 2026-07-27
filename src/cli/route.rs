@@ -324,11 +324,11 @@ fn prompt_route_entry(
     route_id: i64,
     priority: i32,
 ) -> Result<Option<String>> {
-    let model_id: String = Input::<String>::with_theme(theme)
-        .with_prompt("Model ID (e.g. deepseek-v4-flash, empty to finish)")
-        .allow_empty(true)
-        .interact_text()?;
-    if model_id.is_empty() {
+    let another = Confirm::with_theme(theme)
+        .with_prompt(format!("Add a model at priority {priority}?"))
+        .default(true)
+        .interact()?;
+    if !another {
         return Ok(None);
     }
     let providers = store.list_providers(profile.id.as_str())?;
@@ -339,6 +339,11 @@ fn prompt_route_entry(
         );
     }
     let provider = pick_provider(store, profile, "Provider")?;
+    let model_id = crate::cli::util::prompt_model_id(
+        theme,
+        &provider,
+        format!("Pick a model from {:?} or enter it manually", provider.name).as_str(),
+    )?;
     let weight_str: String = Input::<String>::with_theme(theme)
         .with_prompt("Weight")
         .default("1.0".into())

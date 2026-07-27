@@ -10,12 +10,12 @@ use anyhow::{Context as _, Result};
 
 use crate::domain::ProviderKind;
 use crate::router::Target;
-use crate::translator::{content_text, ChatRequest};
+use crate::translator::{content_text, normalize_base, ChatRequest};
 
 /// Build the upstream URL for a Gemini request. The API key goes in the query
 /// string, so the target's auth token is appended there.
 pub fn build_url(target: &Target, stream: bool) -> String {
-    let base = target.provider.base_url.trim_end_matches('/');
+    let base = normalize_base(&target.provider.base_url);
     let model = target.entry.model_id.replace('/', "-");
     if stream {
         format!(

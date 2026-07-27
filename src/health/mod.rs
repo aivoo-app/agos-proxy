@@ -15,6 +15,7 @@ use tracing::info_span;
 use crate::domain::ModelStatus;
 use crate::server::ratelimit::RateLimiter;
 use crate::storage::Store;
+use crate::translator::normalize_base;
 
 /// How often the probe loop wakes up and scans for entries to check.
 const PROBE_INTERVAL: Duration = Duration::from_secs(30);
@@ -104,7 +105,7 @@ async fn run_once(store: Arc<Store>, client: &reqwest::Client) -> Result<()> {
 
 /// Send a lightweight ping to the provider. Returns true on any success.
 async fn ping(client: &reqwest::Client, provider: &crate::domain::Provider) -> bool {
-    let base = provider.base_url.trim_end_matches('/');
+    let base = normalize_base(&provider.base_url);
     let url = format!("{base}{PING_PATH}");
     let mut req = client.get(&url);
     if !provider.auth_token.is_empty() {

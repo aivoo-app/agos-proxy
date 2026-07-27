@@ -16,6 +16,17 @@ use reqwest::Client;
 use crate::domain::ProviderKind;
 use crate::router::Target;
 
+/// Strip a trailing `/v1` segment (and any trailing slashes) from a provider
+/// base URL. The URL builders append their own versioned path
+/// (`/v1/chat/completions`, `/v1/messages`, `/v1beta/models/...`), so a base
+/// URL copied from provider docs that already ends in `/v1` (e.g.
+/// `https://openrouter.ai/api/v1`) would otherwise produce a doubled segment
+/// like `/v1/v1/chat/completions` and 404 on every request and health probe.
+pub fn normalize_base(base_url: &str) -> &str {
+    let base = base_url.trim_end_matches('/');
+    base.strip_suffix("/v1").unwrap_or(base)
+}
+
 /// An OpenAI-compatible chat completions request.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ChatRequest {
@@ -65,7 +76,7 @@ pub fn build_upstream_request(
 ) -> Result<(String, BTreeMap<String, String>, serde_json::Value)> {
     match target.provider.kind {
         ProviderKind::OpenAICompatible => {
-            let base = target.provider.base_url.trim_end_matches('/');
+            let base = normalize_base(&target.provider.base_url);
             let url = format!("{base}/v1/chat/completions");
 
             let mut headers = target.provider.extra_headers.clone();
@@ -101,7 +112,7 @@ pub fn build_upstream_request(
         ProviderKind::Custom => {
             // Custom providers are treated as OpenAI-compatible — the caller
             // supplies their own base URL and the request passes through as-is.
-            let base = target.provider.base_url.trim_end_matches('/');
+            let base = normalize_base(&target.provider.base_url);
             let url = format!("{base}/v1/chat/completions");
             let mut headers = target.provider.extra_headers.clone();
             headers.insert(
@@ -191,6 +202,19 @@ pub fn is_supported(_kind: ProviderKind) -> bool {
 mod tests {
     use super::*;
     use crate::domain::{ModelStatus, Provider, RouteEntry};
+
+    #[test]
+    fn normalize_base_strips_trailing_v1() {
+        assert_eq!(normalize_base("https://openrouter.ai/api/v1"), "https://openrouter.ai/api");
+        assert_eq!(normalize_base("https://api.openai.com/v1/"), "https://api.openai.com");
+        assert_eq!(normalize_base("https://api.deepseek.com"), "https://api.deepseek.com");
+        assert_eq!(normalize_base("http://localhost:11434/v1"), "http://localhost:11434");
+        // /v1beta (Google) must not be touched.
+        assert_eq!(
+            normalize_base("https://generativelanguage.googleapis.com/v1beta"),
+            "https://generativelanguage.googleapis.com/v1beta"
+        );
+    }
 
     fn dummy_target() -> Target {
         let mut extra = BTreeMap::new();

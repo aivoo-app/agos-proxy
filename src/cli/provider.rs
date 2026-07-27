@@ -74,9 +74,7 @@ fn add(store: &crate::storage::Store, profile: Option<String>) -> Result<()> {
         .with_prompt("Base URL")
         .default("https://api.deepseek.com".into())
         .interact_text()?;
-    let auth_token = dialoguer::Password::with_theme(&theme)
-        .with_prompt("API token")
-        .interact()?;
+    let auth_token = crate::cli::util::prompt_token(&theme, "API token", false)?;
     let kind = pick_kind(&theme)?;
     let description: String = Input::<String>::with_theme(&theme)
         .with_prompt("Description (optional)")
@@ -147,9 +145,7 @@ fn edit(store: &crate::storage::Store, profile: Option<String>) -> Result<()> {
         .with_prompt("Base URL")
         .default(provider.base_url.clone())
         .interact_text()?;
-    let auth_token = dialoguer::Password::with_theme(&theme)
-        .with_prompt("API token (enter to keep current)")
-        .interact()?;
+    let auth_token = crate::cli::util::prompt_token(&theme, "API token (empty to keep current)", true)?;
     let final_token = if auth_token.is_empty() {
         provider.auth_token.clone()
     } else {
