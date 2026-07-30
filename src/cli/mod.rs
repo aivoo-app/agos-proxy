@@ -60,6 +60,10 @@ pub enum Command {
         /// Address to bind, e.g. 0.0.0.0:8080.
         #[arg(long, default_value = "127.0.0.1:3000")]
         bind: String,
+        /// Per-attempt timeout in seconds: how long one model may take before
+        /// the router fails over to the next entry in the chain.
+        #[arg(long)]
+        attempt_timeout: Option<u64>,
     },
     /// Manage profiles (tenants) and their API tokens.
     #[command(subcommand)]
@@ -113,7 +117,10 @@ pub fn data_dir() -> Result<PathBuf> {
 /// Dispatch a parsed command line and run it to completion.
 pub fn run(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::Serve { bind } => server_command(&bind),
+        Command::Serve {
+            bind,
+            attempt_timeout,
+        } => server_command(&bind, attempt_timeout),
         Command::Profile(args) => profile::run(args),
         Command::Provider(args) => provider::run(args),
         Command::Proxy(args) => proxy::run(args),
@@ -127,7 +134,7 @@ pub fn run(cli: Cli) -> Result<()> {
     }
 }
 
-fn server_command(bind: &str) -> Result<()> {
+fn server_command(bind: &str, attempt_timeout_secs: Option<u64>) -> Result<()> {
     let worker_threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(2)
@@ -137,6 +144,8 @@ fn server_command(bind: &str) -> Result<()> {
         .enable_all()
         .build()?;
     let addr = bind.to_string();
-    rt.block_on(async move { crate::server::serve(&addr).await })?;
+    rt.block_on(async move {
+        crate::server::serve(&addr, attempt_timeout_secs.map(std::time::Duration::from_secs)).await
+    })?;
     Ok(())
 }

@@ -74,6 +74,22 @@ RUST_LOG=off agos-proxy serve
 
 ---
 
+### `AGOS_ATTEMPT_TIMEOUT_SECS`
+
+| | |
+|---|---|
+| **Purpose** | Per-attempt failover timeout: how long one model may take before the router moves to the next entry in the chain |
+| **Default** | `10` seconds |
+| **Used by** | `agos-proxy serve` only |
+| **Example** | `AGOS_ATTEMPT_TIMEOUT_SECS=30 agos-proxy serve` |
+
+The `--attempt-timeout` command-line flag takes precedence over this variable,
+which in turn takes precedence over the built-in default. Raise it if your
+chain contains slow reasoning models that legitimately take longer than 10
+seconds to produce their first token.
+
+---
+
 ## Docker / Bootstrap
 
 ### `AGOS_SETUP`

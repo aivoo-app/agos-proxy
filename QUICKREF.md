@@ -28,6 +28,7 @@ docker compose up -d                     # run with Docker
 ```sh
 agos-proxy serve                         # bind 127.0.0.1:3000
 agos-proxy serve --bind 0.0.0.0:8080     # custom bind
+agos-proxy serve --attempt-timeout 30    # failover timeout per model attempt
 ```
 
 ## Profile

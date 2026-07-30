@@ -147,7 +147,7 @@ async fn readiness_check(State(state): State<AppState>) -> axum::response::Respo
     }
 }
 
-pub async fn serve(bind_addr: &str) -> Result<()> {
+pub async fn serve(bind_addr: &str, cli_attempt_timeout: Option<Duration>) -> Result<()> {
     if std::env::var("RUST_LOG").unwrap_or_default() != "off" {
         tracing_subscriber::fmt()
             .with_env_filter(
@@ -166,9 +166,21 @@ pub async fn serve(bind_addr: &str) -> Result<()> {
         .pool_idle_timeout(Duration::from_secs(60))
         .build()?;
     let rate_limiter = Arc::new(ratelimit::RateLimiter::new());
+    // Per-attempt failover timeout: how long one model may take before the
+    // router gives up on it and moves to the next entry in the chain.
+    // Configurable via `--attempt-timeout` or `AGOS_ATTEMPT_TIMEOUT_SECS`.
+    // Precedence: --attempt-timeout flag > AGOS_ATTEMPT_TIMEOUT_SECS env > 10s.
+    let attempt_timeout = cli_attempt_timeout
+        .or_else(|| {
+            std::env::var("AGOS_ATTEMPT_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .map(Duration::from_secs)
+        })
+        .unwrap_or(Duration::from_secs(10));
     let state = AppState {
         store: store.clone(),
-        attempt_timeout: Duration::from_secs(10),
+        attempt_timeout,
         http_client: http_client.clone(),
         routing_state: RoutingState::default(),
         rate_limiter: rate_limiter.clone(),

@@ -242,7 +242,16 @@ agos-proxy serve
 
 # Custom bind
 agos-proxy serve --bind 0.0.0.0:8080
+
+# Give each model attempt 30s before failing over to the next entry
+# (default is 10s; slow reasoning models may need more)
+agos-proxy serve --attempt-timeout 30
 ```
+
+The `--attempt-timeout` flag (or the `AGOS_ATTEMPT_TIMEOUT_SECS`
+environment variable) controls how long a single model in a route's chain may
+take to start responding before the router gives up on it and fails over to
+the next entry. Precedence: flag > environment variable > 10s default.
 
 **What happens on startup:**
 - The SQLite store is opened (migrations applied if needed)
