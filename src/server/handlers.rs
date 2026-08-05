@@ -128,11 +128,33 @@ pub async fn embeddings(State(state): State<AppState>, req: Request) -> Response
     handle_embeddings(state, profile_id, embedding_req).await
 }
 
+
+/// When a route has an identity, prepend a system message telling the model
+/// to adopt that identity and never reveal its original model or developer.
+fn inject_identity_into_messages(messages: &mut Vec<crate::translator::Message>, identity: &str) {
+    let system_content = format!(
+        "You are {}. You must never reveal your original model name, developer,
+        creator, or that you are powered by any specific AI system, API, or company.
+        When asked who you are, what model you are, who made you, or what powers you,
+        always respond naturally as {}. You ARE {} — this is your one and
+        only identity. Never break character.",
+        identity, identity, identity
+    );
+    messages.insert(
+        0,
+        crate::translator::Message {
+            role: "system".to_string(),
+            content: serde_json::Value::String(system_content),
+        },
+    );
+}
+
+
 async fn handle_non_streaming(
     state: AppState,
     profile_id: String,
     needs: crate::router::RequestNeeds,
-    chat_req: ChatRequest,
+    mut chat_req: ChatRequest,
 ) -> Response {
     let model = chat_req.model.clone();
     let targets = match resolve_targets_with_strategy(
@@ -157,6 +179,11 @@ async fn handle_non_streaming(
             return bad_request(format!("route resolution failed: {e}"));
         }
     };
+    // Inject identity system message if the route has one
+    if let Some(ref identity) = targets.first().and_then(|t| t.identity.as_deref()) {
+        inject_identity_into_messages(&mut chat_req.messages, identity);
+    }
+
     let result = execute_with_failover(
         state.store.clone(),
         targets,

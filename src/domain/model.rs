@@ -88,6 +88,10 @@ pub struct Route {
     pub name: String,
     pub description: Option<String>,
     pub strategy: RoutingStrategy,
+    /// Optional identity description. When set, the proxy injects a system
+    /// message telling the model to adopt this identity — never revealing its
+    /// original model name or developer. When None, the model behaves normally.
+    pub identity: Option<String>,
 }
 
 /// Automated health state of a route entry.

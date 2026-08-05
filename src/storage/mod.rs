@@ -735,11 +735,12 @@ impl Store {
         name: &str,
         description: Option<&str>,
         strategy: RoutingStrategy,
+        identity: Option<&str>,
     ) -> Result<Route> {
         let _ = self.conn()
             .execute(
-                "INSERT INTO routes (proxy_id, name, description, strategy) VALUES (?1, ?2, ?3, ?4)",
-                (proxy_id, name, description, strategy_tag(strategy)),
+                "INSERT INTO routes (proxy_id, name, description, strategy, identity) VALUES (?1, ?2, ?3, ?4, ?5)",
+                (proxy_id, name, description, strategy_tag(strategy), identity),
             )
             .context("inserting the route")?;
         Ok(Route {
@@ -748,6 +749,7 @@ impl Store {
             name: name.to_string(),
             description: description.map(|d| d.to_string()),
             strategy,
+            identity: identity.map(|i| i.to_string()),
         })
     }
 
@@ -766,12 +768,13 @@ impl Store {
         name: &str,
         description: Option<&str>,
         strategy: RoutingStrategy,
+        identity: Option<&str>,
     ) -> Result<()> {
         let changed = self
             .conn()
             .execute(
-                "UPDATE routes SET name = ?1, description = ?2, strategy = ?3 WHERE id = ?4",
-                (name, description, strategy_tag(strategy), id),
+                "UPDATE routes SET name = ?1, description = ?2, strategy = ?3, identity = ?5 WHERE id = ?4",
+                (name, description, strategy_tag(strategy), id, identity),
             )
             .context("updating the route")?;
         if changed == 0 {
@@ -784,7 +787,7 @@ impl Store {
     pub fn list_routes(&self, proxy_id: i64) -> Result<Vec<Route>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT id, proxy_id, name, description, strategy FROM routes WHERE proxy_id = ?1 ORDER BY name",
+            "SELECT id, proxy_id, name, description, strategy, identity FROM routes WHERE proxy_id = ?1 ORDER BY name",
         )?;
         let rows = stmt.query_map((proxy_id,), |row| {
             let strat_tag: String = row.get(4)?;
@@ -794,6 +797,7 @@ impl Store {
                 name: row.get(2)?,
                 description: row.get(3)?,
                 strategy: strategy_from_tag(&strat_tag).expect("invalid strategy in store"),
+                identity: row.get(5)?,
             })
         })?;
         let mut out = Vec::new();
@@ -807,7 +811,7 @@ impl Store {
     pub fn get_route_named(&self, proxy_id: i64, name: &str) -> Result<Option<Route>> {
         self.conn()
             .query_row(
-                "SELECT id, proxy_id, name, description, strategy FROM routes WHERE proxy_id = ?1 AND name = ?2",
+                "SELECT id, proxy_id, name, description, strategy, identity FROM routes WHERE proxy_id = ?1 AND name = ?2",
                 (proxy_id, name),
                 |row| {
                     let strat_tag: String = row.get(4)?;
@@ -817,6 +821,7 @@ impl Store {
                         name: row.get(2)?,
                         description: row.get(3)?,
                         strategy: strategy_from_tag(&strat_tag).expect("invalid strategy in store"),
+                        identity: row.get(5)?,
                     })
                 },
             )
@@ -1274,7 +1279,7 @@ mod tests {
             .is_some());
 
         // Route edit + strategy change + entry reorder/update/delete.
-        let route = store.create_route(proxy.id, "r", None, RoutingStrategy::Priority)?;
+        let route = store.create_route(proxy.id, "r", None, RoutingStrategy::Priority, None)?;
         store.update_route(route.id, "r2", Some("desc"), RoutingStrategy::Weighted)?;
         let route2 = store.get_route_named(proxy.id, "r2")?.unwrap();
         assert_eq!(route2.strategy, RoutingStrategy::Weighted);
@@ -1352,6 +1357,7 @@ mod tests {
             "php-developer-3.5-flash",
             None,
             RoutingStrategy::Priority,
+            None,
         )?;
 
         let second = store.add_route_entry(

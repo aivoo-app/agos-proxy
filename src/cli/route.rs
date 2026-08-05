@@ -119,6 +119,16 @@ fn create(store: &crate::storage::Store, proxy_name: Option<String>) -> Result<(
         .allow_empty(true)
         .interact_text()?;
 
+    let identity_prompt = Input::<String>::with_theme(&theme)
+        .with_prompt("Identity description (optional — hides the real model name from users)")
+        .allow_empty(true)
+        .interact_text()?;
+    let identity = if identity_prompt.is_empty() {
+        None
+    } else {
+        Some(identity_prompt)
+    };
+
     let route = store.create_route(
         proxy.id,
         &route_name,
@@ -128,6 +138,7 @@ fn create(store: &crate::storage::Store, proxy_name: Option<String>) -> Result<(
             Some(description.as_str())
         },
         RoutingStrategy::Priority,
+        identity.as_deref(),
     )?;
 
     println!("Add at least one model to the route's fallback chain.");
@@ -173,6 +184,16 @@ fn edit(store: &crate::storage::Store, proxy_name: Option<String>) -> Result<()>
         .interact_text()?;
     let strategy = pick_strategy(&theme)?;
 
+    let edit_identity_prompt = Input::<String>::with_theme(&theme)
+        .with_prompt("Identity description (empty to keep current, or clear)")
+        .allow_empty(true)
+        .interact_text()?;
+    let edit_identity = if edit_identity_prompt.is_empty() {
+        route.identity.clone()
+    } else {
+        Some(edit_identity_prompt)
+    };
+
     store.update_route(
         route.id,
         &route_name,
@@ -182,6 +203,7 @@ fn edit(store: &crate::storage::Store, proxy_name: Option<String>) -> Result<()>
             Some(description.as_str())
         },
         strategy,
+        edit_identity.as_deref(),
     )?;
     println!(
         "Updated route {:?} under proxy {:?}.",

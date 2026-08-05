@@ -124,6 +124,10 @@ impl RequestNeeds {
 pub struct Target {
     pub provider: Provider,
     pub entry: RouteEntry,
+    /// Optional identity description from the route. When set, the proxy
+    /// injects a system message into the request so the model adopts this
+    /// identity and hides its original one.
+    pub identity: Option<String>,
 }
 
 /// Resolve a model string to an ordered list of healthy targets, scoped to the
@@ -142,6 +146,7 @@ pub fn resolve_targets(store: &Store, profile_id: &str, model: &str) -> Result<V
         .get_route_named(proxy.id, route_name)?
         .with_context(|| format!("no route named {route_name:?} under proxy {proxy_name:?}"))?;
 
+    let identity = route.identity.clone();
     let entries = store.route_entries(route.id)?;
     let mut targets = Vec::new();
     for entry in entries {
@@ -149,7 +154,7 @@ pub fn resolve_targets(store: &Store, profile_id: &str, model: &str) -> Result<V
             continue;
         }
         if let Some(provider) = store.get_provider(entry.provider_id)? {
-            targets.push(Target { provider, entry });
+            targets.push(Target { provider, entry, identity: identity.clone() });
         }
     }
     Ok(targets)
@@ -180,6 +185,7 @@ pub fn resolve_targets_with_strategy(
         .get_route_named(proxy.id, route_name)?
         .with_context(|| format!("no route named {route_name:?} under proxy {proxy_name:?}"))?;
 
+    let identity = route.identity.clone();
     let entries = store.route_entries(route.id)?;
     let mut targets: Vec<Target> = entries
         .into_iter()
@@ -190,7 +196,7 @@ pub fn resolve_targets_with_strategy(
                 .get_provider(entry.provider_id)
                 .ok()
                 .flatten()
-                .map(|provider| Target { provider, entry })
+                .map(|provider| Target { provider, entry, identity: identity.clone() })
         })
         .collect();
 
@@ -281,7 +287,7 @@ mod tests {
             .create_proxy(profile.id.as_str(), "prog", None)
             .unwrap();
         let route = store
-            .create_route(proxy.id, "r1", None, RoutingStrategy::Priority)
+            .create_route(proxy.id, "r1", None, RoutingStrategy::Priority, None)
             .unwrap();
         store
             .add_route_entry(route.id, provider.id, "m1", 1, 1.0, Default::default())
@@ -353,7 +359,7 @@ mod tests {
             .create_proxy(profile.id.as_str(), "prog", None)
             .unwrap();
         let route = store
-            .create_route(proxy.id, "r1", None, RoutingStrategy::RoundRobin)
+            .create_route(proxy.id, "r1", None, RoutingStrategy::RoundRobin, None)
             .unwrap();
         store
             .add_route_entry(route.id, p1.id, "m1", 1, 1.0, Default::default())
@@ -440,7 +446,7 @@ mod tests {
             .create_proxy(profile.id.as_str(), "prog", None)
             .unwrap();
         let route = store
-            .create_route(proxy.id, "r1", None, RoutingStrategy::Weighted)
+            .create_route(proxy.id, "r1", None, RoutingStrategy::Weighted, None)
             .unwrap();
         // light has weight 1, heavy has weight 9 → heavy should lead ~90% of the time
         store
@@ -610,7 +616,7 @@ mod tests {
             .unwrap();
         let proxy = store.create_proxy(a.id.as_str(), "prog", None).unwrap();
         let route = store
-            .create_route(proxy.id, "r1", None, RoutingStrategy::Priority)
+            .create_route(proxy.id, "r1", None, RoutingStrategy::Priority, None)
             .unwrap();
         store
             .add_route_entry(route.id, p.id, "m1", 1, 1.0, Default::default())
@@ -626,7 +632,7 @@ mod tests {
         // Alice's routes either.
         let b_proxy = store.create_proxy(_b.id.as_str(), "prog", None).unwrap();
         let b_route = store
-            .create_route(b_proxy.id, "r1", None, RoutingStrategy::Priority)
+            .create_route(b_proxy.id, "r1", None, RoutingStrategy::Priority, None)
             .unwrap();
         let _ = b_route;
         let still_empty = resolve_targets(&store, &_b.id, "prog/r1").unwrap();

@@ -50,7 +50,8 @@ pub const SCHEMA: &str = "
         proxy_id    INTEGER NOT NULL REFERENCES proxies(id) ON DELETE CASCADE,
         name        TEXT NOT NULL,
         description TEXT,
-        strategy    TEXT NOT NULL
+        strategy    TEXT NOT NULL,
+        identity    TEXT
     );
 
     CREATE TABLE IF NOT EXISTS route_entries (
@@ -94,6 +95,7 @@ pub const SCHEMA: &str = "
 /// additions are checked and applied one at a time on every open.
 pub fn migrate_columns(conn: &rusqlite::Connection) -> anyhow::Result<()> {
     ensure_column(conn, "profiles", "rpm_limit", "INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(conn, "routes", "identity", "TEXT")?;
     Ok(())
 }
 

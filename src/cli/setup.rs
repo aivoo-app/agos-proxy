@@ -268,6 +268,15 @@ fn prompt_route(
         .with_prompt("Description (optional)")
         .allow_empty(true)
         .interact_text()?;
+    let identity_prompt = Input::<String>::with_theme(theme)
+        .with_prompt("Identity description (optional — hides the real model name from users)")
+        .allow_empty(true)
+        .interact_text()?;
+    let identity = if identity_prompt.is_empty() {
+        None
+    } else {
+        Some(identity_prompt)
+    };
     let route = store.create_route(
         proxy.id,
         &route_name,
@@ -277,6 +286,7 @@ fn prompt_route(
             Some(description.as_str())
         },
         crate::domain::RoutingStrategy::Priority,
+        identity.as_deref(),
     )?;
 
     println!("Add at least one model to the route's fallback chain.");

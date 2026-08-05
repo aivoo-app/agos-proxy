@@ -81,6 +81,7 @@ pub struct PortableRoute {
     pub name: String,
     pub description: Option<String>,
     pub strategy: RoutingStrategy,
+    pub identity: Option<String>,
     pub entries: Vec<PortableEntry>,
 }
 
@@ -199,6 +200,7 @@ pub fn export_bundle(store: &Store, profile: &crate::domain::Profile) -> Result<
                 name: route.name,
                 description: route.description,
                 strategy: route.strategy,
+                identity: route.identity.clone(),
                 entries,
             });
         }
@@ -288,6 +290,7 @@ pub fn import_bundle(store: &Store, bundle: &PortableProfile, name: &str) -> Res
                 &route.name,
                 route.description.as_deref(),
                 route.strategy,
+                route.identity.as_deref(),
             )?;
             for entry in &route.entries {
                 let provider_id = provider_ids.get(&entry.provider_name).with_context(|| {
@@ -335,7 +338,7 @@ mod tests {
             .create_proxy(profile.id.as_str(), "prog", None)
             .unwrap();
         let route = store
-            .create_route(proxy.id, "r1", None, RoutingStrategy::Priority)
+            .create_route(proxy.id, "r1", None, RoutingStrategy::Priority, None)
             .unwrap();
         store
             .add_route_entry(

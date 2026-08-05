@@ -99,6 +99,11 @@ pub struct RouteSpec {
     /// Defaults to `priority`.
     #[serde(default)]
     pub strategy: Option<String>,
+    /// Optional identity description. When set, the proxy injects a system
+    /// message telling the model to adopt this identity instead of revealing
+    /// its original model name or developer.
+    #[serde(default)]
+    pub identity: Option<String>,
     /// Models in the chain, in the order they were declared.
     #[serde(default)]
     pub models: Vec<ModelSpec>,
@@ -215,6 +220,7 @@ fn apply(setup: Setup) -> Result<()> {
                 &route_spec.name,
                 route_spec.description.as_deref(),
                 parse_strategy(route_spec.strategy.as_deref())?,
+                route_spec.identity.as_deref(),
             )?;
             println!("route: {}/{}", proxy.name, route.name);
 
