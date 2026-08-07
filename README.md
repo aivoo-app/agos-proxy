@@ -2,375 +2,354 @@
 
 <div align="center">
 
-[![CI](https://github.com/aivoo-app/agos-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/aivoo-app/agos-proxy/actions/workflows/ci.yml)
-[![Release](https://github.com/aivoo-app/agos-proxy/actions/workflows/release.yml/badge.svg)](https://github.com/aivoo-app/agos-proxy/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.75+-blue.svg)](https://www.rust-lang.org)
-[![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macOS%20%7C%20windows-lightgrey.svg)]()
+[![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macOS%20%7C%20windows-lightgrey.svg)()
 [![Version](https://img.shields.io/badge/version-0.1.0-green.svg)](Cargo.toml)
 
-**A self-hosted, CLI-managed AI gateway that gives any agent an OpenAI-compatible
-endpoint backed by automatic multi-provider failover.**
+**A self-hosted, CLI-managed AI gateway that gives any agent an OpenAI-compatible endpoint backed by automatic multi-provider failover.**
 
-[Quick Start](#quick-start) •
-[Features](#highlights) •
-[A-Z Workflow](#a-z-workflow) •
-[Docs](docs/) •
-[Contributing](CONTRIBUTING.md) •
-[Changelog](CHANGELOG.md)
+[Quick Start](#quick-start) &bull; [What It Does](#what-it-does) &bull; [The Model You Call](#the-model-you-call) &bull; [Identity Masking](#identity-masking) &bull; [A--Z Walkthrough](#a--z-walkthrough) &bull; [Docs Index](#docs-index) &bull; [Contributing](CONTRIBUTING.md)
 
 </div>
 
 ---
 
-## Table of Contents
-
-- [What is AGOS Proxy?](#what-is-agos-proxy)
-- [Highlights](#highlights)
-- [Quick Start](#quick-start)
-- [A-Z Workflow](#a-z-workflow)
-  - [Step 1: Install](#step-1-install)
-  - [Step 2: Create a Profile](#step-2-create-a-profile)
-  - [Step 3: Add Providers](#step-3-add-providers)
-  - [Step 4: Create a Proxy](#step-4-create-a-proxy)
-  - [Step 5: Create a Route](#step-5-create-a-route)
-  - [Step 6: Start the Server](#step-6-start-the-server)
-  - [Step 7: Make a Request](#step-7-make-a-request)
-  - [Step 8: Monitor Usage](#step-8-monitor-usage)
-  - [Step 9: Test Interactively](#step-9-test-interactively)
-  - [Step 10: Export/Import Config](#-step-10-exportimport-config)
-- [Common Workflows](#common-workflows)
-- [Architecture Overview](#architecture-overview)
-- [Documentation Index](#documentation-index)
-- [Project Status](#project-status)
-- [Glossary](#glossary)
-- [License](#license)
-
----
-
-## What is AGOS Proxy?
-
-AGOS Proxy sits between an agent and its LLM providers. Instead of an agent
-calling `deepseek-v4-flash` directly, it calls a **route** such as
-`programmer/php-developer-3.5-flash` that AGOS Proxy owns. Behind that single
-route is an ordered list of real models from real providers; AGOS Proxy tries
-them in priority order, tracks which are healthy, and transparently fails over
-so a request keeps getting answered even if several underlying providers are
-down at once.
-
-Conceptually it is closest to LiteLLM's proxy/gateway mode, but with
-profile-based multi-tenancy and failover as first-class concepts rather than
-add-ons.
-
-### When to Use AGOS Proxy
-
-- You have multiple LLM providers and want automatic failover
-- You want a single OpenAI-compatible endpoint that never goes down
-- You need per-agent or per-team rate limits and usage tracking
-- You want to swap providers without changing client code
-- You want encrypted storage of provider API keys
-
-### When NOT to Use AGOS Proxy
-
-- You have a single provider and don't need failover — call it directly
-- You need multi-node clustering — AGOS Proxy is single-process today
-- You need a fully managed service — AGOS Proxy is self-hosted
-
----
-
-## Highlights
-
-| Feature | Description |
-|---------|-------------|
-| **OpenAI-compatible API** | `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models` — drop-in replacement for any OpenAI SDK |
-| **Multi-profile, multi-tenant** | Separate credentials and routing rules per agent, team, or use case |
-| **Ordered model fallback chains** | Per route with automatic health tracking and background recovery |
-| **Three routing strategies** | Priority (strict fallback), round-robin, and weighted round-robin |
-| **Streaming (SSE) passthrough** | Mirrors each provider's streaming behavior |
-| **Provider translation** | Native support for Anthropic (`/v1/messages`) and Google Gemini (`generateContent`), plus pass-through for any OpenAI-compatible provider |
-| **CLI-first configuration** | Interactive wizards and scriptable non-interactive flags; a guided `setup` wizard covers first-time users |
-| **Encrypted secrets at rest** | Provider tokens encrypted with ChaCha20-Poly1305, master key sealed in the local store; optional per-profile password protection |
-| **Usage, cost, and latency visibility** | Per model and per route |
-| **Portable config export/import** | Move a full profile setup between machines with a passphrase-sealed file |
-
----
-
 ## Quick Start
 
-### Prerequisites
-
-- **Rust** 1.75+ (or use the Docker image)
-- A terminal
-
-### Build from Source
+Get a working proxy in about two minutes:
 
 ```sh
+# 1. Build
 git clone https://github.com/aivoo-app/agos-proxy.git
 cd agos-proxy
 cargo build --release
+
+# 2. Create a profile and grab its token
+./target/release/agos-proxy profile create --name coder1
+# saves the token it prints; you will need it for API calls
+
+# 3. Add a provider (your real API key goes here, stored encrypted)
+./target/release/agos-proxy provider add --profile coder1
+# name: openai
+# base_url: https://api.openai.com/v1
+# auth_token: sk-...
+# kind: openai_compatible
+
+# 4. Create a proxy + route
+./target/release/agos-proxy proxy create --profile coder1
+# name: Programmer
+
+./target/release/agos-proxy route create --proxy Programmer
+# route name: php-dev
+# strategy: priority
+# then add model entries: openai/gpt-4o at priority 1, etc.
+
+# 5. Start the server
+./target/release/agos-proxy serve --bind 127.0.0.1:3000
 ```
-
-The binary is `target/release/agos-proxy`. Add it to your PATH or invoke it directly.
-
-### Using Docker
 
 ```sh
-docker compose up -d
+# 6. Call it like any OpenAI endpoint
+curl http://localhost:3000/v1/chat/completions   -H "Authorization: Bearer <YOUR_TOKEN>"   -H "Content-Type: application/json"   -d '{"model":"Programmer/php-dev","messages":[{"role":"user","content":"hi"}]}'
 ```
 
-This starts AGOS Proxy with a mock upstream, seeded with a sample profile. See [docs/deployment.md](docs/deployment.md) for production Docker usage.
+For a guided first-time walkthrough, run `./target/release/agos-proxy setup` instead of the steps above. For scripted or container environments, see [Bootstrap JSON](#bootstrap-json).
 
 ---
 
-## A-Z Workflow
+## What It Does
 
-This is the complete walkthrough from zero to a working proxy. Follow each step in order.
+AGOS Proxy sits between an agent and its LLM providers. The agent calls one stable OpenAI-compatible endpoint; behind that endpoint, AGOS Proxy fans the request out across an ordered chain of real providers with automatic failover. If the first provider is down, rate-limited, or slow, the proxy tries the next one within a single caller request. The agent sees one request and one response.
+
+Conceptually it is closest to LiteLLM proxy/gateway mode, with three differences: it is a self-contained Rust binary (no Python runtime), it is configured entirely through a CLI rather than a config file, and it has first-class multi-tenant profiles with per-profile rate limits and encrypted credential storage.
+
+### When to use it
+
+- You have multiple LLM providers and want automatic failover without wiring it into every agent.
+- You want a single OpenAI-compatible endpoint whose backends can change without touching client code.
+- You run multiple agents or teams and want per-agent API tokens, rate limits, and routing rules.
+- You want provider API keys stored encrypted rather than in plaintext config files.
+
+### When not to use it
+
+- You have a single provider and no failover need -- call it directly.
+- You need multi-node clustering -- AGOS Proxy is single-process, single-machine today.
+- You need a fully managed service -- AGOS Proxy is self-hosted.
+
+---
+
+## The Model You Call
+
+Everything in AGOS Proxy is organized around one idea: a caller never picks a provider or a model directly. The caller picks a **route**, and the route owns the chain.
+
+```
+Profile ("coder1")                     # your tenant; its id is your API token
+├── Providers                          # how we reach the outside world
+│     ├── openai        https://api.openai.com/v1
+│     ├── deepseek      https://api.deepseek.com
+│     └── openrouter    https://openrouter.ai/api/v1
+└── Proxy: "Programmer"               # a namespace for routes
+      └── Route: "php-dev"            # what callers actually request
+            1. openai/gpt-4o          (priority 1 -- tried first)
+            2. deepseek/deepseek-chat (priority 2 -- fallback)
+            3. openrouter/google/gemini-2.0-flash-001 (priority 3)
+```
+
+A caller requests `Programmer/php-dev`. AGOS Proxy resolves the route, picks the highest-priority healthy entry, forwards the request, and if that attempt fails, tries the next entry. The caller does not know or care which provider answered.
+
+### Routing strategies
+
+| Strategy | Behavior |
+|----------|----------|
+| `priority` | Try entries in stored order (1, 2, 3...). Default. |
+| `round_robin` | Distribute across healthy entries in rotation. |
+| `weighted` | Like round-robin, but biased by each entry's weight. |
+
+---
+
+## Identity Masking
+
+A route can carry an optional **identity description**. When set, AGOS Proxy prepends a system message to every request telling the model to adopt that identity and never reveal its underlying provider, model name, or developer. When the identity is not set, the model behaves normally.
+
+```sh
+./target/release/agos-proxy route create --proxy Programmer
+# Identity description (optional -- hides the real model from users): A senior Python engineer named Maya
+```
+
+Or include it in a [bootstrap JSON](#bootstrap-json) document. The field is optional. Omit it and the model responds as itself.
+
+---
+
+## A--Z Walkthrough
 
 ### Step 1: Install
 
-Choose one of:
-
 ```sh
-# Option A: Build from source
 git clone https://github.com/aivoo-app/agos-proxy.git
 cd agos-proxy
 cargo build --release
 sudo cp target/release/agos-proxy /usr/local/bin/
 
-# Option B: Install via cargo
+# Or install via cargo
 cargo install --path .
 
-# Option C: Use Docker
-docker pull ghcr.io/aivoo-app/agos-proxy:latest
+# Or Docker
+docker compose up -d
 ```
 
-Verify:
-```sh
-agos-proxy --version
-```
+Verify: `agos-proxy --version`
 
 ### Step 2: Create a Profile
 
-A profile is a tenant — it owns providers, proxies, routes, and has its own API token.
+A profile is a tenant -- it owns providers, proxies, routes, and has its own API token (which is also its opaque `id`).
 
 ```sh
-# Interactive wizard (recommended for first-time users)
-agos-proxy profile create
-
-# Non-interactive (for scripts)
 agos-proxy profile create --name coder1
 ```
 
-The CLI prints your **API token** (the profile `id`). Save it — you need it for API calls.
+The CLI prints the token once. Save it. You will send it as `Authorization: Bearer <token>` on every API call. If you lose it, rotate it with `agos-proxy profile token rotate coder1` -- the old token stops working immediately.
 
-```
-Profile "coder1" created.
-API token: abc123def456ghi789...
+To protect a profile from interactive changes, create it with a password:
+
+```sh
+agos-proxy profile create        # interactive -- prompted for password when you say yes
 ```
 
-**What just happened:**
-- A profile named `coder1` was created in the SQLite store
-- A random 128-bit API token was generated (doubles as the profile `id`)
-- The store lives at `~/.config/agos-proxy/agos.db` by default
+Password-protected profiles prompt for the password on every mutating CLI operation, up to 3 attempts.
 
 ### Step 3: Add Providers
 
-A provider is an upstream LLM service (DeepSeek, OpenRouter, Anthropic, etc.).
-
-```sh
-# Interactive wizard
-agos-proxy provider add --profile coder1
-
-# The wizard prompts for:
-#   - name: deepseek (your label)
-#   - base URL: https://api.deepseek.com
-#   - API token: sk-... (your real DeepSeek key — stored encrypted)
-#   - kind: OpenAI-compatible
-```
-
-Add more providers for failover:
 ```sh
 agos-proxy provider add --profile coder1
-# name: anthropic
-# base URL: https://api.anthropic.com
-# API token: sk-ant-...
-# kind: Anthropic
 ```
 
-**What just happened:**
-- Provider credentials were stored encrypted with ChaCha20-Poly1305
-- The master key for encryption lives only in memory + the store's `meta` table
-- Provider tokens are never shown in plaintext after creation
+The wizard prompts for: name, base URL, API token (stored encrypted), provider kind, and optional extra headers.
+
+Common providers:
+
+| Provider | Name | Base URL |
+|----------|------|----------|
+| OpenAI | openai | https://api.openai.com/v1 |
+| DeepSeek | deepseek | https://api.deepseek.com |
+| OpenRouter | openrouter | https://openrouter.ai/api/v1 |
+| Anthropic (native) | claude | https://api.anthropic.com |
+| Google Gemini (native) | google | https://generativelanguage.googleapis.com/v1beta |
+| Local / self-hosted | ollama | http://localhost:11434/v1 |
+
+Provider tokens are encrypted with ChaCha20-Poly1305 before they reach disk.
 
 ### Step 4: Create a Proxy
 
-A proxy is a named group of routes — think of it as an API namespace.
-
 ```sh
-# Interactive wizard
 agos-proxy proxy create --profile coder1
-
-# The wizard prompts for:
-#   - name: Programmer (your label)
+# name: Programmer
 ```
+
+A proxy is a namespace for routes -- think of it as an API group label.
 
 ### Step 5: Create a Route
 
-A route is an addressable fallback chain. Callers request `<proxy>/<route>` and AGOS Proxy picks the best model.
+```sh
+agos-proxy route create --proxy Programmer
+```
+
+The wizard prompts for the route name, routing strategy, optional identity, and then walks you through adding model entries one by one.
+
+Example chain:
+
+```
+1. openai/gpt-4o                        (priority 1 -- first try)
+2. deepseek/deepseek-chat               (priority 2 -- fallback)
+3. openrouter/google/gemini-2.0-flash  (priority 3 -- last resort)
+```
+
+Non-interactive:
 
 ```sh
-# Interactive wizard — walks through building the model chain
-agos-proxy route create --proxy Programmer
-
-# The wizard prompts for:
-#   - route name: php-developer-3.5-flash
-#   - strategy: priority (default)
-#   - model entries: pick a provider + model ID for each rung
-```
-
-Example chain built interactively:
-```
-1. deepseek → deepseek-v4-flash    (priority 1, first try)
-2. anthropic → claude-3-haiku      (priority 2, fallback)
+agos-proxy route model add --proxy Programmer --route php-dev \
+  --provider openai --model gpt-4o --priority 1
 ```
 
 ### Step 6: Start the Server
 
 ```sh
-# Default: bind to 127.0.0.1:3000
-agos-proxy serve
-
-# Custom bind
-agos-proxy serve --bind 0.0.0.0:8080
-
-# Give each model attempt 30s before failing over to the next entry
-# (default is 10s; slow reasoning models may need more)
-agos-proxy serve --attempt-timeout 30
+agos-proxy serve --bind 127.0.0.1:3000
 ```
 
-The `--attempt-timeout` flag (or the `AGOS_ATTEMPT_TIMEOUT_SECS`
-environment variable) controls how long a single model in a route's chain may
-take to start responding before the router gives up on it and fails over to
-the next entry. Precedence: flag > environment variable > 10s default.
+On startup the proxy opens the SQLite store (applying any pending migrations), starts the background health-probe loop (pings unhealthy entries every 30 seconds), and begins listening.
 
-**What happens on startup:**
-- The SQLite store is opened (migrations applied if needed)
-- The background health-probe loop starts (pings unhealthy providers every 30s)
-- The HTTP server starts listening
+For long-running service, wrap it in systemd (see [Deployment](docs/deployment.md)) or run it behind a reverse proxy that terminates TLS. The proxy itself does not terminate TLS.
 
 ### Step 7: Make a Request
 
-Use any OpenAI-compatible client. Here's curl:
+**curl:**
 
 ```sh
 curl http://localhost:3000/v1/chat/completions \
-  -H "Authorization: Bearer YOUR_PROFILE_TOKEN" \
+  -H "Authorization: Bearer <YOUR_TOKEN>" \
   -H "Content-Type: application/json" \
-  -d '{
-    "model": "Programmer/php-developer-3.5-flash",
-    "messages": [{"role": "user", "content": "Hello!"}]
-  }'
+  -d '{"model":"Programmer/php-dev","messages":[{"role":"user","content":"Write a quicksort in Python."}]}'
 ```
 
-With the Python OpenAI SDK:
+**Python:**
+
 ```python
 from openai import OpenAI
 
 client = OpenAI(
     base_url="http://localhost:3000/v1",
-    api_key="YOUR_PROFILE_TOKEN",
+    api_key="<YOUR_TOKEN>",
 )
 
 response = client.chat.completions.create(
-    model="Programmer/php-developer-3.5-flash",
-    messages=[{"role": "user", "content": "Hello!"}],
+    model="Programmer/php-dev",
+    messages=[{"role": "user", "content": "Write a quicksort in Python."}],
 )
 print(response.choices[0].message.content)
 ```
 
-With the Node.js OpenAI SDK:
+**Node.js:**
+
 ```js
-import OpenAI from 'openai';
+import OpenAI from "openai";
 
 const client = new OpenAI({
-  baseURL: 'http://localhost:3000/v1',
-  apiKey: 'YOUR_PROFILE_TOKEN',
+  baseURL: "http://localhost:3000/v1",
+  apiKey: "<YOUR_TOKEN>",
 });
 
 const response = await client.chat.completions.create({
-  model: 'Programmer/php-developer-3.5-flash',
-  messages: [{ role: 'user', content: 'Hello!' }],
+  model: "Programmer/php-dev",
+  messages: [{ role: "user", content: "Write a quicksort in Python." }],
 });
 console.log(response.choices[0].message.content);
 ```
 
+**Streaming:** Add `"stream": true` to the request body. The response is an SSE stream. Note: if the upstream fails mid-stream, the stream breaks -- that is a fundamental limitation of streaming failover. Use non-streaming when transparent failover matters.
+
+**List available models:**
+
+```sh
+curl http://localhost:3000/v1/models \
+  -H "Authorization: Bearer <YOUR_TOKEN>"
+```
+
+Returns the routes your profile can reach, in `<proxy>/<route>` form.
+
 ### Step 8: Monitor Usage
 
 ```sh
-# Per-model aggregates: calls, failures, latency, tokens
 agos-proxy usage stats --profile coder1
-
-# Recent individual requests
 agos-proxy usage recent --profile coder1 --limit 20
-
-# Live route health status
-agos-proxy route status --route php-developer-3.5-flash
+agos-proxy route status --route php-dev
 ```
 
 ### Step 9: Test Interactively
 
-Before wiring up a client, test a route directly:
-
 ```sh
-# Interactive chat REPL
-agos-proxy chat
-
-# Full-screen TUI
-agos-proxy chat --tui
+agos-proxy chat          # line-based REPL
+agos-proxy chat --tui    # full-screen TUI
 ```
 
-### Step 10: Export/Import Config
-
-Move a profile setup between machines:
+### Step 10: Export / Import Config
 
 ```sh
-# Export (you'll be prompted for a passphrase)
-agos-proxy config export --profile coder1 --output coder1-sealed.json
-
-# Import on another machine
-agos-proxy config import --path coder1-sealed.json
+agos-proxy config export --profile coder1 > coder1-backup.json
+agos-proxy config import --file coder1-backup.json
 ```
 
-The sealed file contains the full profile tree (providers with tokens, proxies, routes, entries), encrypted with a passphrase-derived key. On import, tokens are re-encrypted with the destination store's master key.
+Never copy the raw SQLite file between machines with different master keys. Use export/import instead.
 
 ---
 
-## Common Workflows
+## The Guided Setup Wizard
 
-### Guided Setup Wizard
-
-First-time users can run the all-in-one wizard instead of individual commands:
+For first-time users, one command walks through the whole sequence:
 
 ```sh
 agos-proxy setup
 ```
 
-This walks through: profile → providers → proxies → routes → summary.
+It prompts for a profile, then into a menu where you can add providers, create proxies, build routes, and set rate limits -- all in one session. When you exit the menu, it prints the profile token.
 
-### Scripted / CI Setup
+---
 
-For containers and CI, use `bootstrap` with a JSON document:
+## Bootstrap JSON
+
+For scripted or container environments, AGOS Proxy can be seeded from a single JSON document:
 
 ```sh
-cat <<'EOF' > setup.json
+agos-proxy bootstrap from-file setup.json
+# prints the generated profile token to stdout
+```
+
+Or from stdin:
+
+```sh
+cat setup.json | agos-proxy bootstrap from-file -
+```
+
+This is the intended way to give an agent or a provisioning script its own self-contained setup.
+
+### Example bootstrap document
+
+```json
 {
-  "profile": "ci-agent",
+  "profile": "agent-1",
+  "description": "autonomous coding agent",
   "providers": [
     {
-      "name": "openrouter",
+      "name": "primary",
+      "base_url": "https://api.openai.com/v1",
+      "auth_token": "sk-...",
+      "kind": "openai_compatible"
+    },
+    {
+      "name": "fallback",
       "base_url": "https://openrouter.ai/api/v1",
       "auth_token": "sk-or-v1-...",
-      "kind": "openai_compatificant"
+      "kind": "openai_compatible"
     }
   ],
   "proxies": [
@@ -378,245 +357,129 @@ cat <<'EOF' > setup.json
       "name": "main",
       "routes": [
         {
-          "name": "chat",
+          "name": "coder",
+          "description": "code generation and review",
+          "identity": "A senior Python engineer named Maya",
+          "strategy": "priority",
           "models": [
-            {"provider": "openrouter", "model": "openai/gpt-4o"}
+            { "provider": "primary", "model": "gpt-4o", "priority": 1 },
+            { "provider": "fallback", "model": "anthropic/claude-3.5-sonnet", "priority": 2 }
+          ]
+        },
+        {
+          "name": "chat",
+          "description": "cheap, fast chat",
+          "strategy": "priority",
+          "models": [
+            { "provider": "fallback", "model": "google/gemini-2.0-flash-001", "priority": 1 }
           ]
         }
       ]
     }
   ]
 }
-EOF
-
-agos-proxy bootstrap from-file setup.json
-# Prints the generated API token
 ```
 
-### Adding a New Provider to an Existing Chain
+The bootstrap document is the same format that Docker's `AGOS_SETUP` environment variable accepts.
+
+---
+
+## API Surface
+
+AGOS Proxy speaks an OpenAI-compatible API at `/v1/...`.
+
+| Endpoint | Description |
+|----------|-------------|
+| `POST /v1/chat/completions` | Chat completions (streaming and non-streaming) |
+| `POST /v1/completions` | Legacy text completions |
+| `POST /v1/embeddings` | Embedding vectors |
+| `GET /v1/models` | Lists the routes your profile can call |
+
+Full reference: [API Reference](docs/api-reference.md)
+
+Provider notes: [Providers](docs/providers.md)
+Failover details: [Failover](docs/failover.md)
+
+---
+
+## Configuration
+
+- [Configuration Reference](docs/configuration.md) -- data directory, environment variables, bootstrap schema, secrets
+- [Environment Variables](docs/reference/environment.md) -- complete env var reference
+
+Key points:
+
+- **Data directory:** `~/.config/agos-proxy` by default. Override with `AGOS_HOME=/path`.
+- **No config file to edit.** Everything is administered through the CLI, which writes to the SQLite store.
+- **Secrets:** provider tokens are encrypted at rest with ChaCha20-Poly1305; the master key lives only in the store's `meta` table and in memory.
+
+---
+
+## Deployment
+
+- [Deployment Guide](docs/deployment.md) -- binary install, Docker, systemd, reverse proxy, backup/restore, health checking
+
+Highlights:
+
+- Bind to `127.0.0.1` for local development (the default). Put it behind a TLS-terminating reverse proxy when exposing it on the network.
+- Back up the whole data directory, or use `config export`/`config import` for portable, cross-key backup.
+- A restart preserves profiles, providers, routes, and usage history. It resets in-memory health state and rate-limit windows.
+
+---
+
+## Security
+
+- [Security Model](docs/security.md) -- threat model, encryption, password hashing, token handling, operational guidance
+
+In brief: the host is trusted; provider tokens are encrypted at rest; profile passwords gate interactive management; bearer tokens are sensitive and should be treated like API keys; the proxy does not terminate TLS.
+
+---
+
+## Architecture
+
+- [Architecture](docs/architecture.md) -- mental model, crate layout, data model, request lifecycle, health subsystem, routing strategies
+
+---
+
+## Monitoring & Operations
+
+- [Failover](docs/failover.md) -- health states, probe loop, status transitions, operational guidance
+- [Troubleshooting](docs/help/troubleshooting.md) -- common issues and fixes
+- [FAQ](docs/help/faq.md) -- common questions
+
+Key operational tools:
 
 ```sh
-# Add the provider
-agos-proxy provider add --profile coder1
-# ... enter details ...
-
-# Add it as a new rung in an existing route
-agos-proxy route model add --proxy Programmer
-# Pick the route, pick the new provider, set priority
-```
-
-### Rotating a Compromised API Token
-
-```sh
-# Rotate the profile bearer token
-agos-proxy profile token rotate coder1
-
-# Update all clients with the new token
-```
-
-### Disaster Recovery
-
-```sh
-# 1. Export before anything goes wrong
-agos-proxy config export --profile coder1 --output backup.json
-
-# 2. On a new machine, restore
-agos-proxy config import --path backup.json
-# The imported profile gets a fresh bearer token; tokens are re-encrypted
-```
-
-### Setting Rate Limits
-
-```sh
-# Limit a profile to 120 requests per minute
-agos-proxy profile limit coder1 120
-
-# Remove the limit
-agos-proxy profile limit coder1 0
+agos-proxy route status --route <name>     # which entries are healthy
+agos-proxy usage recent --profile <name>    # what happened to recent requests
+agos-proxy usage stats --profile <name>     # per-model aggregates
+RUST_LOG=debug agos-proxy serve            # verbose server logs
 ```
 
 ---
 
-## Architecture Overview
+## Reference
 
-For the full architecture reference, see [docs/architecture.md](docs/architecture.md).
-
-### Mental Model
-
-```
-Profile ("coder1")  ← tenant, owns everything
-├── Providers       ← how we reach the outside world
-│   ├── Deepseek    base_url + auth_token (encrypted)
-│   ├── Anthropic   base_url + auth_token (encrypted)
-│   └── Google      base_url + auth_token (encrypted)
-└── Proxies         ← what callers may request
-    └── Proxy: "Programmer"
-        ├── Route: "php-developer-3.5-flash"
-        │     1. deepseek-v4-flash    (priority 1)
-        │     2. claude-3-haiku       (priority 2)
-        └── Route: "code-reviewer"
-              1. gpt-4o               (priority 1)
-              2. gemini-2.0-flash      (priority 2)
-```
-
-### Request Lifecycle
-
-```
-Caller ──/v1/chat/completions──► AGOS Proxy ──resolve──► Route
-  │                                    │                  │
-  │                                    │              strategy?
-  │                                    │            ╱    │    ╲
-  │                                  auth     Priority  Round  Weighted
-  │                                  rate     try in   Robin   Round Robin
-  │                                  limit    order
-  │                                    │
-  │                                    ▼
-  │                            Translator (if needed)
-  │                            (Anthropic, Google, pass-through)
-  │                                    │
-  │                                    ▼
-  │                            Upstream Provider
-  │                                    │
-  ◄──────── response ──────────────────┘
-```
-
-### Crate Layout
-
-```
-src/
-├── lib.rs           crate root, module wiring, VERSION
-├── main.rs          thin entry point: parse args, call cli::run
-├── cli/             command tree (clap) + interactive wizards + TUI
-├── domain/          core data model: profiles, providers, proxies, routes
-├── storage/         persistence of the domain model (embedded SQLite)
-├── server/          OpenAI-compatible HTTP surface + auth + rate limiting
-├── router/          model resolution, failover execution, routing state
-├── health/          background probe loop for unhealthy entries
-├── crypto/          secrets at rest (ChaCha20-Poly1305 + Argon2id)
-├── translator/      OpenAI ⇄ provider shape translation (Anthropic, Google)
-└── bin/
-    └── gen-docs     developer-only: man pages, completions, CLI markdown
-```
+| Document | Purpose |
+|----------|---------|
+| [API Reference](docs/api-reference.md) | HTTP endpoints, auth, errors, streaming |
+| [CLI Reference](docs/CLI.md) | Auto-generated command help |
+| [Configuration](docs/configuration.md) | Data dir, env vars, bootstrap schema, secrets |
+| [Environment Variables](docs/reference/environment.md) | Complete env var reference |
+| [Providers](docs/providers.md) | Provider kinds, setup, auth styles |
+| [Failover](docs/failover.md) | Health states, probe loop, streaming limitation |
+| [Security](docs/security.md) | Threat model, encryption, operational guidance |
+| [Architecture](docs/architecture.md) | Design, crate layout, data model, request lifecycle |
+| [Deployment](docs/deployment.md) | Binary, Docker, systemd, reverse proxy, backup |
 
 ---
 
-## Documentation Index
+## Contributing
 
-### Tutorials
-| Document | Contents |
-|----------|----------|
-| [docs/tutorials/getting-started.md](docs/tutorials/getting-started.md) | Step-by-step install → first request |
-| [docs/tutorials/common-patterns.md](docs/tutorials/common-patterns.md) | Common configuration patterns |
-| [docs/tutorials/openai-sdk-integration.md](docs/tutorials/openai-sdk-integration.md) | Using with Python, JS, and other OpenAI SDKs |
-
-### Reference
-| Document | Contents |
-|----------|----------|
-| [docs/architecture.md](docs/architecture.md) | Full design, crate layout, data model, build phases |
-| [docs/CLI.md](docs/CLI.md) | Auto-generated full command reference |
-| [docs/configuration.md](docs/configuration.md) | Config location, env vars, bootstrap JSON schema, secrets |
-| [docs/api.md](docs/api.md) | OpenAI-compatible API surface, auth, rate limiting, errors |
-| [docs/providers.md](docs/providers.md) | Provider kinds, translators, per-provider notes |
-| [docs/security.md](docs/security.md) | Threat model, encryption, password hashing, token handling |
-| [docs/reference/environment.md](docs/reference/environment.md) | Complete environment variable reference |
-
-### Operations
-| Document | Contents |
-|----------|----------|
-| [docs/operations/runbook.md](docs/operations/runbook.md) | Day-2 operations runbook |
-| [docs/operations/monitoring.md](docs/operations/monitoring.md) | Monitoring, observability, alerting |
-| [docs/operations/migrations.md](docs/operations/migrations.md) | Store migration guide |
-| [docs/deployment.md](docs/deployment.md) | Docker, binary install, systemd, reverse proxy |
-
-### Help
-| Document | Contents |
-|----------|----------|
-| [docs/help/faq.md](docs/help/faq.md) | Frequently asked questions |
-| [docs/help/troubleshooting.md](docs/help/troubleshooting.md) | Common issues and solutions |
-
-### Contributing
-| Document | Contents |
-|----------|----------|
-| [CONTRIBUTING.md](CONTRIBUTING.md) | Contribution workflow and review expectations |
-| [docs/contributing/testing.md](docs/contributing/testing.md) | Testing guide (unit, integration, e2e) |
-| [docs/contributing/code-of-conduct.md](docs/contributing/code-of-conduct.md) | Code of conduct |
-| [docs/development.md](docs/development.md) | Dev environment, testing, code layout |
-| [docs/workflow.md](docs/workflow.md) | Branching, releases, CI, versioning policy |
-
-### Architecture Decision Records
-| Document | Contents |
-|----------|----------|
-| [docs/adr/001-why-rust.md](docs/adr/001-why-rust.md) | Why Rust was chosen |
-| [docs/adr/002-sqlite-store.md](docs/adr/002-sqlite-store.md) | Why SQLite for persistence |
-| [docs/adr/003-chacha20-encryption.md](docs/adr/003-chacha20-encryption.md) | Encryption algorithm choices |
-| [docs/adr/004-cli-first-design.md](docs/adr/004-cli-first-design.md) | CLI-first design philosophy |
-
-### Top-Level Quick Reference
-| Document | Contents |
-|----------|----------|
-| [QUICKREF.md](QUICKREF.md) | One-page CLI quick reference |
-
----
-
-## Project Status
-
-AGOS Proxy is **v0.1.0** — pre-1.0. The core surface is functional:
-
-| Area | Status |
-|------|--------|
-| Profile CRUD | ✅ Stable |
-| Provider CRUD (with encrypted tokens) | ✅ Stable |
-| Proxy CRUD | ✅ Stable |
-| Route CRUD (with model chains) | ✅ Stable |
-| `/v1/chat/completions` (streaming + non-streaming) | ✅ Stable |
-| `/v1/completions` (passthrough) | ✅ Stable |
-| `/v1/embeddings` (passthrough) | ✅ Stable |
-| `/v1/models` (auto-listing) | ✅ Stable |
-| Automatic failover with health tracking | ✅ Stable |
-| Priority routing | ✅ Stable |
-| Round-robin routing | ✅ Stable |
-| Weighted round-robin routing | ✅ Stable |
-| Background health probe loop | ✅ Stable |
-| Bearer token auth | ✅ Stable |
-| Per-profile rate limiting | ✅ Stable |
-| Interactive CLI wizards | ✅ Stable |
-| Non-interactive flag-driven commands | ✅ Stable |
-| Full-screen TUI chat | ✅ Stable |
-| Config export/import (passphrase-sealed) | ✅ Stable |
-| Bootstrap from JSON | ✅ Stable |
-| Usage logging + per-model aggregates | ✅ Stable |
-| Docker test stack with mock upstream | ✅ Stable |
-| Auto-generated CLI docs, man pages, completions | ✅ Stable |
-| Capability-aware routing | 🔄 Partial (stored, partially filtered) |
-| Cost tracking | 📋 Planned |
-| Failover webhooks | 📋 Planned |
-| Richer CLI stats / history search | 📋 Planned |
-| Provider-specific advanced options | 📋 Planned |
-| Multi-node clustering | 📋 Planned |
-| TLS termination (built-in) | 📋 Planned |
-
----
-
-## Glossary
-
-| Term | Definition |
-|------|------------|
-| **Profile** | A tenant. Owns providers, proxies, and routes. Has an opaque `id` that doubles as the API bearer token. |
-| **Provider** | An upstream LLM service (e.g., DeepSeek, Anthropic, OpenRouter). Defined by `base_url`, `auth_token`, and `kind`. |
-| **Proxy** | A named group of routes. Think of it as an API namespace (e.g., "Programmer"). |
-| **Route** | An addressable fallback chain. Exposed to callers as `<proxy>/<route>`. Behind the scenes, an ordered list of models. |
-| **Route Entry / Model Entry** | A single rung in a route's fallback chain. Points at a specific model on a specific provider, with a priority and weight. |
-| **Strategy** | How entries in a route are selected: `priority` (strict order), `round_robin` (distribute), `weighted` (weighted distribution). |
-| **Health Status** | Per-entry state: `Healthy`, `Degraded`, `Unhealthy`, or `Disabled`. Controls whether an entry receives live traffic. |
-| **Failover** | The process of trying the next entry in a chain when the current one fails. |
-| **Translator** | Code that converts OpenAI-compatible request/response shapes to a provider's native format (Anthropic, Google). |
-| **Bootstrap** | Non-interactive store seeding from a JSON document, for containers and CI. |
-| **Portable File** | A passphrase-sealed file containing a full profile tree, for export/import between machines. |
-| **Store** | The single SQLite file holding all profiles, providers, proxies, routes, and usage data. |
-| **AGOS_HOME** | Environment variable overriding the data directory location. |
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution workflow, PR expectations, and the release process. Keep changes small and focused. Update docs when behavior changes.
 
 ---
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT -- see [LICENSE](LICENSE).

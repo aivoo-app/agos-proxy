@@ -1,0 +1,156 @@
+{
+  "api_version": "v1",
+  "base_url": {
+    "cloud": "https://api.agos.proxy/v1",
+    "local": "http://localhost:3000/v1"
+  },
+  "authentication": {
+    "method": "Bearer token",
+    "header": "Authorization",
+    "note": "Use your profile token as the API key"
+  },
+  "endpoints": {
+    "chat_completions": {
+      "path": "/chat/completions",
+      "method": "POST",
+      "description": "Generate chat completions (streaming supported)",
+      "model_format": "<proxy>/<route>",
+      "supports_streaming": true,
+      "parameters": [
+        {
+          "name": "model",
+          "required": true,
+          "type": "string",
+          "example": "Programmer/coder"
+        },
+        {
+          "name": "messages",
+          "required": true,
+          "type": "array",
+          "example": "[{\"role\": \"user\", \"content\": \"Hello\"}]"
+        },
+        {
+          "name": "stream",
+          "required": false,
+          "type": "boolean",
+          "default": false
+        },
+        {
+          "name": "max_tokens",
+          "required": false,
+          "type": "integer",
+          "example": 256
+        },
+        {
+          "name": "temperature",
+          "required": false,
+          "type": "float",
+          "example": 0.7
+        },
+        {
+          "name": "top_p",
+          "required": false,
+          "type": "float"
+        },
+        {
+          "name": "stop",
+          "required": false,
+          "type": "string | array"
+        },
+        {
+          "name": "frequency_penalty",
+          "required": false,
+          "type": "float"
+        },
+        {
+          "name": "presence_penalty",
+          "required": false,
+          "type": "float"
+        },
+        {
+          "name": "response_format",
+          "required": false,
+          "type": "object"
+        }
+      ],
+      "response": {
+        "format": "OpenAI-compatible JSON",
+        "key": "choices[0].message.content"
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "code": "invalid_request_error",
+          "when": "Bad request, missing required fields"
+        },
+        {
+          "status": 401,
+          "code": "unauthorized",
+          "when": "Invalid or missing profile token"
+        },
+        {
+          "status": 404,
+          "code": "not_found",
+          "when": "Route not found"
+        },
+        {
+          "status": 429,
+          "code": "rate_limit_exceeded",
+          "when": "Profile rate limit reached"
+        },
+        {
+          "status": 502,
+          "code": "upstream_error",
+          "when": "All upstream providers failed"
+        },
+        {
+          "status": 503,
+          "code": "service_unavailable",
+          "when": "Proxy is shutting down or restarting"
+        }
+      ]
+    },
+    "completions": {
+      "path": "/completions",
+      "method": "POST",
+      "description": "Legacy text completion endpoint",
+      "notes": "Simpler interface; fewer features than chat"
+    },
+    "embeddings": {
+      "path": "/embeddings",
+      "method": "POST",
+      "description": "Generate vector embeddings"
+    },
+    "models": {
+      "path": "/models",
+      "method": "GET",
+      "description": "List available models (routes)",
+      "response": "Array of model objects with route metadata"
+    }
+  },
+  "streaming": {
+    "type": "Server-Sent Events (SSE)",
+    "format": "OpenAI-compatible streaming chunks",
+    "caveat": "If upstream fails mid-stream, the stream breaks (fundamental limitation)"
+  },
+  "rate_limiting": {
+    "enabled": true,
+    "scope": "Per-profile",
+    "note": "Default: no limit. Configure with agos-proxy rate limit set"
+  },
+  "health_endpoints": {
+    "foundry": {
+      "path": "/health",
+      "authenticated": false
+    },
+    "agora": {
+      "path": "/setup",
+      "authenticated": false,
+      "description": "Setup endpoint for agent integration"
+    }
+  },
+  "examples": {
+    "curl_chat": "curl -X POST http://localhost:3000/v1/chat/completions -H 'Content-Type: application/json' -H 'Authorization: Bearer <TOKEN>' -d '{\"model\": \"Programmer/coder\", \"messages\": [{\"role\": \"user\", \"content\": \"Hello\"}]}'",
+    "curl_streaming": "curl -X POST http://localhost:3000/v1/chat/completions -H 'Content-Type: application/json' -H 'Authorization: Bearer <TOKEN>' -d '{\"model\": \"Programmer/coder\", \"messages\": [{\"role\": \"user\", \"content\": \"Hello\"}], \"stream\": true}'"
+  }
+}
