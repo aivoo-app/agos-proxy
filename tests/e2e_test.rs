@@ -62,7 +62,7 @@ fn setup_store(base_url: &str) -> (Store, String) {
         .create_proxy(&profile_id, "programmer", Some("dev proxy"))
         .expect("create proxy");
     let route = store
-        .create_route(proxy.id, "php-dev", None, RoutingStrategy::Priority)
+        .create_route(proxy.id, "php-dev", None, RoutingStrategy::Priority, None)
         .expect("create route");
     store
         .add_route_entry(

@@ -749,7 +749,7 @@ mod tests {
             .create_proxy(&profile.id, "prog", None)
             .expect("proxy");
         let route = store
-            .create_route(proxy.id, "r1", None, RoutingStrategy::Priority)
+            .create_route(proxy.id, "r1", None, RoutingStrategy::Priority, None)
             .expect("route");
         store
             .add_route_entry(route.id, provider.id, "m1", 1, 1.0, Default::default())

@@ -9,6 +9,7 @@
 //! - [`server`]  — the HTTP surface exposed to callers (work in progress).
 //! - [`crypto`]  — handling of secrets at rest (work in progress).
 
+pub mod adapter;
 pub mod cli;
 pub mod crypto;
 pub mod domain;

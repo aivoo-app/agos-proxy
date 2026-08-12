@@ -1280,7 +1280,7 @@ mod tests {
 
         // Route edit + strategy change + entry reorder/update/delete.
         let route = store.create_route(proxy.id, "r", None, RoutingStrategy::Priority, None)?;
-        store.update_route(route.id, "r2", Some("desc"), RoutingStrategy::Weighted)?;
+        store.update_route(route.id, "r2", Some("desc"), RoutingStrategy::Weighted, None)?;
         let route2 = store.get_route_named(proxy.id, "r2")?.unwrap();
         assert_eq!(route2.strategy, RoutingStrategy::Weighted);
 
