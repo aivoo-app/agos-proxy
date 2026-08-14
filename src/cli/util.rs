@@ -180,7 +180,7 @@ pub fn fetch_provider_models(provider: &crate::domain::Provider) -> Result<Vec<S
         .enable_all()
         .build()?;
     let ids = rt.block_on(async move {
-        let base = crate::translator::normalize_base(&provider.base_url);
+        let base = crate::adapter::outbound::normalize_base(&provider.base_url);
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(20))
             .build()
@@ -228,7 +228,10 @@ pub fn prompt_model_id(
     loop {
         if browseable {
             let choices = [
-                format!("Browse models from {:?} (fetch from the API)", provider.name),
+                format!(
+                    "Browse models from {:?} (fetch from the API)",
+                    provider.name
+                ),
                 "Type the model ID manually".to_string(),
             ];
             let idx = Select::with_theme(theme)

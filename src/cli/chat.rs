@@ -14,13 +14,14 @@ use anyhow::{bail, Context as _, Result};
 use clap::Parser;
 use dialoguer::{theme::ColorfulTheme, Select};
 
+use crate::adapter::outbound::forward_non_streaming;
 use crate::cli::util::open_store;
 use crate::domain::Profile;
 use crate::router::{
     execute_with_failover, resolve_targets_with_strategy, RequestNeeds, RoutingState,
 };
 use crate::storage::Store;
-use crate::translator::{content_text, forward_non_streaming, ChatRequest, Message};
+use crate::translator::{content_text, ChatRequest, Message};
 
 /// Arguments for `agos-proxy chat`. The wizards pick profile → proxy → route.
 #[derive(Debug, Parser)]

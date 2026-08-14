@@ -154,7 +154,11 @@ pub fn resolve_targets(store: &Store, profile_id: &str, model: &str) -> Result<V
             continue;
         }
         if let Some(provider) = store.get_provider(entry.provider_id)? {
-            targets.push(Target { provider, entry, identity: identity.clone() });
+            targets.push(Target {
+                provider,
+                entry,
+                identity: identity.clone(),
+            });
         }
     }
     Ok(targets)
@@ -196,7 +200,11 @@ pub fn resolve_targets_with_strategy(
                 .get_provider(entry.provider_id)
                 .ok()
                 .flatten()
-                .map(|provider| Target { provider, entry, identity: identity.clone() })
+                .map(|provider| Target {
+                    provider,
+                    entry,
+                    identity: identity.clone(),
+                })
         })
         .collect();
 

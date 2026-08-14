@@ -145,7 +145,11 @@ fn server_command(bind: &str, attempt_timeout_secs: Option<u64>) -> Result<()> {
         .build()?;
     let addr = bind.to_string();
     rt.block_on(async move {
-        crate::server::serve(&addr, attempt_timeout_secs.map(std::time::Duration::from_secs)).await
+        crate::server::serve(
+            &addr,
+            attempt_timeout_secs.map(std::time::Duration::from_secs),
+        )
+        .await
     })?;
     Ok(())
 }

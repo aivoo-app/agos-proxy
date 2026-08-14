@@ -30,12 +30,24 @@ pub async fn auth_middleware(
     }
 
     // All other endpoints (including /ready when auth is required) need auth.
+    // The profile token can be presented the way each native client speaks it:
+    // OpenAI SDKs use `Authorization: Bearer`, the Anthropic SDK sends
+    // `x-api-key`, and the Gemini SDK puts a `key=` query parameter. All of
+    // them carry the same profile id, so we accept any one.
     let token = request
         .headers()
         .get("Authorization")
         .and_then(|h| h.to_str().ok())
         .and_then(|h| h.strip_prefix("Bearer "))
-        .map(String::from);
+        .map(String::from)
+        .or_else(|| {
+            request
+                .headers()
+                .get("x-api-key")
+                .and_then(|h| h.to_str().ok())
+                .map(String::from)
+        })
+        .or_else(|| query_key(request.uri().query()));
 
     let profile = token
         .as_ref()
@@ -93,4 +105,18 @@ pub async fn auth_middleware(
                 })
         }
     }
+}
+
+/// Extract the `key` query parameter, used by the Gemini SDK for auth.
+fn query_key(query: Option<&str>) -> Option<String> {
+    query.and_then(|q| {
+        q.split('&').find_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            if k == "key" {
+                Some(v.to_string())
+            } else {
+                None
+            }
+        })
+    })
 }

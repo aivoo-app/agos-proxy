@@ -16,6 +16,7 @@ use axum::Router;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
+use crate::adapter::Registry;
 use crate::cli::data_dir;
 use crate::health;
 use crate::router::RoutingState;
@@ -24,6 +25,7 @@ use crate::storage::Store;
 mod auth;
 mod handlers;
 pub mod middleware;
+mod native;
 pub mod ratelimit;
 
 pub use handlers::{chat_completions, list_models, AppState};
@@ -86,9 +88,43 @@ pub fn create_app(state: AppState) -> Router {
     let cors_layer = build_cors_layer();
 
     Router::new()
+        // Legacy OpenAI-compatible surface (backward-compatible alias).
         .route(
             "/v1/chat/completions",
             axum::routing::post(handlers::chat_completions),
+        )
+        // Namespaced native surfaces served through the master adapter registry.
+        .route(
+            "/openai/v1/chat/completions",
+            axum::routing::post(native::openai_chat),
+        )
+        .route(
+            "/openai/v1/completions",
+            axum::routing::post(handlers::completions),
+        )
+        .route(
+            "/openai/v1/embeddings",
+            axum::routing::post(handlers::embeddings),
+        )
+        .route(
+            "/openai/v1/models",
+            axum::routing::get(handlers::list_models),
+        )
+        .route(
+            "/anthropic/v1/messages",
+            axum::routing::post(native::anthropic_messages),
+        )
+        .route(
+            "/anthropic/v1/models",
+            axum::routing::get(native::anthropic_models),
+        )
+        .route(
+            "/google/v1beta/models/{*path}",
+            axum::routing::any(native::google_generate),
+        )
+        .route(
+            "/google/v1beta/models",
+            axum::routing::get(native::google_models),
         )
         .route(
             "/v1/completions",
@@ -185,6 +221,7 @@ pub async fn serve(bind_addr: &str, cli_attempt_timeout: Option<Duration>) -> Re
         routing_state: RoutingState::default(),
         rate_limiter: rate_limiter.clone(),
         require_auth_on_health: false,
+        adapter: Registry::default(),
     };
     let app = create_app(state);
 

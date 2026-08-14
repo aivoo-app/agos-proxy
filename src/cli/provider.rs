@@ -145,7 +145,8 @@ fn edit(store: &crate::storage::Store, profile: Option<String>) -> Result<()> {
         .with_prompt("Base URL")
         .default(provider.base_url.clone())
         .interact_text()?;
-    let auth_token = crate::cli::util::prompt_token(&theme, "API token (empty to keep current)", true)?;
+    let auth_token =
+        crate::cli::util::prompt_token(&theme, "API token (empty to keep current)", true)?;
     let final_token = if auth_token.is_empty() {
         provider.auth_token.clone()
     } else {

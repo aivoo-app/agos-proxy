@@ -12,10 +12,10 @@ use anyhow::Result;
 use tokio::time::{interval, timeout};
 use tracing::info_span;
 
+use crate::adapter::outbound::normalize_base;
 use crate::domain::ModelStatus;
 use crate::server::ratelimit::RateLimiter;
 use crate::storage::Store;
-use crate::translator::normalize_base;
 
 /// How often the probe loop wakes up and scans for entries to check.
 const PROBE_INTERVAL: Duration = Duration::from_secs(30);

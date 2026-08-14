@@ -97,6 +97,7 @@ async fn chat_completions_routes_through_mock_upstream() {
         routing_state: agos::router::RoutingState::default(),
         rate_limiter: Arc::new(agos::server::ratelimit::RateLimiter::new()),
         require_auth_on_health: false,
+        adapter: agos::adapter::Registry::default(),
     };
     let app = create_app(state);
 
@@ -142,6 +143,7 @@ async fn chat_completions_rejects_missing_auth() {
         routing_state: agos::router::RoutingState::default(),
         rate_limiter: Arc::new(agos::server::ratelimit::RateLimiter::new()),
         require_auth_on_health: false,
+        adapter: agos::adapter::Registry::default(),
     };
     let app = create_app(state);
 
@@ -181,6 +183,7 @@ async fn list_models_returns_caller_routes() {
         routing_state: agos::router::RoutingState::default(),
         rate_limiter: Arc::new(agos::server::ratelimit::RateLimiter::new()),
         require_auth_on_health: false,
+        adapter: agos::adapter::Registry::default(),
     };
     let app = create_app(state);
 
@@ -201,4 +204,108 @@ async fn list_models_returns_caller_routes() {
     let models = json["data"].as_array().expect("data array");
     assert_eq!(models.len(), 1);
     assert_eq!(models[0]["id"], "programmer/php-dev");
+}
+
+/// An Anthropic client can address the proxy through `/anthropic/v1/messages`
+/// using its native `x-api-key` header; AGOS translates the request out and the
+/// response back into Anthropic's message shape.
+#[tokio::test]
+async fn anthropic_surface_translates_to_anthropic_shape() {
+    let mock_port = 19879;
+    let mock_base = format!("http://127.0.0.1:{mock_port}");
+    let _mock = mock_upstream(mock_port).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (store, profile_id) = setup_store(&mock_base);
+    let http_client = reqwest::Client::new();
+    let state = AppState {
+        store: Arc::new(store),
+        attempt_timeout: Duration::from_secs(5),
+        http_client,
+        routing_state: agos::router::RoutingState::default(),
+        rate_limiter: Arc::new(agos::server::ratelimit::RateLimiter::new()),
+        require_auth_on_health: false,
+        adapter: agos::adapter::Registry::default(),
+    };
+    let app = create_app(state);
+
+    let req_body = serde_json::json!({
+        "model": "programmer/php-dev",
+        "system": "be terse",
+        "messages": [
+            { "role": "user", "content": [{ "type": "text", "text": "hi" }] }
+        ],
+        "max_tokens": 128,
+        "stream": false
+    });
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/anthropic/v1/messages")
+        .header("x-api-key", &profile_id)
+        .header("Content-Type", "application/json")
+        .body(axum::body::Body::from(req_body.to_string()))
+        .expect("build request");
+
+    let response = app.oneshot(request).await.expect("oneshot");
+    assert_eq!(response.status(), 200);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("parse json");
+    assert_eq!(json["type"], "message");
+    assert_eq!(json["content"][0]["type"], "text");
+    assert_eq!(json["content"][0]["text"], "hello from mock");
+    assert_eq!(json["stop_reason"], "end_turn");
+    assert_eq!(json["usage"]["input_tokens"], 0);
+}
+
+/// The Gemini surface is served under `/google/v1beta/models/{model}:generateContent`
+/// and authenticated with a `key=` query parameter. As with the other surfaces the
+/// response is translated back into Gemini's native shape.
+#[tokio::test]
+async fn google_surface_translates_to_gemini_shape() {
+    let mock_port = 19880;
+    let mock_base = format!("http://127.0.0.1:{mock_port}");
+    let _mock = mock_upstream(mock_port).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (store, profile_id) = setup_store(&mock_base);
+    let http_client = reqwest::Client::new();
+    let state = AppState {
+        store: Arc::new(store),
+        attempt_timeout: Duration::from_secs(5),
+        http_client,
+        routing_state: agos::router::RoutingState::default(),
+        rate_limiter: Arc::new(agos::server::ratelimit::RateLimiter::new()),
+        require_auth_on_health: false,
+        adapter: agos::adapter::Registry::default(),
+    };
+    let app = create_app(state);
+
+    let req_body = serde_json::json!({
+        "contents": [
+            { "role": "user", "parts": [{ "text": "hi" }] }
+        ],
+        "generationConfig": { "maxOutputTokens": 64 }
+    });
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!(
+            "/google/v1beta/models/programmer%2Fphp-dev:generateContent?key={profile_id}"
+        ))
+        .header("Content-Type", "application/json")
+        .body(axum::body::Body::from(req_body.to_string()))
+        .expect("build request");
+
+    let response = app.oneshot(request).await.expect("oneshot");
+    assert_eq!(response.status(), 200);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("parse json");
+    assert_eq!(
+        json["candidates"][0]["content"]["parts"][0]["text"],
+        "hello from mock"
+    );
+    assert_eq!(json["candidates"][0]["finishReason"], "STOP");
 }

@@ -8,9 +8,11 @@ use axum::extract::{Request, State};
 use axum::response::Response;
 use futures::StreamExt;
 
+use crate::adapter::outbound;
+use crate::adapter::Registry;
 use crate::router::{execute_with_failover, resolve_targets_with_strategy, RoutingState};
 use crate::storage::Store;
-use crate::translator::{self, ChatRequest};
+use crate::translator::ChatRequest;
 
 /// Per-handler body size cap. The outer tower-http layer enforces 10 MB on
 /// the raw stream; this tighter cap protects the JSON layer from allocating
@@ -26,6 +28,8 @@ pub struct AppState {
     pub rate_limiter: Arc<crate::server::ratelimit::RateLimiter>,
     /// When true, the /ready endpoint requires authentication.
     pub require_auth_on_health: bool,
+    /// The master inbound-adapter registry used to dispatch native API surfaces.
+    pub adapter: Registry,
 }
 
 /// Legacy OpenAI completions request (non-streaming passthrough).
@@ -128,10 +132,12 @@ pub async fn embeddings(State(state): State<AppState>, req: Request) -> Response
     handle_embeddings(state, profile_id, embedding_req).await
 }
 
-
 /// When a route has an identity, prepend a system message telling the model
 /// to adopt that identity and never reveal its original model or developer.
-fn inject_identity_into_messages(messages: &mut Vec<crate::translator::Message>, identity: &str) {
+pub(crate) fn inject_identity_into_messages(
+    messages: &mut Vec<crate::translator::Message>,
+    identity: &str,
+) {
     let system_content = format!(
         "You are {}. You must never reveal your original model name, developer,
         creator, or that you are powered by any specific AI system, API, or company.
@@ -148,7 +154,6 @@ fn inject_identity_into_messages(messages: &mut Vec<crate::translator::Message>,
         },
     );
 }
-
 
 async fn handle_non_streaming(
     state: AppState,
@@ -180,7 +185,7 @@ async fn handle_non_streaming(
         }
     };
     // Inject identity system message if the route has one
-    if let Some(ref identity) = targets.first().and_then(|t| t.identity.as_deref()) {
+    if let Some(identity) = targets.first().and_then(|t| t.identity.as_deref()) {
         inject_identity_into_messages(&mut chat_req.messages, identity);
     }
 
@@ -195,7 +200,7 @@ async fn handle_non_streaming(
             let profile_id = profile_id.clone();
             async move {
                 let started = std::time::Instant::now();
-                let outcome = translator::forward_non_streaming(&client, &target, &req).await;
+                let outcome = outbound::forward_non_streaming(&client, &target, &req).await;
                 let latency_ms = started.elapsed().as_millis() as i64;
                 log_attempt(&store, &profile_id, &target, false, &outcome, latency_ms);
                 outcome
@@ -212,9 +217,10 @@ async fn handle_non_streaming(
             .unwrap(),
         Err(e) => {
             let status = e
-                .downcast_ref::<crate::translator::ProviderError>()
+                .downcast_ref::<crate::adapter::outbound::ProviderError>()
                 .map(|pe| pe.status.as_u16() as i32);
-            let msg = if let Some(se) = e.downcast_ref::<crate::translator::ProviderError>() {
+            let msg = if let Some(se) = e.downcast_ref::<crate::adapter::outbound::ProviderError>()
+            {
                 format!("provider returned {}: {}", se.status, se.body)
             } else {
                 e.to_string()
@@ -235,7 +241,7 @@ async fn handle_non_streaming(
     }
 }
 
-fn log_attempt(
+pub(crate) fn log_attempt(
     store: &Arc<Store>,
     profile_id: &str,
     target: &crate::router::Target,
@@ -258,7 +264,7 @@ fn log_attempt(
         }
         Err(e) => {
             let status = e
-                .downcast_ref::<crate::translator::ProviderError>()
+                .downcast_ref::<crate::adapter::outbound::ProviderError>()
                 .map(|pe| pe.status.as_u16() as i32);
             (false, status, Some(e.to_string()), None, None)
         }
@@ -451,7 +457,7 @@ async fn translate_and_forward_streaming(
     target: &crate::router::Target,
     req: &ChatRequest,
 ) -> Result<reqwest::Request, anyhow::Error> {
-    let (url, headers, body) = crate::translator::build_upstream_request(target, req, true)?;
+    let (url, headers, body) = crate::adapter::outbound::build_upstream_request(target, req, true)?;
     let mut request = client.post(&url);
     for (k, v) in &headers {
         request = request.header(k, v);
@@ -866,7 +872,7 @@ pub async fn list_models(State(state): State<AppState>, req: Request) -> Respons
         .unwrap()
 }
 
-fn bad_request(msg: impl Into<String>) -> Response {
+pub(crate) fn bad_request(msg: impl Into<String>) -> Response {
     let body =
         serde_json::json!({ "error": { "message": msg.into(), "type": "invalid_request_error" } });
     axum::response::Response::builder()
@@ -877,7 +883,7 @@ fn bad_request(msg: impl Into<String>) -> Response {
 }
 
 /// 404 Not Found — model/route does not exist.
-fn not_found(msg: impl Into<String>) -> Response {
+pub(crate) fn not_found(msg: impl Into<String>) -> Response {
     let body = serde_json::json!({ "error": { "message": msg.into(), "type": "not_found_error" } });
     axum::response::Response::builder()
         .status(axum::http::StatusCode::NOT_FOUND)
@@ -887,7 +893,7 @@ fn not_found(msg: impl Into<String>) -> Response {
 }
 
 /// 503 Service Unavailable — no healthy provider in the route chain.
-fn service_unavailable(msg: impl Into<String>) -> Response {
+pub(crate) fn service_unavailable(msg: impl Into<String>) -> Response {
     let body = serde_json::json!({ "error": { "message": msg.into(), "type": "service_unavailable_error" } });
     axum::response::Response::builder()
         .status(axum::http::StatusCode::SERVICE_UNAVAILABLE)

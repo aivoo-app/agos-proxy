@@ -184,17 +184,3 @@ pub struct EmbeddingResponse {
     pub model: String,
     pub usage: EmbeddingUsage,
 }
-
-// ---------------------------------------------------------------------------
-// Back-compat re-exports: the provider codecs moved to `crate::adapter::
-// outbound`, but callers across the codebase still import them from here.
-// These aliases are temporary; callers will be migrated to the adapter
-// module in a follow-up commit and this shim removed.
-// ---------------------------------------------------------------------------
-#[allow(unused_imports)]
-pub use crate::adapter::outbound::{
-    anthropic, google, build_upstream_request, forward_non_streaming,
-    normalize_base, parse_canonical, translate_response, ProviderError,
-};
-#[allow(unused_imports)]
-pub use crate::adapter::outbound::openai::parse_stream_chunk as decode_openai_sse;
