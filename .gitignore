@@ -5,3 +5,5 @@ Cargo.lock
 # Local planning notes — never shared
 AGENT.md
 /plan
+# Local agent rules — never shared
+.clinerules

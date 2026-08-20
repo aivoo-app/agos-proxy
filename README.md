@@ -386,14 +386,25 @@ The bootstrap document is the same format that Docker's `AGOS_SETUP` environment
 
 ## API Surface
 
-AGOS Proxy speaks an OpenAI-compatible API at `/v1/...`.
+AGOS Proxy is a multi-adapter gateway: it serves **several native API surfaces at
+once**, so an OpenAI, Anthropic, or Gemini SDK can point at the same proxy using
+its own dialect. The legacy `/v1/...` routes keep working as the OpenAI-compatible
+alias.
 
-| Endpoint | Description |
-|----------|-------------|
-| `POST /v1/chat/completions` | Chat completions (streaming and non-streaming) |
-| `POST /v1/completions` | Legacy text completions |
-| `POST /v1/embeddings` | Embedding vectors |
-| `GET /v1/models` | Lists the routes your profile can call |
+| Surface | Endpoint | Notes |
+|---------|----------|-------|
+| OpenAI (legacy) | `POST /v1/chat/completions` | Backward-compatible alias |
+| OpenAI | `POST /openai/v1/chat/completions` | Namespaced OpenAI surface |
+| OpenAI | `POST /openai/v1/completions`, `/openai/v1/embeddings`, `GET /openai/v1/models` | |
+| Anthropic | `POST /anthropic/v1/messages`, `GET /anthropic/v1/models` | Native Claude SDK surface |
+| Gemini | `POST /google/v1beta/models/{model}:generateContent`, `:streamGenerateContent`, `GET /google/v1beta/models` | Native Gemini SDK surface |
+| Shared | `POST /v1/completions`, `POST /v1/embeddings`, `GET /v1/models` | OpenAI-compatible |
+
+Each surface authenticates with the same profile token, presented the way its
+native client expects: `Authorization: Bearer <token>` (OpenAI), `x-api-key
+<token>` (Anthropic), or `?key=<token>` (Gemini). Streaming responses are
+translated into the caller's own SSE format regardless of which provider is
+upstream.
 
 Full reference: [API Reference](docs/api-reference.md)
 

@@ -55,7 +55,10 @@ src/
 ├── router/          model resolution, failover execution, routing state
 ├── health/          background probe loop for unhealthy entries
 ├── crypto/          secrets at rest (ChaCha20-Poly1305 + Argon2id)
-├── translator/      OpenAI <-> provider shape translation (Anthropic, Google)
+├── adapter/         modular API adapters, master registry (ApiKind)
+│   ├── inbound/     per-surface inbound: openai, anthropic, google
+│   └── outbound/    per-provider outbound: openai, anthropic, google
+├── translator/      canonical request/response model (no provider logic)
 └── bin/
     └── gen-docs     developer-only: man pages, completions, CLI markdown
 ```
@@ -96,13 +99,13 @@ token is encrypted at rest.
 | `description`  | Option    | Free-text.                                      |
 | `base_url`     | String    | Upstream base URL.                              |
 | `auth_token`   | String    | Encrypted at rest; never returned in clear text.|
-| `kind`         | ProviderKind | Determines the translator used.              |
+| `kind`         | ProviderKind | Determines the outbound adapter used.        |
 | `extra_headers`| BTreeMap  | Non-standard headers sent with every request.   |
 
 ### ProviderKind
 
-What wire format a provider speaks. AGOS Proxy uses this to pick a request
-and response translator.
+What wire format a provider speaks. AGOS Proxy uses this to pick the
+outbound adapter that shapes requests and decodes responses.
 
 | Variant              | Use case                                              |
 |----------------------|-------------------------------------------------------|
@@ -359,7 +362,8 @@ up to date without data loss.
 | `server`      | HTTP surface, auth middleware, rate limiter, handler dispatch.          |
 | `router`      | Model resolution, strategy application, failover execution, logging.    |
 | `health`      | Background probe loop, status machine, entry recovery.                  |
-| `translator`  | OpenAI-compatible request/response shaping per provider kind.           |
+| `adapter`     | Master adapter registry; inbound per-surface + outbound per-provider.   |
+| `translator`  | Canonical request/response/stream types shared by all adapters.         |
 
 ## Testing strategy
 
