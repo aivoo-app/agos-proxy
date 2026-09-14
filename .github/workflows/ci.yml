@@ -88,6 +88,19 @@ jobs:
           docker compose logs proxy || true
           exit 1
 
+      - name: Wait for mock upstream to be ready
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:9999/v1/models >/dev/null 2>&1; then
+              echo 'mock upstream ready'
+              exit 0
+            fi
+            sleep 1
+          done
+          echo 'mock upstream did not become ready in time' >&2
+          docker compose logs mock || true
+          exit 1
+
       - name: Basic smoke request
         run: |
           curl -sf -H 'Content-Type: application/json' \
@@ -98,12 +111,19 @@ jobs:
 
       - name: Chat completions smoke request
         run: |
-          curl -sf -H 'Content-Type: application/json' \
-            http://localhost:8080/v1/chat/completions \
-            -H 'Authorization: Bearer sk-mock' \
-            -d '{"model":"main/chat","messages":[{"role":"user","content":"hi"}]}' \
-            | jq -e '.choices | length > 0' \
-            || (echo 'chat completion failed' && docker compose logs proxy && exit 1)
+          for attempt in 1 2 3; do
+            echo "Attempt $attempt..."
+            if curl -sf -H 'Content-Type: application/json' \
+              http://localhost:8080/v1/chat/completions \
+              -H 'Authorization: Bearer sk-mock' \
+              -d '{"model":"main/chat","messages":[{"role":"user","content":"hi"}]}' \
+              | jq -e '.choices | length > 0' 2>/dev/null; then
+              echo 'chat completion succeeded'
+              exit 0
+            fi
+            sleep 2
+          done
+          echo 'chat completion failed' >&2 && docker compose logs proxy && exit 1
 
       - name: Streaming smoke request
         run: |
