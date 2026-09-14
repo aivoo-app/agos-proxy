@@ -20,14 +20,14 @@
 #   make ci             # run the full CI pipeline as on GitHub Actions
 # ==============================================================================
 
-set -euo pipefail
-
 # ---------------------------------------------------------------------------
 # Layout
 # ---------------------------------------------------------------------------
 PROJECT_ROOT := $(shell pwd)
 CARGO := cargo
 RUSTUP := rustup
+SHELL := /usr/bin/env bash
+.SHELLFLAGS := -c -euo pipefail
 
 # ---------------------------------------------------------------------------
 # Help
@@ -54,11 +54,11 @@ lint: ## Run clippy with all warnings treated as errors.
 
 .PHONY: test
 test: ## Run the test suite.
-	$(CARGO) test --all-targets -- --test-threads=auto
+	$(CARGO) test --all-targets
 
 .PHONY: test-e2e
 test-e2e: ## Run only the end-to-end integration tests.
-	$(CARGO) test --test e2e_test -- --test-threads=auto
+	$(CARGO) test --test e2e_test
 
 .PHONY: build
 build: ## Build a release binary.
@@ -97,7 +97,7 @@ docker-logs: ## Tail logs from the docker-compose stack.
 ci: ## Run the full CI pipeline (identical to GitHub Actions).
 	$(CARGO) fmt --all --check
 	$(CARGO) clippy --all-targets -- -D warnings
-	$(CARGO) test --all-targets -- --test-threads=auto
+	$(CARGO) test --all-targets
 	$(CARGO) build --release
 	./target/release/agos-proxy gen-docs --all --output-dir /tmp/agos-ci-docs
 
@@ -105,7 +105,7 @@ ci: ## Run the full CI pipeline (identical to GitHub Actions).
 ci-check: ## CI with --check style (used by pre-merge gates).
 	$(CARGO) fmt --all --check
 	$(CARGO) clippy --all-targets -- -D warnings
-	$(CARGO) test --all-targets -- --test-threads=auto
+	$(CARGO) test --all-targets
 
 # ---------------------------------------------------------------------------
 # Housekeeping

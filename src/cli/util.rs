@@ -150,7 +150,7 @@ pub fn prompt_token(
         let choices = ["Yes — save it", "Reveal the full token", "No — re-enter it"];
         let idx = Select::with_theme(theme)
             .with_prompt("Is this the token you meant to paste?")
-            .items(&choices)
+            .items(choices)
             .default(0)
             .interact()?;
         match idx {
@@ -236,7 +236,7 @@ pub fn prompt_model_id(
             ];
             let idx = Select::with_theme(theme)
                 .with_prompt(prompt)
-                .items(&choices)
+                .items(choices)
                 .default(0)
                 .interact()?;
             if idx == 0 {
