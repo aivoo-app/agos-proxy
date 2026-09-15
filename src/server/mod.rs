@@ -127,6 +127,14 @@ pub fn create_app(state: AppState) -> Router {
             axum::routing::get(native::google_models),
         )
         .route(
+            "/codex/v1/chat/completions",
+            axum::routing::post(native::codex_chat),
+        )
+        .route(
+            "/codex/v1/models",
+            axum::routing::get(handlers::list_models),
+        )
+        .route(
             "/v1/completions",
             axum::routing::post(handlers::completions),
         )

@@ -28,6 +28,7 @@ pub enum ApiKind {
     OpenAI,
     Anthropic,
     Google,
+    Codex,
 }
 
 impl ApiKind {
@@ -37,6 +38,7 @@ impl ApiKind {
             ApiKind::OpenAI => "/openai",
             ApiKind::Anthropic => "/anthropic",
             ApiKind::Google => "/google",
+            ApiKind::Codex => "/codex",
         }
     }
 
@@ -48,6 +50,7 @@ impl ApiKind {
             "openai" => Some(ApiKind::OpenAI),
             "anthropic" => Some(ApiKind::Anthropic),
             "google" => Some(ApiKind::Google),
+            "codex" => Some(ApiKind::Codex),
             _ => None,
         }
     }
@@ -69,6 +72,7 @@ impl Default for Registry {
         registry.register(&inbound::openai::OpenAiAdapter);
         registry.register(&inbound::anthropic::AnthropicAdapter);
         registry.register(&inbound::google::GoogleAdapter);
+        registry.register(&inbound::codex::CodexAdapter);
         registry
     }
 }

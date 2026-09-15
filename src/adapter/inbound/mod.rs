@@ -5,10 +5,12 @@
 //! Gemini SDK at AGOS Proxy and speak its own native dialect.
 
 pub mod anthropic;
+pub mod codex;
 pub mod google;
 pub mod openai;
 
 pub use anthropic::AnthropicAdapter;
+pub use codex::CodexAdapter;
 pub use google::GoogleAdapter;
 pub use openai::OpenAiAdapter;
 
@@ -136,5 +138,42 @@ mod tests {
         );
         assert_eq!(out["candidates"][0]["finishReason"], "STOP");
         assert_eq!(out["usageMetadata"]["totalTokenCount"], 12);
+    }
+
+    #[test]
+    fn codex_round_trip() {
+        let r = registry();
+        let body = serde_json::json!({
+            "model": "prog/route",
+            "messages": [{ "role": "user", "content": "write a function" }],
+            "stream": false,
+            "tools": [{ "type": "code_interpreter", "code_interpreter": {} }],
+        });
+        let req = r.parse_request(ApiKind::Codex, &body).unwrap();
+        assert_eq!(req.model, "prog/route");
+        assert_eq!(req.messages[0].content, "write a function");
+        // Code-interpreter tool should be flagged in extra metadata.
+        assert_eq!(
+            req.extra["codex_code_interpreter"],
+            serde_json::Value::Bool(true)
+        );
+
+        let out = r.render_response(ApiKind::Codex, &canonical());
+        assert_eq!(out["choices"][0]["message"]["content"], "hello world");
+        assert_eq!(out["choices"][0]["finish_reason"], "stop");
+        assert_eq!(out["usage"]["total_tokens"], 12);
+
+        // Streaming chunk
+        let ev = StreamEvent {
+            delta: "hello".into(),
+            finish_reason: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            done: false,
+        };
+        let frame = r
+            .render_stream_event(ApiKind::Codex, &ev, "chatcmpl-1")
+            .unwrap();
+        assert!(frame.starts_with("data:"));
     }
 }

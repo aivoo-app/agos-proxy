@@ -309,3 +309,48 @@ async fn google_surface_translates_to_gemini_shape() {
     );
     assert_eq!(json["candidates"][0]["finishReason"], "STOP");
 }
+
+/// A Codex client hitting `/codex/v1/chat/completions` is served through the
+/// Codex inbound adapter and routed to the upstream via the canonical pipeline.
+#[tokio::test]
+async fn codex_surface_translates_to_openai_shape() {
+    let mock_port = 19881;
+    let mock_base = format!("http://127.0.0.1:{mock_port}");
+    let _mock = mock_upstream(mock_port).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (store, profile_id) = setup_store(&mock_base);
+    let http_client = reqwest::Client::new();
+    let state = AppState {
+        store: Arc::new(store),
+        attempt_timeout: Duration::from_secs(5),
+        http_client,
+        routing_state: agos::router::RoutingState::default(),
+        rate_limiter: Arc::new(agos::server::ratelimit::RateLimiter::new()),
+        require_auth_on_health: false,
+        adapter: agos::adapter::Registry::default(),
+    };
+    let app = create_app(state);
+
+    let req_body = serde_json::json!({
+        "model": "programmer/php-dev",
+        "messages": [{ "role": "user", "content": "write a function" }],
+        "stream": false
+    });
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/codex/v1/chat/completions")
+        .header("Authorization", format!("Bearer {profile_id}"))
+        .header("Content-Type", "application/json")
+        .body(axum::body::Body::from(req_body.to_string()))
+        .expect("build request");
+
+    let response = app.oneshot(request).await.expect("oneshot");
+    assert_eq!(response.status(), 200);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("parse json");
+    assert_eq!(json["choices"][0]["message"]["content"], "hello from mock");
+    assert_eq!(json["choices"][0]["finish_reason"], "stop");
+}

@@ -47,6 +47,11 @@ pub async fn google_generate(State(state): State<AppState>, req: Request) -> Res
     native_chat(state, ApiKind::Google, req).await
 }
 
+/// Codex chat surface: `/codex/v1/chat/completions`.
+pub async fn codex_chat(State(state): State<AppState>, req: Request) -> Response {
+    native_chat(state, ApiKind::Codex, req).await
+}
+
 async fn native_chat(state: AppState, kind: ApiKind, req: Request) -> Response {
     let (parts, body) = req.into_parts();
     let profile_id = match parts.extensions.get::<String>() {
