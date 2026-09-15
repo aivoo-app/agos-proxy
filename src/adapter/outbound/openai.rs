@@ -3,9 +3,11 @@
 //! OpenAI-compatible providers (including `custom` kinds, which supply their
 //! own base URL) pass requests through untouched: the canonical
 //! [`ChatRequest`] *is* the OpenAI wire format, so the outbound side only
-//! stamps the route's model id and auth headers. This module also owns the
+//! stamps the route's model id, auth headers, and strips pipeline-internal
+//! bookkeeping keys the upstream must not see. This module also owns the
 //! OpenAI-shaped decoders ([`parse_canonical`], [`parse_stream_chunk`]) used
-//! to reduce any upstream response into canonical form.
+//! to reduce any upstream response into canonical form — including
+//! `tool_calls`, which are preserved so an agentic caller can act on them.
 
 use std::collections::BTreeMap;
 
@@ -16,8 +18,25 @@ use super::normalize_base;
 use crate::domain::ProviderKind;
 use crate::router::Target;
 use crate::translator::{
-    CanonicalResponse, ChatRequest, CompletionRequest, EmbeddingRequest, StreamEvent,
+    CanonicalResponse, ChatRequest, CompletionRequest, EmbeddingRequest, StreamEvent, ToolCall,
+    ToolCallDelta,
 };
+
+/// Body keys the pipeline adds for its own bookkeeping and must never forward
+/// upstream. `agos_responses` holds the Responses-API-only request fields the
+/// Codex surface collected (see [`crate::adapter::inbound::responses`]); a
+/// chat-completions provider would reject them as unknown parameters, so they
+/// are stripped here.
+const INTERNAL_BODY_KEYS: [&str; 1] = ["agos_responses"];
+
+/// Remove pipeline-internal keys from an outbound body.
+fn strip_internal_keys(body: &mut serde_json::Value) {
+    if let Some(obj) = body.as_object_mut() {
+        for key in INTERNAL_BODY_KEYS {
+            obj.remove(key);
+        }
+    }
+}
 
 /// Build the upstream request for an OpenAI-compatible chat target.
 pub fn build_upstream_request(
@@ -38,6 +57,7 @@ pub fn build_upstream_request(
     // The body uses the model ID from the route entry, not the caller's
     // model string.
     let mut body = serde_json::to_value(chat_req)?;
+    strip_internal_keys(&mut body);
     if let Some(obj) = body.as_object_mut() {
         obj.insert(
             "model".to_string(),
@@ -45,6 +65,94 @@ pub fn build_upstream_request(
         );
     }
     Ok((url, headers, body))
+}
+
+/// Coerce a `function.arguments` value into the raw JSON *string* the wire
+/// format specifies. OpenAI sends a string; some compatible providers send an
+/// already-parsed object, which is re-serialized so downstream code can always
+/// treat the value as a string.
+fn arguments_to_string(value: Option<&serde_json::Value>) -> String {
+    match value {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Null) | None => "{}".to_string(),
+        Some(other) => other.to_string(),
+    }
+}
+
+/// Extract `choices[0].message.tool_calls` into canonical form.
+///
+/// A call that carries a single `id` (the chat-completions encoding) sets both
+/// [`ToolCall::id`] and [`ToolCall::call_id`] to that id, because that is the
+/// value the client echoes back as `tool_call_id`.
+fn parse_tool_calls(v: &serde_json::Value) -> Vec<ToolCall> {
+    let Some(calls) = v
+        .pointer("/choices/0/message/tool_calls")
+        .and_then(|t| t.as_array())
+    else {
+        return Vec::new();
+    };
+    calls
+        .iter()
+        .filter_map(|call| {
+            let name = call
+                .pointer("/function/name")
+                .and_then(|n| n.as_str())
+                .filter(|n| !n.is_empty())?;
+            let id = call
+                .get("id")
+                .and_then(|i| i.as_str())
+                .unwrap_or_default()
+                .to_string();
+            Some(ToolCall {
+                id: id.clone(),
+                call_id: id,
+                name: name.to_string(),
+                arguments: arguments_to_string(call.pointer("/function/arguments")),
+            })
+        })
+        .collect()
+}
+
+/// Extract `choices[0].delta.tool_calls` fragments. Providers stream one call's
+/// id and name in the first fragment and its arguments across many, so the
+/// caller accumulates these by [`ToolCallDelta::index`].
+fn parse_stream_tool_calls(v: &serde_json::Value) -> Vec<ToolCallDelta> {
+    let Some(calls) = v
+        .pointer("/choices/0/delta/tool_calls")
+        .and_then(|t| t.as_array())
+    else {
+        return Vec::new();
+    };
+    calls
+        .iter()
+        .enumerate()
+        .map(|(position, call)| {
+            let index = call
+                .get("index")
+                .and_then(|i| i.as_u64())
+                .map(|i| i as u32)
+                .unwrap_or(position as u32);
+            let id = call
+                .get("id")
+                .and_then(|i| i.as_str())
+                .filter(|i| !i.is_empty())
+                .map(str::to_string);
+            ToolCallDelta {
+                index,
+                call_id: id.clone(),
+                id,
+                name: call
+                    .pointer("/function/name")
+                    .and_then(|n| n.as_str())
+                    .filter(|n| !n.is_empty())
+                    .map(str::to_string),
+                arguments_delta: call
+                    .pointer("/function/arguments")
+                    .and_then(|a| a.as_str())
+                    .map(str::to_string),
+            }
+        })
+        .collect()
 }
 
 /// Parse an OpenAI-shaped chat completion response into the provider-
@@ -86,7 +194,7 @@ pub fn parse_canonical(bytes: &[u8]) -> Result<CanonicalResponse> {
         finish_reason,
         prompt_tokens,
         completion_tokens,
-        tool_calls: Vec::new(),
+        tool_calls: parse_tool_calls(&v),
     })
 }
 
@@ -133,7 +241,7 @@ pub fn parse_stream_chunk(data: &str) -> Option<StreamEvent> {
         prompt_tokens: prompt,
         completion_tokens: completion,
         done,
-        ..Default::default()
+        tool_call_deltas: parse_stream_tool_calls(&v),
     })
 }
 
@@ -329,5 +437,145 @@ mod tests {
         let done = parse_stream_chunk("[DONE]").unwrap();
         assert!(done.done);
         assert!(parse_stream_chunk(": keep-alive").is_none());
+    }
+
+    #[test]
+    fn tool_calls_are_decoded_from_a_non_streaming_response() {
+        let bytes = serde_json::json!({
+            "id": "x", "model": "m",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": { "name": "shell", "arguments": "{\"cmd\":\"ls\"}" }
+                        },
+                        {
+                            "id": "call_2",
+                            "type": "function",
+                            "function": { "name": "apply_patch", "arguments": "{}" }
+                        }
+                    ]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": { "prompt_tokens": 3, "completion_tokens": 5 }
+        })
+        .to_string()
+        .into_bytes();
+
+        let canon = parse_canonical(&bytes).unwrap();
+        assert_eq!(canon.finish_reason, "tool_calls");
+        assert_eq!(canon.text, "");
+        assert_eq!(canon.tool_calls.len(), 2);
+        // Chat-completions carries one id, used for both the item and the
+        // correlation id so the client's `tool_call_id` matches.
+        assert_eq!(canon.tool_calls[0].id, "call_1");
+        assert_eq!(canon.tool_calls[0].call_id, "call_1");
+        assert_eq!(canon.tool_calls[0].name, "shell");
+        assert_eq!(canon.tool_calls[0].arguments, r#"{"cmd":"ls"}"#);
+        assert_eq!(canon.tool_calls[1].name, "apply_patch");
+    }
+
+    #[test]
+    fn tool_call_arguments_object_is_coerced_to_a_string() {
+        // Some compatible providers send arguments already parsed; the wire
+        // format says string, so it is re-serialized rather than dropped.
+        let bytes = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "id": "c", "function": { "name": "n", "arguments": { "a": 1 } }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })
+        .to_string()
+        .into_bytes();
+        let canon = parse_canonical(&bytes).unwrap();
+        assert_eq!(canon.tool_calls[0].arguments, r#"{"a":1}"#);
+    }
+
+    #[test]
+    fn malformed_and_partial_tool_calls_are_skipped() {
+        // A call with no function name is unusable; the others still decode.
+        let bytes = serde_json::json!({
+            "choices": [{
+                "message": { "tool_calls": [
+                    { "id": "a", "function": { "arguments": "{}" } },
+                    { "function": { "name": "ok" } }
+                ] },
+                "finish_reason": "tool_calls"
+            }]
+        })
+        .to_string()
+        .into_bytes();
+        let canon = parse_canonical(&bytes).unwrap();
+        assert_eq!(canon.tool_calls.len(), 1);
+        assert_eq!(canon.tool_calls[0].name, "ok");
+        assert_eq!(canon.tool_calls[0].arguments, "{}");
+    }
+
+    #[test]
+    fn text_only_response_has_no_tool_calls() {
+        let bytes = serde_json::json!({
+            "choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}]
+        })
+        .to_string()
+        .into_bytes();
+        assert!(parse_canonical(&bytes).unwrap().tool_calls.is_empty());
+    }
+
+    #[test]
+    fn streaming_tool_call_fragments_are_decoded() {
+        // The first fragment opens the call; later ones append arguments.
+        let first = parse_stream_chunk(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"shell","arguments":""}}]}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(first.tool_call_deltas.len(), 1);
+        assert_eq!(first.tool_call_deltas[0].index, 0);
+        assert_eq!(first.tool_call_deltas[0].id.as_deref(), Some("call_1"));
+        assert_eq!(first.tool_call_deltas[0].name.as_deref(), Some("shell"));
+        assert_eq!(
+            first.tool_call_deltas[0].arguments_delta.as_deref(),
+            Some("")
+        );
+
+        let second = parse_stream_chunk(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"cmd\":"}}]}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(second.tool_call_deltas[0].name, None);
+        assert_eq!(
+            second.tool_call_deltas[0].arguments_delta.as_deref(),
+            Some(r#"{"cmd":"#)
+        );
+        // Argument fragments do not terminate the stream on their own.
+        assert!(!second.done);
+    }
+
+    #[test]
+    fn internal_pipeline_keys_are_stripped_from_the_upstream_body() {
+        // The Codex surface stashes Responses-only fields in the body under
+        // `agos_responses`; a chat-completions provider must never see them.
+        let target = dummy_target();
+        let chat_req = ChatRequest {
+            model: "prog/codex".into(),
+            messages: vec![Message::text("user", "hi")],
+            stream: true,
+            extra: serde_json::json!({
+                "tools": [{ "type": "function" }],
+                "agos_responses": { "store": false, "include": ["reasoning.encrypted_content"] }
+            }),
+        };
+        let (_, _, body) = build_upstream_request(&target, &chat_req, true).unwrap();
+        assert!(body.get("agos_responses").is_none());
+        assert!(body.get("tools").is_some());
+        assert_eq!(body["model"], "deepseek-v4-flash");
     }
 }
