@@ -39,9 +39,15 @@ pub enum RouteArgs {
     },
     /// Tune economy limits: max_tokens clamp + exact-cache TTL.
     Economy {
+        /// Name of the owning profile.
+        #[arg(long)]
+        profile: Option<String>,
         /// Name of the owning proxy.
         #[arg(long)]
         proxy: Option<String>,
+        /// Name of the route (skips the route picker).
+        #[arg(long)]
+        route: Option<String>,
         /// Max tokens ceiling (0 = passthrough).
         #[arg(long)]
         max_tokens: Option<u32>,
@@ -59,27 +65,81 @@ pub enum RouteArgs {
 pub enum ModelArgs {
     /// Add a model to a route's chain.
     Add {
+        /// Name of the owning profile.
+        #[arg(long)]
+        profile: Option<String>,
         /// Name of the owning proxy.
         #[arg(long)]
         proxy: Option<String>,
+        /// Name of the route (skips the route picker).
+        #[arg(long)]
+        route: Option<String>,
+        /// Provider name (skips the provider picker).
+        #[arg(long)]
+        provider: Option<String>,
+        /// Model ID (e.g. `openai/gpt-4o-mini`; skips the model prompt).
+        #[arg(long = "model")]
+        model_id: Option<String>,
+        /// Weighted-strategy share; defaults to 1.0.
+        #[arg(long)]
+        weight: Option<f64>,
+        /// Blended price USD/1M tokens for Economy sorting.
+        #[arg(long)]
+        price: Option<f64>,
+        /// Skip the capability prompts (defaults everything on).
+        #[arg(long)]
+        yes: bool,
     },
     /// Remove a model from a route's chain.
     Remove {
+        /// Name of the owning profile.
+        #[arg(long)]
+        profile: Option<String>,
         /// Name of the owning proxy.
         #[arg(long)]
         proxy: Option<String>,
+        /// Name of the route (skips the route picker).
+        #[arg(long)]
+        route: Option<String>,
+        /// Model ID to remove (skips the model picker).
+        #[arg(long = "model")]
+        model_id: Option<String>,
+        /// Skip the confirmation prompt (for scripts/CI).
+        #[arg(long)]
+        yes: bool,
     },
     /// Move a model to a new position in the chain.
     Move {
+        /// Name of the owning profile.
+        #[arg(long)]
+        profile: Option<String>,
         /// Name of the owning proxy.
         #[arg(long)]
         proxy: Option<String>,
+        /// Name of the route (skips the route picker).
+        #[arg(long)]
+        route: Option<String>,
+        /// Model ID to move (skips the model picker).
+        #[arg(long = "model")]
+        model_id: Option<String>,
+        /// New 1-based priority position.
+        #[arg(long)]
+        position: Option<i32>,
     },
     /// Set blended price ($/1M tokens) used by Economy sorting.
     Price {
+        /// Name of the owning profile.
+        #[arg(long)]
+        profile: Option<String>,
         /// Name of the owning proxy.
         #[arg(long)]
         proxy: Option<String>,
+        /// Name of the route (skips the route picker).
+        #[arg(long)]
+        route: Option<String>,
+        /// Model ID to price (skips the model picker).
+        #[arg(long = "model")]
+        model_id: Option<String>,
         /// Blended price in USD per 1M tokens.
         #[arg(long)]
         price: Option<f64>,
@@ -95,25 +155,60 @@ pub fn run(args: RouteArgs) -> Result<()> {
         RouteArgs::Edit { proxy } => edit(&store, proxy),
         RouteArgs::Delete { proxy } => delete(&store, proxy),
         RouteArgs::Economy {
+            profile,
             proxy,
+            route,
             max_tokens,
             cache_ttl,
-        } => economy(&store, proxy, max_tokens, cache_ttl),
-        RouteArgs::Model(ModelArgs::Add { proxy }) => model_add(&store, proxy),
-        RouteArgs::Model(ModelArgs::Remove { proxy }) => model_remove(&store, proxy),
-        RouteArgs::Model(ModelArgs::Move { proxy }) => model_move(&store, proxy),
-        RouteArgs::Model(ModelArgs::Price { proxy, price }) => model_price(&store, proxy, price),
+        } => economy(&store, profile, proxy, route, max_tokens, cache_ttl),
+        RouteArgs::Model(ModelArgs::Add {
+            profile,
+            proxy,
+            route,
+            provider,
+            model_id,
+            weight,
+            price,
+            yes,
+        }) => model_add(
+            &store, profile, proxy, route, provider, model_id, weight, price, yes,
+        ),
+        RouteArgs::Model(ModelArgs::Remove {
+            profile,
+            proxy,
+            route,
+            model_id,
+            yes,
+        }) => model_remove(&store, profile, proxy, route, model_id, yes),
+        RouteArgs::Model(ModelArgs::Move {
+            profile,
+            proxy,
+            route,
+            model_id,
+            position,
+        }) => model_move(&store, profile, proxy, route, model_id, position),
+        RouteArgs::Model(ModelArgs::Price {
+            profile,
+            proxy,
+            route,
+            model_id,
+            price,
+        }) => model_price(&store, profile, proxy, route, model_id, price),
     }
 }
 
-/// Resolve the owning profile then pick a proxy, using a flag when provided.
+/// Resolve the owning profile then pick a proxy, using flags when provided.
 fn resolve_proxy(
     store: &crate::storage::Store,
-    given: Option<String>,
+    profile_name: Option<String>,
+    proxy_name: Option<String>,
 ) -> Result<(crate::domain::Profile, crate::domain::Proxy)> {
-    let profile = pick_profile(store, "Profile")?;
+    let profile = match profile_name {
+        Some(p) if !p.is_empty() => crate::cli::util::require_profile(store, &p)?,
+        _ => pick_profile(store, "Profile")?,
+    };
     let mut found: Option<crate::domain::Proxy> = None;
-    if let Some(name) = given {
+    if let Some(name) = proxy_name {
         if !name.is_empty() {
             let p = store
                 .get_proxy_named(profile.id.as_str(), &name)?
@@ -127,9 +222,26 @@ fn resolve_proxy(
     Ok((profile, found.unwrap()))
 }
 
+/// Resolve a route under a proxy, using a name flag when provided.
+fn resolve_route(
+    store: &crate::storage::Store,
+    proxy: &crate::domain::Proxy,
+    route_name: Option<String>,
+    prompt: &str,
+) -> Result<crate::domain::Route> {
+    if let Some(name) = route_name {
+        if !name.is_empty() {
+            return store
+                .get_route_named(proxy.id, &name)?
+                .with_context(|| format!("no route named {name:?} under proxy {:?}", proxy.name));
+        }
+    }
+    pick_route(store, proxy, prompt)
+}
+
 fn create(store: &crate::storage::Store, proxy_name: Option<String>) -> Result<()> {
     let theme = ColorfulTheme::default();
-    let (profile, proxy) = resolve_proxy(store, proxy_name)?;
+    let (profile, proxy) = resolve_proxy(store, None, proxy_name)?;
     ensure_password_ok(&profile)?;
 
     let route_name: String = Input::<String>::with_theme(&theme)
@@ -184,7 +296,7 @@ fn create(store: &crate::storage::Store, proxy_name: Option<String>) -> Result<(
 
 fn edit(store: &crate::storage::Store, proxy_name: Option<String>) -> Result<()> {
     let theme = ColorfulTheme::default();
-    let (profile, proxy) = resolve_proxy(store, proxy_name)?;
+    let (profile, proxy) = resolve_proxy(store, None, proxy_name)?;
     ensure_password_ok(&profile)?;
     let route = pick_route(store, &proxy, "Route to edit")?;
 
@@ -241,7 +353,7 @@ fn edit(store: &crate::storage::Store, proxy_name: Option<String>) -> Result<()>
 
 fn delete(store: &crate::storage::Store, proxy_name: Option<String>) -> Result<()> {
     let theme = ColorfulTheme::default();
-    let (profile, proxy) = resolve_proxy(store, proxy_name)?;
+    let (profile, proxy) = resolve_proxy(store, None, proxy_name)?;
     ensure_password_ok(&profile)?;
     let route = pick_route(store, &proxy, "Route to delete")?;
     let sure = Confirm::with_theme(&theme)
@@ -261,15 +373,83 @@ fn delete(store: &crate::storage::Store, proxy_name: Option<String>) -> Result<(
 }
 
 /// Add a model to an existing route.
-fn model_add(store: &crate::storage::Store, proxy_name: Option<String>) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn model_add(
+    store: &crate::storage::Store,
+    profile_name: Option<String>,
+    proxy_name: Option<String>,
+    route_name: Option<String>,
+    provider_name: Option<String>,
+    model_id: Option<String>,
+    weight: Option<f64>,
+    price: Option<f64>,
+    yes: bool,
+) -> Result<()> {
     let theme = ColorfulTheme::default();
-    let (profile, proxy) = resolve_proxy(store, proxy_name)?;
+    let (profile, proxy) = resolve_proxy(store, profile_name, proxy_name)?;
     ensure_password_ok(&profile)?;
-    let route = pick_route(store, &proxy, "Route")?;
+    let route = resolve_route(store, &proxy, route_name, "Route")?;
+
+    // Fully flag-driven: `--model` + (provider resolved or `--provider`).
+    if let Some(model) = model_id {
+        let providers = store.list_providers(profile.id.as_str())?;
+        let provider =
+            match provider_name {
+                Some(n) if !n.is_empty() => providers
+                    .into_iter()
+                    .find(|p| p.name == n)
+                    .with_context(|| {
+                        format!("no provider named {n:?} under profile {:?}", profile.name)
+                    })?,
+                _ if providers.len() == 1 => providers.into_iter().next().unwrap(),
+                _ => bail!(
+                    "profile {:?} has multiple providers; pass --provider",
+                    profile.name
+                ),
+            };
+        let existing = store.route_entries(route.id)?;
+        let next_priority = existing.len() as i32 + 1;
+        let capabilities = if yes {
+            RouteCapabilities {
+                tools: true,
+                vision: true,
+                json_mode: true,
+                max_context: None,
+            }
+        } else {
+            prompt_capabilities(&theme)?
+        };
+        let entry = store.add_route_entry(
+            route.id,
+            provider.id,
+            &model,
+            next_priority,
+            weight.unwrap_or(1.0),
+            capabilities,
+        )?;
+        if let Some(p) = price {
+            store.set_route_entry_price(entry.id, p)?;
+        }
+        println!(
+            "Added model {model} to route {:?} at priority {next_priority}.",
+            route.name
+        );
+        return Ok(());
+    }
+
     let existing = store.route_entries(route.id)?;
     let next_priority = existing.len() as i32 + 1;
     match prompt_route_entry(store, &profile, &theme, route.id, next_priority)? {
         Some(model_id) => {
+            if let Some(p) = price {
+                if let Some(entry) = store
+                    .route_entries(route.id)?
+                    .into_iter()
+                    .find(|e| e.model_id == model_id)
+                {
+                    store.set_route_entry_price(entry.id, p)?;
+                }
+            }
             println!(
                 "Added model {model_id} to route {:?} at priority {next_priority}.",
                 route.name
@@ -280,40 +460,75 @@ fn model_add(store: &crate::storage::Store, proxy_name: Option<String>) -> Resul
     Ok(())
 }
 
-fn model_remove(store: &crate::storage::Store, proxy_name: Option<String>) -> Result<()> {
+fn model_remove(
+    store: &crate::storage::Store,
+    profile_name: Option<String>,
+    proxy_name: Option<String>,
+    route_name: Option<String>,
+    model_id: Option<String>,
+    yes: bool,
+) -> Result<()> {
     let theme = ColorfulTheme::default();
-    let (profile, proxy) = resolve_proxy(store, proxy_name)?;
+    let (profile, proxy) = resolve_proxy(store, profile_name, proxy_name)?;
     ensure_password_ok(&profile)?;
-    let route = pick_route(store, &proxy, "Route")?;
-    let entry = pick_entry(store, &route, "Model to remove")?;
-    let sure = Confirm::with_theme(&theme)
-        .with_prompt(format!("Remove model {:?} from the chain?", entry.model_id))
-        .default(false)
-        .interact()?;
-    if !sure {
-        println!("Cancelled.");
-        return Ok(());
+    let route = resolve_route(store, &proxy, route_name, "Route")?;
+    let entry = match model_id {
+        Some(m) if !m.is_empty() => store
+            .route_entries(route.id)?
+            .into_iter()
+            .find(|e| e.model_id == m)
+            .with_context(|| format!("route {:?} has no model {m:?}", route.name))?,
+        _ => pick_entry(store, &route, "Model to remove")?,
+    };
+    if !yes {
+        let sure = Confirm::with_theme(&theme)
+            .with_prompt(format!("Remove model {:?} from the chain?", entry.model_id))
+            .default(false)
+            .interact()?;
+        if !sure {
+            println!("Cancelled.");
+            return Ok(());
+        }
     }
     store.delete_route_entry(entry.id)?;
     println!("Removed model {:?}.", entry.model_id);
     Ok(())
 }
 
-fn model_move(store: &crate::storage::Store, proxy_name: Option<String>) -> Result<()> {
+fn model_move(
+    store: &crate::storage::Store,
+    profile_name: Option<String>,
+    proxy_name: Option<String>,
+    route_name: Option<String>,
+    model_id: Option<String>,
+    position: Option<i32>,
+) -> Result<()> {
     let theme = ColorfulTheme::default();
-    let (profile, proxy) = resolve_proxy(store, proxy_name)?;
+    let (profile, proxy) = resolve_proxy(store, profile_name, proxy_name)?;
     ensure_password_ok(&profile)?;
-    let route = pick_route(store, &proxy, "Route")?;
+    let route = resolve_route(store, &proxy, route_name, "Route")?;
     let entries = store.route_entries(route.id)?;
     if entries.is_empty() {
         println!("Route {:?} has no models to reorder.", route.name);
         return Ok(());
     }
-    let entry = pick_entry(store, &route, "Model to move")?;
-    let new_pos: String = Input::<String>::with_theme(&theme)
-        .with_prompt("New priority position (1-based)")
-        .interact_text()?;
-    let target: i32 = new_pos.parse().unwrap_or(-1);
+    let entry = match model_id {
+        Some(m) if !m.is_empty() => entries
+            .iter()
+            .find(|e| e.model_id == m)
+            .with_context(|| format!("route {:?} has no model {m:?}", route.name))?
+            .clone(),
+        _ => pick_entry(store, &route, "Model to move")?,
+    };
+    let target: i32 = match position {
+        Some(p) => p,
+        None => {
+            let new_pos: String = Input::<String>::with_theme(&theme)
+                .with_prompt("New priority position (1-based)")
+                .interact_text()?;
+            new_pos.parse().unwrap_or(-1)
+        }
+    };
     let max: i32 = entries.len() as i32;
     if target < 1 || target > max {
         bail!("position must be between 1 and {max}");
@@ -457,13 +672,15 @@ fn pick_strategy(theme: &ColorfulTheme) -> Result<RoutingStrategy> {
 /// Tune a route's economy limits (non-interactive flags or wizard).
 fn economy(
     store: &crate::storage::Store,
+    profile_name: Option<String>,
     proxy_name: Option<String>,
+    route_name: Option<String>,
     max_tokens: Option<u32>,
     cache_ttl: Option<i64>,
 ) -> Result<()> {
     let theme = ColorfulTheme::default();
-    let (_profile, proxy) = resolve_proxy(store, proxy_name)?;
-    let route = pick_route(store, &proxy, "Route")?;
+    let (_profile, proxy) = resolve_proxy(store, profile_name, proxy_name)?;
+    let route = resolve_route(store, &proxy, route_name, "Route")?;
     let max = match max_tokens {
         Some(m) => m,
         None => Input::<String>::with_theme(&theme)
@@ -495,13 +712,23 @@ fn economy(
 /// Set a route entry's blended price for Economy sorting.
 fn model_price(
     store: &crate::storage::Store,
+    profile_name: Option<String>,
     proxy_name: Option<String>,
+    route_name: Option<String>,
+    model_id: Option<String>,
     price: Option<f64>,
 ) -> Result<()> {
     let theme = ColorfulTheme::default();
-    let (_profile, proxy) = resolve_proxy(store, proxy_name)?;
-    let route = pick_route(store, &proxy, "Route")?;
-    let entry = pick_entry(store, &route, "Model to price")?;
+    let (_profile, proxy) = resolve_proxy(store, profile_name, proxy_name)?;
+    let route = resolve_route(store, &proxy, route_name, "Route")?;
+    let entry = match model_id {
+        Some(m) if !m.is_empty() => store
+            .route_entries(route.id)?
+            .into_iter()
+            .find(|e| e.model_id == m)
+            .with_context(|| format!("route {:?} has no model {m:?}", route.name))?,
+        _ => pick_entry(store, &route, "Model to price")?,
+    };
     let p = match price {
         Some(v) => v,
         None => Input::<String>::with_theme(&theme)
@@ -517,7 +744,7 @@ fn model_price(
 }
 
 fn status(store: &crate::storage::Store, route_name: Option<String>) -> Result<()> {
-    let (_profile, proxy) = resolve_proxy(store, None)?;
+    let (_profile, proxy) = resolve_proxy(store, None, None)?;
     let mut route_opt: Option<crate::domain::Route> = None;
     if let Some(r) = route_name {
         if !r.is_empty() {
