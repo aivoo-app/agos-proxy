@@ -398,6 +398,7 @@ alias.
 | OpenAI | `POST /openai/v1/completions`, `/openai/v1/embeddings`, `GET /openai/v1/models` | |
 | Anthropic | `POST /anthropic/v1/messages`, `GET /anthropic/v1/models` | Native Claude SDK surface |
 | Gemini | `POST /google/v1beta/models/{model}:generateContent`, `:streamGenerateContent`, `GET /google/v1beta/models` | Native Gemini SDK surface |
+| OpenAI Responses | `POST /codex/v1/responses` | Native [Codex CLI](docs/tutorials/codex-cli.md) surface (Responses API) |
 | Shared | `POST /v1/completions`, `POST /v1/embeddings`, `GET /v1/models` | OpenAI-compatible |
 
 Each surface authenticates with the same profile token, presented the way its

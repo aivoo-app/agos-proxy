@@ -50,6 +50,12 @@ and uses the Rust ecosystem convention of a `semver`-compatible version in
 
 ### Added
 
+- Codex CLI compatibility: native OpenAI **Responses API** surface at
+  `POST /codex/v1/responses`, with streaming (`response.created` →
+  `response.output_text.delta` → `response.output_item.done` →
+  `response.completed`) and function/tool calling round trips. Configure Codex
+  with `wire_api = "responses"` and `base_url = http://127.0.0.1:3000/codex/v1`;
+  see [the Codex CLI tutorial](docs/tutorials/codex-cli.md).
 - Initial release.
 - Profile, provider, proxy, and route CRUD via CLI.
 - OpenAI-compatible HTTP server: chat completions, completions, embeddings,
