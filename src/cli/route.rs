@@ -37,6 +37,18 @@ pub enum RouteArgs {
         #[arg(long)]
         proxy: Option<String>,
     },
+    /// Tune economy limits: max_tokens clamp + exact-cache TTL.
+    Economy {
+        /// Name of the owning proxy.
+        #[arg(long)]
+        proxy: Option<String>,
+        /// Max tokens ceiling (0 = passthrough).
+        #[arg(long)]
+        max_tokens: Option<u32>,
+        /// Exact-cache TTL seconds (0 = disabled).
+        #[arg(long)]
+        cache_ttl: Option<i64>,
+    },
     /// Manage the models in a route's fallback chain.
     #[command(subcommand)]
     Model(ModelArgs),
@@ -63,6 +75,15 @@ pub enum ModelArgs {
         #[arg(long)]
         proxy: Option<String>,
     },
+    /// Set blended price ($/1M tokens) used by Economy sorting.
+    Price {
+        /// Name of the owning proxy.
+        #[arg(long)]
+        proxy: Option<String>,
+        /// Blended price in USD per 1M tokens.
+        #[arg(long)]
+        price: Option<f64>,
+    },
 }
 
 /// Entry point for `agos-proxy route ...`.
@@ -73,9 +94,15 @@ pub fn run(args: RouteArgs) -> Result<()> {
         RouteArgs::Status { route } => status(&store, route),
         RouteArgs::Edit { proxy } => edit(&store, proxy),
         RouteArgs::Delete { proxy } => delete(&store, proxy),
+        RouteArgs::Economy {
+            proxy,
+            max_tokens,
+            cache_ttl,
+        } => economy(&store, proxy, max_tokens, cache_ttl),
         RouteArgs::Model(ModelArgs::Add { proxy }) => model_add(&store, proxy),
         RouteArgs::Model(ModelArgs::Remove { proxy }) => model_remove(&store, proxy),
         RouteArgs::Model(ModelArgs::Move { proxy }) => model_move(&store, proxy),
+        RouteArgs::Model(ModelArgs::Price { proxy, price }) => model_price(&store, proxy, price),
     }
 }
 
@@ -412,6 +439,7 @@ fn pick_strategy(theme: &ColorfulTheme) -> Result<RoutingStrategy> {
         "Priority (strict fallback order)",
         "Round robin (spread across healthy)",
         "Weighted (round robin biased by weight)",
+        "Economy (cheap-first, flagship fallback — saves 60-85%)",
     ];
     let idx = Select::with_theme(theme)
         .with_prompt("Routing strategy")
@@ -421,8 +449,71 @@ fn pick_strategy(theme: &ColorfulTheme) -> Result<RoutingStrategy> {
     Ok(match idx {
         0 => RoutingStrategy::Priority,
         1 => RoutingStrategy::RoundRobin,
-        _ => RoutingStrategy::Weighted,
+        2 => RoutingStrategy::Weighted,
+        _ => RoutingStrategy::Economy,
     })
+}
+
+/// Tune a route's economy limits (non-interactive flags or wizard).
+fn economy(
+    store: &crate::storage::Store,
+    proxy_name: Option<String>,
+    max_tokens: Option<u32>,
+    cache_ttl: Option<i64>,
+) -> Result<()> {
+    let theme = ColorfulTheme::default();
+    let (_profile, proxy) = resolve_proxy(store, proxy_name)?;
+    let route = pick_route(store, &proxy, "Route")?;
+    let max = match max_tokens {
+        Some(m) => m,
+        None => Input::<String>::with_theme(&theme)
+            .with_prompt("Max tokens ceiling (0 = passthrough)")
+            .default(route.max_tokens.to_string())
+            .interact_text()?
+            .parse()
+            .unwrap_or(route.max_tokens),
+    };
+    let ttl = match cache_ttl {
+        Some(t) => t,
+        None => Input::<String>::with_theme(&theme)
+            .with_prompt("Exact-cache TTL seconds (0 = disabled, 3600 recommended)")
+            .default(route.cache_ttl_secs.to_string())
+            .interact_text()?
+            .parse()
+            .unwrap_or(route.cache_ttl_secs),
+    };
+    store.set_route_economy(route.id, max, ttl.max(0))?;
+    println!(
+        "Economy for {:?}: max_tokens={} cache_ttl={}s.",
+        route.name,
+        max,
+        ttl.max(0)
+    );
+    Ok(())
+}
+
+/// Set a route entry's blended price for Economy sorting.
+fn model_price(
+    store: &crate::storage::Store,
+    proxy_name: Option<String>,
+    price: Option<f64>,
+) -> Result<()> {
+    let theme = ColorfulTheme::default();
+    let (_profile, proxy) = resolve_proxy(store, proxy_name)?;
+    let route = pick_route(store, &proxy, "Route")?;
+    let entry = pick_entry(store, &route, "Model to price")?;
+    let p = match price {
+        Some(v) => v,
+        None => Input::<String>::with_theme(&theme)
+            .with_prompt("Blended price USD/1M tokens (e.g. 0.4 cheap, 6.0 flagship)")
+            .default(entry.price_per_1m.to_string())
+            .interact_text()?
+            .parse()
+            .unwrap_or(entry.price_per_1m),
+    };
+    store.set_route_entry_price(entry.id, p)?;
+    println!("Priced {:?} at ${}/1M.", entry.model_id, p);
+    Ok(())
 }
 
 fn status(store: &crate::storage::Store, route_name: Option<String>) -> Result<()> {
@@ -446,23 +537,24 @@ fn status(store: &crate::storage::Store, route_name: Option<String>) -> Result<(
         return Ok(());
     }
     println!(
-        "Route {:?} (proxy {:?}, strategy: {:?})",
-        route.name, proxy.name, route.strategy
+        "Route {:?} (proxy {:?}, strategy: {:?}, max_tokens={}, cache_ttl={}s)",
+        route.name, proxy.name, route.strategy, route.max_tokens, route.cache_ttl_secs
     );
     println!(
-        "{:<5} {:<6} {:<8} {:<24} {:<24} WEIGHT",
-        "PRI", "ID", "STATUS", "MODEL", "PROVIDER"
+        "{:<5} {:<6} {:<8} {:<24} {:<24} {:<8} PRICE",
+        "PRI", "ID", "STATUS", "MODEL", "PROVIDER", "WEIGHT"
     );
     for e in entries {
         let provider_name = provider_name(store, e.provider_id)?;
         println!(
-            "{:<5} {:<6} {:<8} {:<24} {:<24} {}",
+            "{:<5} {:<6} {:<8} {:<24} {:<24} {:<8} ${}/1M",
             e.priority,
             e.id,
             status_label(&e.status),
             e.model_id,
             provider_name,
-            e.weight
+            e.weight,
+            e.price_per_1m
         );
     }
     Ok(())

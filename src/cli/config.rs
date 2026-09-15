@@ -82,6 +82,10 @@ pub struct PortableRoute {
     pub description: Option<String>,
     pub strategy: RoutingStrategy,
     pub identity: Option<String>,
+    #[serde(default)]
+    pub max_tokens: u32,
+    #[serde(default)]
+    pub cache_ttl_secs: i64,
     pub entries: Vec<PortableEntry>,
 }
 
@@ -93,6 +97,8 @@ pub struct PortableEntry {
     pub priority: i32,
     pub weight: f64,
     pub capabilities: RouteCapabilities,
+    #[serde(default)]
+    pub price_per_1m: f64,
 }
 
 /// Entry point for `agos-proxy config ...`.
@@ -193,6 +199,7 @@ pub fn export_bundle(store: &Store, profile: &crate::domain::Profile) -> Result<
                         priority: e.priority,
                         weight: e.weight,
                         capabilities: e.capabilities,
+                        price_per_1m: e.price_per_1m,
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -201,6 +208,8 @@ pub fn export_bundle(store: &Store, profile: &crate::domain::Profile) -> Result<
                 description: route.description,
                 strategy: route.strategy,
                 identity: route.identity.clone(),
+                max_tokens: route.max_tokens,
+                cache_ttl_secs: route.cache_ttl_secs,
                 entries,
             });
         }
@@ -292,6 +301,13 @@ pub fn import_bundle(store: &Store, bundle: &PortableProfile, name: &str) -> Res
                 route.strategy,
                 route.identity.as_deref(),
             )?;
+            if route.max_tokens > 0 || route.cache_ttl_secs > 0 {
+                let _ = store.set_route_economy(
+                    created_route.id,
+                    route.max_tokens,
+                    route.cache_ttl_secs,
+                );
+            }
             for entry in &route.entries {
                 let provider_id = provider_ids.get(&entry.provider_name).with_context(|| {
                     format!(
@@ -299,7 +315,7 @@ pub fn import_bundle(store: &Store, bundle: &PortableProfile, name: &str) -> Res
                         entry.provider_name
                     )
                 })?;
-                store.add_route_entry(
+                let created = store.add_route_entry(
                     created_route.id,
                     *provider_id,
                     &entry.model_id,
@@ -307,6 +323,9 @@ pub fn import_bundle(store: &Store, bundle: &PortableProfile, name: &str) -> Res
                     entry.weight,
                     entry.capabilities.clone(),
                 )?;
+                if entry.price_per_1m > 0.0 {
+                    let _ = store.set_route_entry_price(created.id, entry.price_per_1m);
+                }
             }
         }
     }

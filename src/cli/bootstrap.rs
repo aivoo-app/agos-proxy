@@ -104,6 +104,12 @@ pub struct RouteSpec {
     /// its original model name or developer.
     #[serde(default)]
     pub identity: Option<String>,
+    /// Economy max_tokens ceiling (0 = passthrough).
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    /// Economy exact-cache TTL seconds (0 = disabled).
+    #[serde(default)]
+    pub cache_ttl_secs: Option<i64>,
     /// Models in the chain, in the order they were declared.
     #[serde(default)]
     pub models: Vec<ModelSpec>,
@@ -122,6 +128,9 @@ pub struct ModelSpec {
     /// Weighted-strategy share; defaults to 1.0.
     #[serde(default)]
     pub weight: Option<f64>,
+    /// Blended price USD/1M tokens for Economy sorting.
+    #[serde(default)]
+    pub price_per_1m: Option<f64>,
     /// Capability flags, defaulting to everything on.
     #[serde(default = "default_capabilities")]
     pub capabilities: CapabilitiesSpec,
@@ -170,6 +179,7 @@ fn parse_strategy(raw: Option<&str>) -> Result<RoutingStrategy> {
         "priority" => Ok(RoutingStrategy::Priority),
         "round_robin" => Ok(RoutingStrategy::RoundRobin),
         "weighted" => Ok(RoutingStrategy::Weighted),
+        "economy" => Ok(RoutingStrategy::Economy),
         other => bail!("unknown routing strategy {other:?}"),
     }
 }
@@ -222,6 +232,14 @@ fn apply(setup: Setup) -> Result<()> {
                 parse_strategy(route_spec.strategy.as_deref())?,
                 route_spec.identity.as_deref(),
             )?;
+            if route_spec.max_tokens.unwrap_or(0) > 0 || route_spec.cache_ttl_secs.unwrap_or(0) > 0
+            {
+                let _ = store.set_route_economy(
+                    route.id,
+                    route_spec.max_tokens.unwrap_or(0),
+                    route_spec.cache_ttl_secs.unwrap_or(0).max(0),
+                );
+            }
             println!("route: {}/{}", proxy.name, route.name);
 
             for (index, model_spec) in route_spec.models.iter().enumerate() {
@@ -233,7 +251,7 @@ fn apply(setup: Setup) -> Result<()> {
                         model_spec.provider
                     )
                 })?;
-                store.add_route_entry(
+                let entry = store.add_route_entry(
                     route.id,
                     provider_id,
                     &model_spec.model,
@@ -246,6 +264,9 @@ fn apply(setup: Setup) -> Result<()> {
                         max_context: model_spec.capabilities.max_context,
                     },
                 )?;
+                if let Some(p) = model_spec.price_per_1m {
+                    let _ = store.set_route_entry_price(entry.id, p);
+                }
                 println!(
                     "  model: {} (provider {}, priority {})",
                     model_spec.model,
@@ -299,6 +320,10 @@ mod tests {
         assert!(matches!(
             parse_strategy(Some("weighted")),
             Ok(RoutingStrategy::Weighted)
+        ));
+        assert!(matches!(
+            parse_strategy(Some("economy")),
+            Ok(RoutingStrategy::Economy)
         ));
         assert!(parse_strategy(Some("nope")).is_err());
     }

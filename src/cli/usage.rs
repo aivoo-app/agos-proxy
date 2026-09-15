@@ -57,15 +57,25 @@ fn stats(store: &crate::storage::Store, profile: Option<String>) -> Result<()> {
     }
     println!("Usage for {:?} (per model):", profile.name);
     println!(
-        "{:<28} {:>7} {:>9} {:>12} {:>10} {:>12}",
-        "MODEL", "CALLS", "FAILURES", "AVG LAT(ms)", "PROMPT", "COMPLETION"
+        "{:<28} {:>7} {:>9} {:>12} {:>10} {:>12} {:>10}",
+        "MODEL", "CALLS", "FAILURES", "AVG LAT(ms)", "PROMPT", "COMPLETION", "EST $"
     );
+    let mut total = 0.0;
     for s in rows {
+        total += s.est_cost_usd;
         println!(
-            "{:<28} {:>7} {:>9} {:>12.0} {:>10} {:>12}",
-            s.model_id, s.calls, s.failures, s.avg_latency_ms, s.prompt_tokens, s.completion_tokens
+            "{:<28} {:>7} {:>9} {:>12.0} {:>10} {:>12} {:>10.4}",
+            s.model_id,
+            s.calls,
+            s.failures,
+            s.avg_latency_ms,
+            s.prompt_tokens,
+            s.completion_tokens,
+            s.est_cost_usd
         );
     }
+    println!("{:<28} {:>48} {:>10.4}", "TOTAL", "", total);
+    println!("Tip: `route edit` → Economy + `route economy` to cut this bill 60-85%.");
     Ok(())
 }
 
