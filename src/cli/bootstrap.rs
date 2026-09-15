@@ -185,6 +185,10 @@ fn parse_strategy(raw: Option<&str>) -> Result<RoutingStrategy> {
 }
 
 /// Write the setup tree to the store and print a summary + the API token.
+///
+/// The seed is atomic: if any step fails after the profile row is created, the
+/// profile (and everything inserted under it) is removed again so a retry
+/// starts from a clean slate.
 fn apply(setup: Setup) -> Result<()> {
     let store = open_store()?;
 
@@ -197,6 +201,32 @@ fn apply(setup: Setup) -> Result<()> {
         )?,
         None => store.create_profile(&setup.profile, setup.description.as_deref(), None)?,
     };
+
+    let seeded = seed(&store, &profile, &setup);
+    if let Err(err) = seeded {
+        // Compensate: drop the partially-created tree before reporting.
+        let _ = store.delete_profile(profile.id.as_str());
+        return Err(err.context(format!(
+            "bootstrap failed; removed partially created profile {:?}",
+            profile.name
+        )));
+    }
+
+    println!();
+    println!(
+        "API token (bearer) for {profile_name}:",
+        profile_name = profile.name
+    );
+    println!("{}", profile.id);
+    Ok(())
+}
+
+/// Insert providers, proxies, routes and route entries for a fresh profile.
+fn seed(
+    store: &crate::storage::Store,
+    profile: &crate::domain::Profile,
+    setup: &Setup,
+) -> Result<()> {
     println!("profile: {}", profile.name);
 
     let mut provider_ids = std::collections::BTreeMap::new();
@@ -276,13 +306,6 @@ fn apply(setup: Setup) -> Result<()> {
             }
         }
     }
-
-    println!();
-    println!(
-        "API token (bearer) for {profile_name}:",
-        profile_name = profile.name
-    );
-    println!("{}", profile.id);
     Ok(())
 }
 
