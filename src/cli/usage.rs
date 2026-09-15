@@ -88,7 +88,8 @@ fn recent(store: &crate::storage::Store, profile: Option<String>, limit: u32) ->
     }
     println!("Last {} requests for {:?}:", rows.len(), profile.name);
     for r in rows {
-        let when = chrono::DateTime::from_timestamp(r.created_at, 0)
+        // `created_at` is stored as epoch milliseconds; `from_timestamp` wants seconds.
+        let when = chrono::DateTime::from_timestamp_millis(r.created_at)
             .map(|dt| {
                 dt.with_timezone(&chrono::Local)
                     .format("%Y-%m-%d %H:%M:%S")
