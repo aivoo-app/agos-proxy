@@ -27,6 +27,25 @@ and uses the Rust ecosystem convention of a `semver`-compatible version in
   overview, command summary, request lifecycle, health model, routing strategies,
   security model, tech stack, and documentation index.
 
+## [0.1.1] - 2026-09-14
+
+### Fixed
+
+- Panic on unknown route entry status tags (e.g. legacy `"draining"` from
+  previous database schemas). `status_from_tag` now falls back to `Unhealthy`
+  with a warning instead of panicking.
+- Schema migration in `migrate_columns` now normalizes stale status tags to
+  `"unhealthy"` on store open, preventing future panics on upgraded databases.
+- CI race condition: added a "Wait for mock upstream to be ready" step in the
+  docker-compose integration test so the Python mock server is fully listening
+  before smoke tests are sent.
+- CI robustness: chat completions smoke test now retries up to 3 times with
+  2s delay to handle transient startup hiccups.
+- Makefile `.SHELLFLAGS` now includes `-c` and uses `/usr/bin/env bash` to
+  avoid `set -euo pipefail` errors under `/bin/sh`.
+- Clippy lint: `.items(&choices)` → `.items(choices)` (needless borrows).
+- `cargo fmt` indentation fix in `src/cli/util.rs`.
+
 ## [0.1.0] - 2025-01-01
 
 ### Added
