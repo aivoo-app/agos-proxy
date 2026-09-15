@@ -86,6 +86,7 @@ pub fn parse_canonical(bytes: &[u8]) -> Result<CanonicalResponse> {
         finish_reason,
         prompt_tokens,
         completion_tokens,
+        tool_calls: Vec::new(),
     })
 }
 
@@ -104,6 +105,7 @@ pub fn parse_stream_chunk(data: &str) -> Option<StreamEvent> {
             prompt_tokens: None,
             completion_tokens: None,
             done: true,
+            ..Default::default()
         });
     }
     let v: serde_json::Value = serde_json::from_str(trimmed).ok()?;
@@ -131,6 +133,7 @@ pub fn parse_stream_chunk(data: &str) -> Option<StreamEvent> {
         prompt_tokens: prompt,
         completion_tokens: completion,
         done,
+        ..Default::default()
     })
 }
 
@@ -297,10 +300,7 @@ mod tests {
         let target = dummy_target();
         let chat_req = ChatRequest {
             model: "prog/my-route".into(),
-            messages: vec![Message {
-                role: "user".into(),
-                content: "hi".into(),
-            }],
+            messages: vec![Message::text("user", "hi")],
             stream: false,
             extra: serde_json::Value::Null,
         };

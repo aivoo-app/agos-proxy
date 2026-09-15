@@ -218,10 +218,7 @@ async fn chat_session(
                     }
                 }
 
-                history.push(Message {
-                    role: "user".into(),
-                    content: serde_json::Value::String(text.to_string()),
-                });
+                history.push(Message::text("user", text.to_string()));
 
                 eprintln!("thinking… (failover chain: {chain_len} model(s))");
                 match send_turn(
@@ -236,10 +233,7 @@ async fn chat_session(
                 .await
                 {
                     Ok(reply) => {
-                        history.push(Message {
-                            role: "assistant".into(),
-                            content: serde_json::Value::String(reply.clone()),
-                        });
+                        history.push(Message::text("assistant", reply.clone()));
                         println!("assistant> {reply}");
                     }
                     Err(e) => {
@@ -413,10 +407,7 @@ mod tests {
             .build()
             .expect("build client");
         let store = Arc::new(store);
-        let messages: Vec<Message> = vec![Message {
-            role: "user".into(),
-            content: "hi".into(),
-        }];
+        let messages: Vec<Message> = vec![Message::text("user", "hi")];
 
         let reply = send_turn(
             &store,

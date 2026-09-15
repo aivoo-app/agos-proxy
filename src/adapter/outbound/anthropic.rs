@@ -161,6 +161,7 @@ pub fn parse_stream_chunk(data: &str) -> Option<crate::translator::StreamEvent> 
                 prompt_tokens: None,
                 completion_tokens: None,
                 done: false,
+                ..Default::default()
             })
         }
         "message_delta" => {
@@ -179,6 +180,7 @@ pub fn parse_stream_chunk(data: &str) -> Option<crate::translator::StreamEvent> 
                 prompt_tokens: None,
                 completion_tokens: completion,
                 done: false,
+                ..Default::default()
             })
         }
         "message_stop" => Some(crate::translator::StreamEvent {
@@ -187,6 +189,7 @@ pub fn parse_stream_chunk(data: &str) -> Option<crate::translator::StreamEvent> 
             prompt_tokens: None,
             completion_tokens: None,
             done: true,
+            ..Default::default()
         }),
         _ => None,
     }

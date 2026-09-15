@@ -63,10 +63,7 @@ impl InboundAdapter for AnthropicAdapter {
         if let Some(sys) = body.get("system") {
             let text = anthropic_content_text(sys);
             if !text.is_empty() {
-                messages.push(Message {
-                    role: "system".to_string(),
-                    content: serde_json::Value::String(text),
-                });
+                messages.push(Message::text("system", text));
             }
         }
         if let Some(arr) = body.get("messages").and_then(|m| m.as_array()) {
@@ -78,10 +75,7 @@ impl InboundAdapter for AnthropicAdapter {
                     .to_string();
                 let content =
                     anthropic_content_text(m.get("content").unwrap_or(&serde_json::Value::Null));
-                messages.push(Message {
-                    role,
-                    content: serde_json::Value::String(content),
-                });
+                messages.push(Message::text(role, content));
             }
         }
 

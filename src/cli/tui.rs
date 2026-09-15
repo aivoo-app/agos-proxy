@@ -286,10 +286,7 @@ impl ChatApp {
             return;
         }
 
-        self.history.push(Message {
-            role: "user".into(),
-            content: serde_json::Value::String(text.clone()),
-        });
+        self.history.push(Message::text("user", text.clone()));
         self.transcript.push(Turn {
             speaker: Speaker::User,
             text,
@@ -313,10 +310,7 @@ impl ChatApp {
         loop {
             match rx.try_recv() {
                 Ok(TurnResult::Reply(reply, ms)) => {
-                    self.history.push(Message {
-                        role: "assistant".into(),
-                        content: serde_json::Value::String(reply.clone()),
-                    });
+                    self.history.push(Message::text("assistant", reply.clone()));
                     self.transcript.push(Turn {
                         speaker: Speaker::Assistant,
                         text: reply,

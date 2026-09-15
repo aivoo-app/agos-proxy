@@ -148,10 +148,7 @@ pub(crate) fn inject_identity_into_messages(
     );
     messages.insert(
         0,
-        crate::translator::Message {
-            role: "system".to_string(),
-            content: serde_json::Value::String(system_content),
-        },
+        crate::translator::Message::text("system", system_content),
     );
 }
 

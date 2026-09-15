@@ -192,6 +192,7 @@ pub fn parse_stream_chunk(data: &str) -> Option<crate::translator::StreamEvent> 
         prompt_tokens: prompt,
         completion_tokens: completion,
         done,
+        ..Default::default()
     })
 }
 
@@ -246,18 +247,9 @@ mod tests {
         let chat = ChatRequest {
             model: "prog/route".into(),
             messages: vec![
-                Message {
-                    role: "system".into(),
-                    content: "be terse".into(),
-                },
-                Message {
-                    role: "user".into(),
-                    content: "hi".into(),
-                },
-                Message {
-                    role: "assistant".into(),
-                    content: "hello".into(),
-                },
+                Message::text("system", "be terse"),
+                Message::text("user", "hi"),
+                Message::text("assistant", "hello"),
             ],
             stream: false,
             extra: serde_json::json!({ "temperature": 0.5, "max_tokens": 128 }),

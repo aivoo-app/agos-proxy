@@ -62,10 +62,7 @@ impl InboundAdapter for GoogleAdapter {
         if let Some(sys) = body.pointer("/systemInstruction/parts") {
             let text = Self::parts_text(sys);
             if !text.is_empty() {
-                messages.push(Message {
-                    role: "system".to_string(),
-                    content: serde_json::Value::String(text),
-                });
+                messages.push(Message::text("system", text));
             }
         }
         if let Some(contents) = body.get("contents").and_then(|c| c.as_array()) {
@@ -75,10 +72,7 @@ impl InboundAdapter for GoogleAdapter {
                     _ => "user",
                 };
                 let text = Self::parts_text(c.get("parts").unwrap_or(&serde_json::Value::Null));
-                messages.push(Message {
-                    role: role.to_string(),
-                    content: serde_json::Value::String(text),
-                });
+                messages.push(Message::text(role, text));
             }
         }
 

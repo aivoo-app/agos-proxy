@@ -58,6 +58,7 @@ mod tests {
             finish_reason: "stop".into(),
             prompt_tokens: 5,
             completion_tokens: 7,
+            tool_calls: Vec::new(),
         }
     }
 
@@ -107,6 +108,7 @@ mod tests {
             prompt_tokens: None,
             completion_tokens: None,
             done: false,
+            ..Default::default()
         };
         let frame = r
             .render_stream_event(ApiKind::Anthropic, &ev, "id")
@@ -170,6 +172,7 @@ mod tests {
             prompt_tokens: None,
             completion_tokens: None,
             done: false,
+            ..Default::default()
         };
         let frame = r
             .render_stream_event(ApiKind::Codex, &ev, "chatcmpl-1")
