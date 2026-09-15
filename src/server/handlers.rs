@@ -62,6 +62,12 @@ pub async fn chat_completions(State(state): State<AppState>, req: Request) -> Re
         Some(id) => id.clone(),
         None => return bad_request("unauthenticated"),
     };
+    let escalate_header = crate::router::wants_escalation_header(
+        parts
+            .headers
+            .get("X-Economy-Escalate")
+            .and_then(|v| v.to_str().ok()),
+    );
     let bytes = match axum::body::to_bytes(body, HANDLER_BODY_LIMIT).await {
         Ok(b) => b,
         Err(e) => return bad_request(format!("failed to read body: {e}")),
@@ -71,6 +77,7 @@ pub async fn chat_completions(State(state): State<AppState>, req: Request) -> Re
         Err(e) => return bad_request(format!("invalid request body: {e}")),
     };
     let needs = crate::router::RequestNeeds::from_body(&body_value);
+    let escalate_body = crate::router::wants_escalation(&body_value);
     let chat_req: ChatRequest = match serde_json::from_value(body_value) {
         Ok(r) => r,
         Err(e) => return bad_request(format!("invalid request body: {e}")),
@@ -78,7 +85,14 @@ pub async fn chat_completions(State(state): State<AppState>, req: Request) -> Re
     if chat_req.stream {
         handle_streaming(state, profile_id, needs, chat_req).await
     } else {
-        handle_non_streaming(state, profile_id, needs, chat_req).await
+        handle_non_streaming(
+            state,
+            profile_id,
+            needs,
+            chat_req,
+            escalate_header || escalate_body,
+        )
+        .await
     }
 }
 
@@ -157,9 +171,10 @@ async fn handle_non_streaming(
     profile_id: String,
     needs: crate::router::RequestNeeds,
     mut chat_req: ChatRequest,
+    escalate: bool,
 ) -> Response {
     let model = chat_req.model.clone();
-    let targets = match resolve_targets_with_strategy(
+    let mut targets = match resolve_targets_with_strategy(
         &state.store,
         &profile_id,
         &model,
@@ -181,9 +196,42 @@ async fn handle_non_streaming(
             return bad_request(format!("route resolution failed: {e}"));
         }
     };
+    // Route-level economy config (max_tokens clamp + cache TTL).
+    let (route_max_tokens, route_cache_ttl, route_id) =
+        route_economy(&state.store, &profile_id, &model);
+    if escalate && targets.len() > 1 {
+        // Explicit escalation: try the most expensive entry first.
+        targets.sort_by(|a, b| {
+            b.entry
+                .price_per_1m
+                .partial_cmp(&a.entry.price_per_1m)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+    if route_max_tokens > 0 {
+        clamp_chat_max_tokens(&mut chat_req, route_max_tokens);
+    }
     // Inject identity system message if the route has one
     if let Some(identity) = targets.first().and_then(|t| t.identity.as_deref()) {
         inject_identity_into_messages(&mut chat_req.messages, identity);
+    }
+    // Exact-cache: deterministic requests only (no tools/stream, temp≈0 or unset).
+    // Escalated requests always bypass the cache — they must reach the flagship.
+    let cache_key = if route_cache_ttl > 0 && !escalate {
+        cache_hash(&profile_id, &model, &chat_req)
+    } else {
+        None
+    };
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    if let (Some(hash), Some(rid)) = (cache_key.clone(), route_id) {
+        if let Ok(Some((cached, _, _))) = state.store.cache_get(rid, &hash, now_ms) {
+            return Response::builder()
+                .status(200)
+                .header("Content-Type", "application/json")
+                .header("X-Agos-Cache", "HIT")
+                .body(axum::body::Body::from(cached))
+                .unwrap();
+        }
     }
 
     let result = execute_with_failover(
@@ -207,11 +255,28 @@ async fn handle_non_streaming(
     .await;
 
     match result {
-        Ok(bytes) => Response::builder()
-            .status(200)
-            .header("Content-Type", "application/json")
-            .body(axum::body::Body::from(bytes))
-            .unwrap(),
+        Ok(bytes) => {
+            if let (Some(hash), Some(rid)) = (cache_key.clone(), route_id) {
+                if route_cache_ttl > 0 {
+                    let (p, c) = usage_tokens(&bytes);
+                    let _ = state.store.cache_put(
+                        rid,
+                        &hash,
+                        &bytes,
+                        p,
+                        c,
+                        chrono::Utc::now().timestamp_millis(),
+                        route_cache_ttl,
+                    );
+                }
+            }
+            Response::builder()
+                .status(200)
+                .header("Content-Type", "application/json")
+                .header("X-Agos-Cache", "MISS")
+                .body(axum::body::Body::from(bytes))
+                .unwrap()
+        }
         Err(e) => {
             let status = e
                 .downcast_ref::<crate::adapter::outbound::ProviderError>()
@@ -236,6 +301,112 @@ async fn handle_non_streaming(
                 .unwrap()
         }
     }
+}
+
+/// Extract prompt/completion tokens from a raw OpenAI response body.
+fn usage_tokens(bytes: &[u8]) -> (Option<i64>, Option<i64>) {
+    serde_json::from_slice::<serde_json::Value>(bytes)
+        .ok()
+        .and_then(|v| {
+            let u = v.get("usage")?.as_object()?.clone();
+            Some((
+                u.get("prompt_tokens").and_then(|t| t.as_i64()),
+                u.get("completion_tokens").and_then(|t| t.as_i64()),
+            ))
+        })
+        .unwrap_or((None, None))
+}
+
+/// Resolve `(max_tokens, cache_ttl, route_id)` for economy clamping/caching.
+/// Returns zeros when the route cannot be resolved.
+fn route_economy(store: &Store, profile_id: &str, model: &str) -> (u32, i64, Option<i64>) {
+    let (proxy_name, route_name) = match model.split_once('/') {
+        Some(p) => p,
+        None => return (0, 0, None),
+    };
+    let proxy = match store.get_proxy_named(profile_id, proxy_name) {
+        Ok(Some(p)) => p,
+        _ => return (0, 0, None),
+    };
+    match store.get_route_named(proxy.id, route_name) {
+        Ok(Some(r)) => (r.max_tokens, r.cache_ttl_secs, Some(r.id)),
+        _ => (0, 0, None),
+    }
+}
+
+/// Clamp `max_tokens` / `max_completion_tokens` to the route ceiling.
+fn clamp_chat_max_tokens(req: &mut ChatRequest, ceiling: u32) {
+    // `extra` is `Null` when the caller sent no optional fields; start from an
+    // empty map in that case so the ceiling is still enforced.
+    let mut v = match &req.extra {
+        serde_json::Value::Null => serde_json::json!({}),
+        other => other.clone(),
+    };
+    let obj = match v.as_object_mut() {
+        Some(o) => o,
+        None => return,
+    };
+    for key in ["max_tokens", "max_completion_tokens"] {
+        if let Some(cur) = obj.get(key).and_then(|x| x.as_u64()) {
+            if cur > ceiling as u64 {
+                obj.insert(key.to_string(), serde_json::json!(ceiling));
+            }
+        }
+    }
+    // If unset, set a ceiling so runaway completions cannot burn budget.
+    if !obj.contains_key("max_tokens") && !obj.contains_key("max_completion_tokens") {
+        obj.insert("max_tokens".to_string(), serde_json::json!(ceiling));
+    }
+    if let Ok(extra) = serde_json::from_value(v) {
+        req.extra = extra;
+    }
+}
+
+/// Deterministic cache key — only for cacheable requests:
+/// non-streaming, no tools, temperature unset/0. Returns None otherwise.
+///
+/// Note: `ChatRequest` is flattened, so `stream`/`tools`/`temperature` live at
+/// the top level of the serialized value; `messages`/`model` too. The proxy-local
+/// `economy_escalate` flag (also flattened into `extra`) is stripped before
+/// hashing so escalated and normal requests share a key — escalation bypasses
+/// the cache at the call site anyway.
+fn cache_hash(profile_id: &str, model: &str, req: &ChatRequest) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let mut v = serde_json::to_value(req).ok()?;
+    if let Some(obj) = v.as_object_mut() {
+        obj.remove("economy_escalate");
+    }
+    if v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false) {
+        return None;
+    }
+    if v.get("tools")
+        .and_then(|t| t.as_array())
+        .is_some_and(|a| !a.is_empty())
+    {
+        return None;
+    }
+    // Anthropic-style tool passthrough: a non-empty tool-result block also
+    // disqualifies the request (kept cheap — string scan of message extras).
+    if serde_json::to_string(v.get("messages").unwrap_or(&serde_json::Value::Null))
+        .unwrap_or_default()
+        .contains("tool_call_id")
+    {
+        return None;
+    }
+    let temp_ok = match v.get("temperature") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(t) => t.as_f64().is_some_and(|f| f == 0.0),
+    };
+    if !temp_ok {
+        return None;
+    }
+    let mut h = Sha256::new();
+    h.update(profile_id.as_bytes());
+    h.update(b"|");
+    h.update(model.as_bytes());
+    h.update(b"|");
+    h.update(serde_json::to_string(&v).ok()?.as_bytes());
+    Some(hex::encode(h.finalize()))
 }
 
 pub(crate) fn log_attempt(
@@ -897,4 +1068,62 @@ pub(crate) fn service_unavailable(msg: impl Into<String>) -> Response {
         .header("Content-Type", "application/json")
         .body(axum::body::Body::from(body.to_string()))
         .unwrap()
+}
+
+#[cfg(test)]
+mod economy_tests {
+    use super::*;
+
+    fn chat(text: &str) -> ChatRequest {
+        ChatRequest {
+            model: "prog/r".into(),
+            messages: vec![crate::translator::Message::text("user", text)],
+            stream: false,
+            extra: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn clamp_sets_ceiling_when_extra_is_null() {
+        let mut req = chat("hi");
+        clamp_chat_max_tokens(&mut req, 1024);
+        assert_eq!(req.extra["max_tokens"], 1024);
+        // Higher values are clamped down; lower values pass through.
+        req.extra = serde_json::json!({"max_tokens": 4096});
+        clamp_chat_max_tokens(&mut req, 1024);
+        assert_eq!(req.extra["max_tokens"], 1024);
+        req.extra = serde_json::json!({"max_tokens": 10});
+        clamp_chat_max_tokens(&mut req, 1024);
+        assert_eq!(req.extra["max_tokens"], 10);
+    }
+
+    #[test]
+    fn cache_hash_accepts_deterministic_and_rejects_the_rest() {
+        let base = chat("hi");
+        assert!(cache_hash("p", "prog/r", &base).is_some());
+        // temperature 0 and explicit null temperature are still deterministic.
+        let mut t0 = base.clone();
+        t0.extra = serde_json::json!({"temperature": 0.0});
+        assert!(cache_hash("p", "prog/r", &t0).is_some());
+        let mut tn = base.clone();
+        tn.extra = serde_json::json!({"temperature": null});
+        assert!(cache_hash("p", "prog/r", &tn).is_some());
+        // temperature > 0, tools, and streaming bypass the cache.
+        let mut hot = base.clone();
+        hot.extra = serde_json::json!({"temperature": 0.7});
+        assert!(cache_hash("p", "prog/r", &hot).is_none());
+        let mut tools = base.clone();
+        tools.extra = serde_json::json!({"tools": [{"type": "function"}]});
+        assert!(cache_hash("p", "prog/r", &tools).is_none());
+        let mut stream = base.clone();
+        stream.stream = true;
+        assert!(cache_hash("p", "prog/r", &stream).is_none());
+        // The escalation flag never changes the key (it bypasses the cache).
+        let mut esc = base.clone();
+        esc.extra = serde_json::json!({"economy_escalate": true});
+        assert_eq!(
+            cache_hash("p", "prog/r", &base),
+            cache_hash("p", "prog/r", &esc)
+        );
+    }
 }
