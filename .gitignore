@@ -7,3 +7,4 @@ AGENT.md
 /plan
 # Local agent rules — never shared
 .clinerules
+.agostmp/
