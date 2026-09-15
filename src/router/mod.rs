@@ -170,6 +170,8 @@ pub fn resolve_targets(store: &Store, profile_id: &str, model: &str) -> Result<V
 /// - `Priority`: entries are left in strict priority order (no change).
 /// - `RoundRobin`: the starting entry rotates per request.
 /// - `Weighted`: the starting entry is picked by weighted random draw.
+/// - `Economy`: entries sorted cheapest-first by `price_per_1m` (unknown last),
+///   so simple prompts never touch the flagship. Failover still escalates.
 pub fn resolve_targets_with_strategy(
     store: &Store,
     profile_id: &str,
@@ -212,9 +214,57 @@ pub fn resolve_targets_with_strategy(
         RoutingStrategy::Priority => {} // already in priority order
         RoutingStrategy::RoundRobin => routing_state.rotate_round_robin(route.id, &mut targets),
         RoutingStrategy::Weighted => routing_state.shuffle_weighted(&mut targets),
+        RoutingStrategy::Economy => {
+            // Cheap-first; unknown price (0.0) sinks to the end.
+            targets.sort_by(|a, b| {
+                let pa = if a.entry.price_per_1m <= 0.0 {
+                    f64::INFINITY
+                } else {
+                    a.entry.price_per_1m
+                };
+                let pb = if b.entry.price_per_1m <= 0.0 {
+                    f64::INFINITY
+                } else {
+                    b.entry.price_per_1m
+                };
+                pa.partial_cmp(&pb).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
     }
 
     Ok(targets)
+}
+
+/// Whether an explicit escalation was requested (`X-Economy-Escalate: true`
+/// header or `{"economy_escalate": true}` body flag). Callers use this to
+/// force the flagship when they know the task is hard.
+///
+/// `body` is the raw request JSON (unknown keys live at the top level).
+/// [`wants_escalation_header`] covers the header variant; combine both at the
+/// call site.
+pub fn wants_escalation(body: &serde_json::Value) -> bool {
+    // Top-level flag (OpenAI surface). `ChatRequest::extra` flattens unknown
+    // keys, so also look one level inside `extra` for callers that pass the
+    // already-parsed canonical value.
+    if body
+        .get("economy_escalate")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    body.get("extra")
+        .and_then(|e| e.get("economy_escalate"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Header variant of [`wants_escalation`]: `X-Economy-Escalate: true` / `1`.
+pub fn wants_escalation_header(value: Option<&str>) -> bool {
+    matches!(
+        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("true") | Some("1") | Some("yes")
+    )
 }
 
 /// Execute a request against resolved targets with priority failover.
@@ -503,6 +553,90 @@ mod tests {
         .unwrap();
         // Even though the route is RoundRobin, the resolver returns both entries.
         assert_eq!(targets.len(), 2);
+    }
+
+    #[test]
+    fn economy_sorts_cheapest_first() {
+        let store = Store::open_in_memory().unwrap();
+        let profile = store.create_profile("coder1", None, None).unwrap();
+        let mk = |name: &str| {
+            store
+                .create_provider(
+                    profile.id.as_str(),
+                    NewProvider {
+                        name: name.into(),
+                        description: None,
+                        base_url: "https://a.example".into(),
+                        auth_token: "tok".into(),
+                        kind: ProviderKind::OpenAICompatible,
+                        extra_headers: BTreeMap::new(),
+                    },
+                )
+                .unwrap()
+        };
+        let cheap_p = mk("cheap-p");
+        let flagship_p = mk("flag-p");
+        let proxy = store
+            .create_proxy(profile.id.as_str(), "prog", None)
+            .unwrap();
+        let route = store
+            .create_route(proxy.id, "r1", None, RoutingStrategy::Economy, None)
+            .unwrap();
+        // Insert expensive first — Economy must still try cheap first.
+        let exp = store
+            .add_route_entry(
+                route.id,
+                flagship_p.id,
+                "gpt-4o",
+                1,
+                1.0,
+                Default::default(),
+            )
+            .unwrap();
+        let chp = store
+            .add_route_entry(
+                route.id,
+                cheap_p.id,
+                "gpt-4o-mini",
+                2,
+                1.0,
+                Default::default(),
+            )
+            .unwrap();
+        store.set_route_entry_price(exp.id, 6.0).unwrap();
+        store.set_route_entry_price(chp.id, 0.4).unwrap();
+
+        let state = RoutingState::default();
+        let targets = resolve_targets_with_strategy(
+            &store,
+            &profile.id,
+            "prog/r1",
+            RequestNeeds::default(),
+            &state,
+        )
+        .unwrap();
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].entry.model_id, "gpt-4o-mini");
+        assert_eq!(targets[1].entry.model_id, "gpt-4o");
+    }
+
+    #[test]
+    fn escalation_flag_is_detected() {
+        assert!(!wants_escalation(&serde_json::json!({})));
+        assert!(wants_escalation(
+            &serde_json::json!({"economy_escalate": true})
+        ));
+        assert!(!wants_escalation(
+            &serde_json::json!({"economy_escalate": false})
+        ));
+        // Canonical (ChatRequest-serialized) shape nests unknown keys under `extra`.
+        assert!(wants_escalation(
+            &serde_json::json!({"extra": {"economy_escalate": true}})
+        ));
+        assert!(!wants_escalation_header(None));
+        assert!(wants_escalation_header(Some("true")));
+        assert!(wants_escalation_header(Some("1")));
+        assert!(!wants_escalation_header(Some("false")));
     }
 
     #[test]

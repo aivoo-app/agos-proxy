@@ -227,6 +227,7 @@ mod tests {
                 weight: 1.0,
                 status: ModelStatus::Healthy,
                 capabilities: Default::default(),
+                price_per_1m: 0.4,
             },
             identity: None,
         }

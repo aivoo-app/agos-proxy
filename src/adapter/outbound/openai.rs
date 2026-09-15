@@ -26,8 +26,8 @@ use crate::translator::{
 /// upstream. `agos_responses` holds the Responses-API-only request fields the
 /// Codex surface collected (see [`crate::adapter::inbound::responses`]); a
 /// chat-completions provider would reject them as unknown parameters, so they
-/// are stripped here.
-const INTERNAL_BODY_KEYS: [&str; 1] = ["agos_responses"];
+/// are stripped here. `economy_escalate` is the proxy-local escalation flag.
+const INTERNAL_BODY_KEYS: [&str; 2] = ["agos_responses", "economy_escalate"];
 
 /// Remove pipeline-internal keys from an outbound body.
 fn strip_internal_keys(body: &mut serde_json::Value) {
@@ -398,6 +398,7 @@ mod tests {
                 weight: 1.0,
                 status: ModelStatus::Healthy,
                 capabilities: Default::default(),
+                price_per_1m: 0.4,
             },
             identity: None,
         }
@@ -563,6 +564,7 @@ mod tests {
     fn internal_pipeline_keys_are_stripped_from_the_upstream_body() {
         // The Codex surface stashes Responses-only fields in the body under
         // `agos_responses`; a chat-completions provider must never see them.
+        // `economy_escalate` is equally proxy-local (explicit flagship request).
         let target = dummy_target();
         let chat_req = ChatRequest {
             model: "prog/codex".into(),
@@ -570,11 +572,13 @@ mod tests {
             stream: true,
             extra: serde_json::json!({
                 "tools": [{ "type": "function" }],
-                "agos_responses": { "store": false, "include": ["reasoning.encrypted_content"] }
+                "agos_responses": { "store": false, "include": ["reasoning.encrypted_content"] },
+                "economy_escalate": true
             }),
         };
         let (_, _, body) = build_upstream_request(&target, &chat_req, true).unwrap();
         assert!(body.get("agos_responses").is_none());
+        assert!(body.get("economy_escalate").is_none());
         assert!(body.get("tools").is_some());
         assert_eq!(body["model"], "deepseek-v4-flash");
     }
