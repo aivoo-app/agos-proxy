@@ -76,6 +76,10 @@ pub enum RoutingStrategy {
     RoundRobin,
     /// Like round robin, but biased by each entry's weight.
     Weighted,
+    /// Cheap-first: entries sorted by blended price (in+out), cheapest tried
+    /// first, expensive flagship only on failure or explicit escalation.
+    /// This is the economy tier — same output, minimal spend.
+    Economy,
 }
 
 /// A single addressable target, e.g. `php-developer-3.5-flash`, owned by a
@@ -92,6 +96,12 @@ pub struct Route {
     /// message telling the model to adopt this identity — never revealing its
     /// original model name or developer. When None, the model behaves normally.
     pub identity: Option<String>,
+    /// Economy tuning: clamp upstream `max_tokens` (0 = passthrough).
+    #[serde(default)]
+    pub max_tokens: u32,
+    /// Economy tuning: exact-cache TTL in seconds (0 = disabled).
+    #[serde(default)]
+    pub cache_ttl_secs: i64,
 }
 
 /// Automated health state of a route entry.
@@ -124,6 +134,10 @@ pub struct RouteEntry {
     /// Optional capability flags used to skip models that cannot serve a request
     /// (e.g. no tool calling when the request needs it).
     pub capabilities: RouteCapabilities,
+    /// Blended price in USD per 1M tokens (input+output average). Used only by
+    /// `Economy` strategy to sort cheapest-first. 0.0 = unknown (last).
+    #[serde(default)]
+    pub price_per_1m: f64,
 }
 
 /// Optional feature flags on a route entry, used to avoid routing a request to a
@@ -169,4 +183,7 @@ pub struct UsageStats {
     pub avg_latency_ms: f64,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
+    /// Estimated cost in USD derived from `RouteEntry::price_per_1m`.
+    #[serde(default)]
+    pub est_cost_usd: f64,
 }

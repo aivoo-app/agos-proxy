@@ -51,7 +51,9 @@ pub const SCHEMA: &str = "
         name        TEXT NOT NULL,
         description TEXT,
         strategy    TEXT NOT NULL,
-        identity    TEXT
+        identity    TEXT,
+        max_tokens  INTEGER NOT NULL DEFAULT 0,
+        cache_ttl_secs INTEGER NOT NULL DEFAULT 0
     );
 
     CREATE TABLE IF NOT EXISTS route_entries (
@@ -62,7 +64,8 @@ pub const SCHEMA: &str = "
         priority     INTEGER NOT NULL,
         weight       REAL NOT NULL DEFAULT 1.0,
         status       TEXT NOT NULL,
-        capabilities TEXT NOT NULL
+        capabilities TEXT NOT NULL,
+        price_per_1m REAL NOT NULL DEFAULT 0.0
     );
 
     CREATE UNIQUE INDEX IF NOT EXISTS idx_providers_profile ON providers(profile_id, name);
@@ -87,6 +90,20 @@ pub const SCHEMA: &str = "
     CREATE INDEX IF NOT EXISTS idx_usage_profile ON usage_log(profile_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_usage_entry   ON usage_log(route_entry_id, created_at);
 
+    -- Economy cache: deterministic exact-match responses (0 upstream tokens).
+    CREATE TABLE IF NOT EXISTS response_cache (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        route_id    INTEGER NOT NULL REFERENCES routes(id) ON DELETE CASCADE,
+        req_hash    TEXT NOT NULL,
+        resp_json   BLOB NOT NULL,
+        prompt_tokens INTEGER,
+        completion_tokens INTEGER,
+        created_at  INTEGER NOT NULL,
+        expires_at  INTEGER NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_cache_route_hash ON response_cache(route_id, req_hash);
+    CREATE INDEX IF NOT EXISTS idx_cache_expiry ON response_cache(expires_at);
+
 ";
 
 /// Bring stores created before a given column existed up to date.
@@ -96,6 +113,19 @@ pub const SCHEMA: &str = "
 pub fn migrate_columns(conn: &rusqlite::Connection) -> anyhow::Result<()> {
     ensure_column(conn, "profiles", "rpm_limit", "INTEGER NOT NULL DEFAULT 0")?;
     ensure_column(conn, "routes", "identity", "TEXT")?;
+    ensure_column(conn, "routes", "max_tokens", "INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(
+        conn,
+        "routes",
+        "cache_ttl_secs",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "route_entries",
+        "price_per_1m",
+        "REAL NOT NULL DEFAULT 0.0",
+    )?;
 
     // Normalize any route entry status tags that are no longer valid in the
     // current enum (e.g. deprecated "draining") so the store can be read without
