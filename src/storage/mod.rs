@@ -66,6 +66,7 @@ fn strategy_tag(s: RoutingStrategy) -> &'static str {
         RoutingStrategy::Priority => "priority",
         RoutingStrategy::RoundRobin => "round_robin",
         RoutingStrategy::Weighted => "weighted",
+        RoutingStrategy::Economy => "economy",
     }
 }
 
@@ -74,6 +75,7 @@ fn strategy_from_tag(tag: &str) -> Result<RoutingStrategy> {
         "priority" => Ok(RoutingStrategy::Priority),
         "round_robin" => Ok(RoutingStrategy::RoundRobin),
         "weighted" => Ok(RoutingStrategy::Weighted),
+        "economy" => Ok(RoutingStrategy::Economy),
         _ => bail!("unknown routing strategy tag {tag:?}"),
     }
 }
@@ -113,6 +115,36 @@ fn fresh_token() -> Result<String> {
 
 fn now_millis() -> i64 {
     Utc::now().timestamp_millis()
+}
+
+/// Heuristic blended price (USD / 1M tokens) so Economy works out of the box.
+/// Cheap flash/mini/haiku ≈ 0.4, flagship gpt-4o/sonnet/opus ≈ 6.0.
+pub fn default_price_for(model_id: &str) -> f64 {
+    let m = model_id.to_lowercase();
+    // Cheap tier markers.
+    for cheap in [
+        "mini", "haiku", "flash", "3.5", "glm", "deepseek", "qwen", "llama", "mistral",
+    ] {
+        if m.contains(cheap) {
+            return 0.4;
+        }
+    }
+    // Flagship markers.
+    for expensive in [
+        "gpt-4o",
+        "gpt-4",
+        "sonnet",
+        "opus",
+        "o1",
+        "o3",
+        "gemini-1.5-pro",
+        "gemini-2",
+    ] {
+        if m.contains(expensive) {
+            return 6.0;
+        }
+    }
+    2.0
 }
 
 /// Details needed to create a new [`Provider`]. Kept in one place so the storage
@@ -746,7 +778,7 @@ impl Store {
     ) -> Result<Route> {
         let _ = self.conn()
             .execute(
-                "INSERT INTO routes (proxy_id, name, description, strategy, identity) VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO routes (proxy_id, name, description, strategy, identity, max_tokens, cache_ttl_secs) VALUES (?1, ?2, ?3, ?4, ?5, 0, 0)",
                 (proxy_id, name, description, strategy_tag(strategy), identity),
             )
             .context("inserting the route")?;
@@ -757,6 +789,8 @@ impl Store {
             description: description.map(|d| d.to_string()),
             strategy,
             identity: identity.map(|i| i.to_string()),
+            max_tokens: 0,
+            cache_ttl_secs: 0,
         })
     }
 
@@ -790,11 +824,27 @@ impl Store {
         Ok(())
     }
 
+    /// Tune economy limits for a route: max_tokens clamp (0 = passthrough)
+    /// and exact-cache TTL in seconds (0 = disabled).
+    pub fn set_route_economy(&self, id: i64, max_tokens: u32, cache_ttl_secs: i64) -> Result<()> {
+        let changed = self
+            .conn()
+            .execute(
+                "UPDATE routes SET max_tokens = ?1, cache_ttl_secs = ?2 WHERE id = ?3",
+                (max_tokens as i64, cache_ttl_secs, id),
+            )
+            .context("updating route economy settings")?;
+        if changed == 0 {
+            bail!("no route matches id {id}");
+        }
+        Ok(())
+    }
+
     /// All routes under a proxy.
     pub fn list_routes(&self, proxy_id: i64) -> Result<Vec<Route>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT id, proxy_id, name, description, strategy, identity FROM routes WHERE proxy_id = ?1 ORDER BY name",
+            "SELECT id, proxy_id, name, description, strategy, identity, max_tokens, cache_ttl_secs FROM routes WHERE proxy_id = ?1 ORDER BY name",
         )?;
         let rows = stmt.query_map((proxy_id,), |row| {
             let strat_tag: String = row.get(4)?;
@@ -805,6 +855,8 @@ impl Store {
                 description: row.get(3)?,
                 strategy: strategy_from_tag(&strat_tag).expect("invalid strategy in store"),
                 identity: row.get(5)?,
+                max_tokens: row.get::<_, Option<i64>>(6)?.unwrap_or(0).max(0) as u32,
+                cache_ttl_secs: row.get::<_, Option<i64>>(7)?.unwrap_or(0).max(0),
             })
         })?;
         let mut out = Vec::new();
@@ -818,7 +870,7 @@ impl Store {
     pub fn get_route_named(&self, proxy_id: i64, name: &str) -> Result<Option<Route>> {
         self.conn()
             .query_row(
-                "SELECT id, proxy_id, name, description, strategy, identity FROM routes WHERE proxy_id = ?1 AND name = ?2",
+                "SELECT id, proxy_id, name, description, strategy, identity, max_tokens, cache_ttl_secs FROM routes WHERE proxy_id = ?1 AND name = ?2",
                 (proxy_id, name),
                 |row| {
                     let strat_tag: String = row.get(4)?;
@@ -829,6 +881,8 @@ impl Store {
                         description: row.get(3)?,
                         strategy: strategy_from_tag(&strat_tag).expect("invalid strategy in store"),
                         identity: row.get(5)?,
+                        max_tokens: row.get::<_, Option<i64>>(6)?.unwrap_or(0).max(0) as u32,
+                        cache_ttl_secs: row.get::<_, Option<i64>>(7)?.unwrap_or(0).max(0),
                     })
                 },
             )
@@ -848,8 +902,8 @@ impl Store {
     ) -> Result<RouteEntry> {
         let _ = self.conn()
             .execute(
-                "INSERT INTO route_entries (route_id, provider_id, model_id, priority, weight, status, capabilities)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO route_entries (route_id, provider_id, model_id, priority, weight, status, capabilities, price_per_1m)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 (
                     route_id,
                     provider_id,
@@ -858,6 +912,7 @@ impl Store {
                     weight,
                     status_tag(ModelStatus::Healthy),
                     serde_json::to_string(&capabilities).expect("RouteCapabilities always serializable"),
+                    default_price_for(model_id),
                 ),
             )
             .context("inserting the route model")?;
@@ -870,14 +925,26 @@ impl Store {
             weight,
             status: ModelStatus::Healthy,
             capabilities,
+            price_per_1m: default_price_for(model_id),
         })
+    }
+
+    /// Set the blended price (USD / 1M tokens) used by `Economy` sorting.
+    pub fn set_route_entry_price(&self, entry_id: i64, price_per_1m: f64) -> Result<()> {
+        self.conn()
+            .execute(
+                "UPDATE route_entries SET price_per_1m = ?1 WHERE id = ?2",
+                (price_per_1m.max(0.0), entry_id),
+            )
+            .context("updating the route model price")?;
+        Ok(())
     }
 
     /// All model entries in a route's chain, ordered by priority.
     pub fn route_entries(&self, route_id: i64) -> Result<Vec<RouteEntry>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT id, route_id, provider_id, model_id, priority, weight, status, capabilities
+            "SELECT id, route_id, provider_id, model_id, priority, weight, status, capabilities, price_per_1m
              FROM route_entries WHERE route_id = ?1 ORDER BY priority",
         )?;
         let rows = stmt.query_map((route_id,), |row| {
@@ -896,6 +963,7 @@ impl Store {
                 }),
                 capabilities: serde_json::from_str::<RouteCapabilities>(&caps_json)
                     .expect("invalid capabilities in store"),
+                price_per_1m: row.get::<_, Option<f64>>(8)?.unwrap_or(0.0).max(0.0),
             })
         })?;
         let mut out = Vec::new();
@@ -971,7 +1039,7 @@ impl Store {
         let key = self.master_key().clone();
         let mut stmt = conn.prepare(
             "SELECT e.id, e.route_id, e.provider_id, e.model_id, e.priority,
-                    e.weight, e.status, e.capabilities,
+                    e.weight, e.status, e.capabilities, e.price_per_1m,
                     p.id, p.profile_id, p.name, p.description, p.base_url,
                     p.auth_token, p.kind, p.extra_headers
              FROM route_entries e
@@ -986,14 +1054,15 @@ impl Store {
             |row| {
                 let status_tag_owned: String = row.get(6)?;
                 let caps_json: String = row.get(7)?;
-                let kind_tag: String = row.get(14)?;
-                let extra_json: String = row.get(15)?;
+                let price: Option<f64> = row.get(8)?;
+                let kind_tag: String = row.get(15)?;
+                let extra_json: String = row.get(16)?;
                 // The auth token is stored encrypted (BLOB); decrypt it here
                 // the same way `list_providers` / `get_provider` do.
-                let enc_token: Vec<u8> = row.get(13)?;
+                let enc_token: Vec<u8> = row.get(14)?;
                 let auth_token = crate::crypto::decrypt(&key, &enc_token).map_err(|e| {
                     rusqlite::Error::FromSqlConversionFailure(
-                        13,
+                        14,
                         rusqlite::types::Type::Blob,
                         format!("decrypting the provider auth token: {e}").into(),
                     )
@@ -1013,13 +1082,14 @@ impl Store {
                             }),
                         capabilities: serde_json::from_str::<RouteCapabilities>(&caps_json)
                             .expect("invalid capabilities in store"),
+                        price_per_1m: price.unwrap_or(0.0).max(0.0),
                     },
                     Provider {
-                        id: row.get(8)?,
-                        profile_id: row.get(9)?,
-                        name: row.get(10)?,
-                        description: row.get(11)?,
-                        base_url: row.get(12)?,
+                        id: row.get(9)?,
+                        profile_id: row.get(10)?,
+                        name: row.get(11)?,
+                        description: row.get(12)?,
+                        base_url: row.get(13)?,
                         auth_token,
                         kind: provider_kind_from_tag(&kind_tag).expect("invalid kind in store"),
                         extra_headers: serde_json::from_str(&extra_json)
@@ -1136,13 +1206,76 @@ impl Store {
                 avg_latency_ms: row.get(3)?,
                 prompt_tokens: row.get(4)?,
                 completion_tokens: row.get(5)?,
+                est_cost_usd: 0.0,
             })
         })?;
         let mut out = Vec::new();
         for item in rows {
             out.push(item?);
         }
+        // Attach blended price from the cheapest matching entry (best-effort).
+        for s in &mut out {
+            let price: Option<f64> = conn
+                .query_row(
+                    "SELECT MIN(price_per_1m) FROM route_entries WHERE model_id = ?1 AND price_per_1m > 0",
+                    [&s.model_id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(None);
+            if let Some(p) = price {
+                s.est_cost_usd = (s.prompt_tokens + s.completion_tokens) as f64 * p / 1_000_000.0;
+            }
+        }
         Ok(out)
+    }
+
+    /// Look up a cached exact response for a route+hash if still fresh.
+    /// Returns `(body, prompt_tokens, completion_tokens)`.
+    pub fn cache_get(
+        &self,
+        route_id: i64,
+        req_hash: &str,
+        now_ms: i64,
+    ) -> Result<Option<CacheHit>> {
+        // Opportunistically drop expired rows (cheap, keeps table small).
+        let _ = self.conn().execute(
+            "DELETE FROM response_cache WHERE expires_at <= ?1",
+            (now_ms,),
+        );
+        let row: Option<(Vec<u8>, Option<i64>, Option<i64>)> = self
+            .conn()
+            .query_row(
+                "SELECT resp_json, prompt_tokens, completion_tokens FROM response_cache WHERE route_id = ?1 AND req_hash = ?2 AND expires_at > ?3",
+                rusqlite::params![route_id, req_hash, now_ms],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Store an exact response for later reuse.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cache_put(
+        &self,
+        route_id: i64,
+        req_hash: &str,
+        resp_json: &[u8],
+        prompt_tokens: Option<i64>,
+        completion_tokens: Option<i64>,
+        now_ms: i64,
+        ttl_secs: i64,
+    ) -> Result<()> {
+        if ttl_secs <= 0 {
+            return Ok(());
+        }
+        let expires = now_ms + ttl_secs * 1000;
+        self.conn().execute(
+            "INSERT INTO response_cache (route_id, req_hash, resp_json, prompt_tokens, completion_tokens, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(route_id, req_hash) DO UPDATE SET resp_json=excluded.resp_json, prompt_tokens=excluded.prompt_tokens, completion_tokens=excluded.completion_tokens, created_at=excluded.created_at, expires_at=excluded.expires_at",
+            rusqlite::params![route_id, req_hash, resp_json, prompt_tokens, completion_tokens, now_ms, expires],
+        )?;
+        Ok(())
     }
 
     /// Remove usage records older than `keep_days` days. Returns the number of rows deleted.
@@ -1158,6 +1291,9 @@ impl Store {
         Ok(deleted)
     }
 }
+
+/// Cached response body plus its recorded upstream token counts.
+pub type CacheHit = (Vec<u8>, Option<i64>, Option<i64>);
 
 /// Exercise the full CRUD round-trip against an in-memory store.
 #[cfg(test)]
@@ -1407,5 +1543,68 @@ mod tests {
         let updated = store.route_entries(route.id)?;
         assert_eq!(updated[0].status, ModelStatus::Unhealthy);
         Ok(())
+    }
+
+    #[test]
+    fn economy_cache_roundtrip_and_price_estimate() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let profile = store.create_profile("eco", None, None)?;
+        let provider = store.create_provider(
+            profile.id.as_str(),
+            NewProvider {
+                name: "p".to_string(),
+                description: None,
+                base_url: "https://a.example".to_string(),
+                auth_token: "t".to_string(),
+                kind: ProviderKind::OpenAICompatible,
+                extra_headers: std::collections::BTreeMap::new(),
+            },
+        )?;
+        let proxy = store.create_proxy(profile.id.as_str(), "prog", None)?;
+        let route = store.create_route(proxy.id, "r", None, RoutingStrategy::Economy, None)?;
+        store.set_route_economy(route.id, 1024, 3600)?;
+        let got = store.get_route_named(proxy.id, "r")?.unwrap();
+        assert_eq!(got.max_tokens, 1024);
+        assert_eq!(got.cache_ttl_secs, 3600);
+
+        let entry = store.add_route_entry(
+            route.id,
+            provider.id,
+            "gpt-4o-mini",
+            1,
+            1.0,
+            RouteCapabilities::default(),
+        )?;
+        assert!(entry.price_per_1m > 0.0); // auto-guessed cheap price
+        store.set_route_entry_price(entry.id, 0.4)?;
+        assert_eq!(store.route_entries(route.id)?[0].price_per_1m, 0.4);
+
+        // Cache put/get.
+        let now = chrono::Utc::now().timestamp_millis();
+        assert!(store.cache_get(route.id, "h1", now)?.is_none());
+        store.cache_put(
+            route.id,
+            "h1",
+            b"{\"ok\":true}",
+            Some(10),
+            Some(5),
+            now,
+            3600,
+        )?;
+        let hit = store.cache_get(route.id, "h1", now)?.unwrap();
+        assert_eq!(hit.0, b"{\"ok\":true}");
+        // Expired.
+        assert!(store
+            .cache_get(route.id, "h1", now + 3600 * 1000 + 1)?
+            .is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn default_price_heuristics() {
+        assert!(crate::storage::default_price_for("gpt-4o-mini") < 1.0);
+        assert!(crate::storage::default_price_for("claude-haiku") < 1.0);
+        assert!(crate::storage::default_price_for("gpt-4o") > 5.0);
+        assert!(crate::storage::default_price_for("gemini-flash") < 1.0);
     }
 }
