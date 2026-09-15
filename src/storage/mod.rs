@@ -93,7 +93,14 @@ fn status_from_tag(tag: &str) -> Result<ModelStatus> {
         "degraded" => Ok(ModelStatus::Degraded),
         "unhealthy" => Ok(ModelStatus::Unhealthy),
         "disabled" => Ok(ModelStatus::Disabled),
-        _ => bail!("unknown model status tag {tag:?}"),
+        "draining" => {
+            tracing::warn!("encountered deprecated 'draining' status, treating as Unhealthy");
+            Ok(ModelStatus::Unhealthy)
+        }
+        _ => {
+            tracing::warn!("encountered unknown model status tag {tag:?}, treating as Unhealthy");
+            Ok(ModelStatus::Unhealthy)
+        }
     }
 }
 
@@ -883,7 +890,10 @@ impl Store {
                 model_id: row.get(3)?,
                 priority: row.get(4)?,
                 weight: row.get(5)?,
-                status: status_from_tag(&status_tag_owned).expect("invalid status in store"),
+                status: status_from_tag(&status_tag_owned).unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "invalid status in store, defaulting to Unhealthy");
+                    ModelStatus::Unhealthy
+                }),
                 capabilities: serde_json::from_str::<RouteCapabilities>(&caps_json)
                     .expect("invalid capabilities in store"),
             })
@@ -997,7 +1007,10 @@ impl Store {
                         priority: row.get(4)?,
                         weight: row.get(5)?,
                         status: status_from_tag(&status_tag_owned)
-                            .expect("invalid status in store"),
+                            .unwrap_or_else(|e| {
+                                tracing::warn!(error = %e, "invalid status in store, defaulting to Unhealthy");
+                                ModelStatus::Unhealthy
+                            }),
                         capabilities: serde_json::from_str::<RouteCapabilities>(&caps_json)
                             .expect("invalid capabilities in store"),
                     },

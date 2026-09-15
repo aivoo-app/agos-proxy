@@ -96,6 +96,14 @@ pub const SCHEMA: &str = "
 pub fn migrate_columns(conn: &rusqlite::Connection) -> anyhow::Result<()> {
     ensure_column(conn, "profiles", "rpm_limit", "INTEGER NOT NULL DEFAULT 0")?;
     ensure_column(conn, "routes", "identity", "TEXT")?;
+
+    // Normalize any route entry status tags that are no longer valid in the
+    // current enum (e.g. deprecated "draining") so the store can be read without
+    // crashing. Unknown statuses are migrated to "unhealthy".
+    conn.execute_batch(
+        "UPDATE route_entries SET status = 'unhealthy' \
+         WHERE status NOT IN ('healthy', 'degraded', 'unhealthy', 'disabled')",
+    )?;
     Ok(())
 }
 
