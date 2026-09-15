@@ -1,18 +1,19 @@
 //! Inbound adapters.
 //!
 //! Each adapter implements one native client surface on top of the canonical
-//! request/response model, so a caller can point an OpenAI, Anthropic, or
-//! Gemini SDK at AGOS Proxy and speak its own native dialect.
+//! request/response model, so a caller can point an OpenAI, Anthropic, Gemini,
+//! or Codex (Responses API) client at AGOS Proxy and speak its own native
+//! dialect.
 
 pub mod anthropic;
-pub mod codex;
 pub mod google;
 pub mod openai;
+pub mod responses;
 
 pub use anthropic::AnthropicAdapter;
-pub use codex::CodexAdapter;
 pub use google::GoogleAdapter;
 pub use openai::OpenAiAdapter;
+pub use responses::{ResponsesAdapter, ResponsesRenderer};
 
 use crate::adapter::ApiKind;
 use crate::translator::{CanonicalResponse, ChatRequest, StreamEvent};
@@ -38,6 +39,49 @@ pub trait InboundAdapter: Send + Sync {
     /// A terminal frame the protocol needs before the stream ends (e.g. OpenAI's
     /// `data: [DONE]`). `None` when the stream simply ends.
     fn stream_end_marker(&self) -> Option<String>;
+}
+
+/// A per-stream SSE renderer for a single response.
+///
+/// Most surfaces are stateless: every canonical event maps to exactly one
+/// frame, which is what [`StatelessRenderer`] does. The Responses API is not
+/// stateless — its terminal `response.output_item.done` items carry the
+/// *accumulated* text and tool-call arguments — so it supplies a renderer that
+/// owns that state.
+///
+/// A renderer is created once per stream attempt and dropped with it, so
+/// accumulated state never leaks across requests or across failover retries.
+pub trait StreamRenderer: Send {
+    /// Render one canonical event as one or more complete SSE frames,
+    /// including framing and trailing blank lines. `None` means the event
+    /// produces no wire bytes for this protocol.
+    fn render(&mut self, ev: &StreamEvent, id: &str) -> Option<String>;
+
+    /// Called once after the upstream stream ends, so a protocol that requires
+    /// a closing frame can still emit one even when the upstream never sent a
+    /// terminal event. Returns `None` for surfaces that simply end.
+    fn finish(&mut self, id: &str) -> Option<String>;
+}
+
+/// The default [`StreamRenderer`]: one frame per event, delegating straight to
+/// the adapter's own [`InboundAdapter::render_stream_event`] and
+/// [`InboundAdapter::stream_end_marker`].
+pub struct StatelessRenderer(&'static dyn InboundAdapter);
+
+impl StatelessRenderer {
+    pub fn new(adapter: &'static dyn InboundAdapter) -> Self {
+        Self(adapter)
+    }
+}
+
+impl StreamRenderer for StatelessRenderer {
+    fn render(&mut self, ev: &StreamEvent, id: &str) -> Option<String> {
+        self.0.render_stream_event(ev, id)
+    }
+
+    fn finish(&mut self, _id: &str) -> Option<String> {
+        self.0.stream_end_marker()
+    }
 }
 
 #[cfg(test)]
@@ -147,36 +191,27 @@ mod tests {
         let r = registry();
         let body = serde_json::json!({
             "model": "prog/route",
-            "messages": [{ "role": "user", "content": "write a function" }],
-            "stream": false,
-            "tools": [{ "type": "code_interpreter", "code_interpreter": {} }],
+            "instructions": "be terse",
+            "input": [{ "type": "message", "role": "user", "content": "write a function" }],
+            "store": false,
+            "reasoning": { "effort": "low" },
+            "tools": [{ "type": "function", "name": "sh", "parameters": { "type": "object" } }],
         });
-        let req = r.parse_request(ApiKind::Codex, &body).unwrap();
+        let req = r.parse_request(ApiKind::Responses, &body).unwrap();
         assert_eq!(req.model, "prog/route");
-        assert_eq!(req.messages[0].content, "write a function");
-        // Code-interpreter tool should be flagged in extra metadata.
+        assert_eq!(req.messages[0].role, "system");
+        assert_eq!(req.messages[0].content, "be terse");
+        assert_eq!(req.messages[1].content, "write a function");
+        assert_eq!(req.extra["tools"][0]["function"]["name"], "sh");
+        // Responses-only fields are parked under the reserved key.
         assert_eq!(
-            req.extra["codex_code_interpreter"],
-            serde_json::Value::Bool(true)
+            req.extra["agos_responses"]["store"],
+            serde_json::Value::Bool(false)
         );
 
-        let out = r.render_response(ApiKind::Codex, &canonical());
-        assert_eq!(out["choices"][0]["message"]["content"], "hello world");
-        assert_eq!(out["choices"][0]["finish_reason"], "stop");
+        let out = r.render_response(ApiKind::Responses, &canonical());
+        assert_eq!(out["object"], "response");
+        assert_eq!(out["output"][0]["content"][0]["text"], "hello world");
         assert_eq!(out["usage"]["total_tokens"], 12);
-
-        // Streaming chunk
-        let ev = StreamEvent {
-            delta: "hello".into(),
-            finish_reason: None,
-            prompt_tokens: None,
-            completion_tokens: None,
-            done: false,
-            ..Default::default()
-        };
-        let frame = r
-            .render_stream_event(ApiKind::Codex, &ev, "chatcmpl-1")
-            .unwrap();
-        assert!(frame.starts_with("data:"));
     }
 }

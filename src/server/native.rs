@@ -1,5 +1,5 @@
-//! Native multi-adapter inbound surfaces (Anthropic, Gemini, and the
-//! namespaced OpenAI chat route).
+//! Native multi-adapter inbound surfaces (Anthropic, Gemini, the namespaced
+//! OpenAI chat route, and the Responses API for the Codex CLI).
 //!
 //! Every handler here runs the same canonical pipeline:
 //!
@@ -10,16 +10,15 @@
 //!
 //! Streaming re-encodes each upstream SSE chunk into the inbound surface's own
 //! SSE framing, so a Claude or Gemini outbound stream is served to an OpenAI,
-//! Anthropic, or Gemini client correctly.
+//! Anthropic, Gemini, or Codex client correctly.
 
 use axum::body::Bytes;
 use axum::extract::{Request, State};
 use axum::response::Response;
 use futures::StreamExt;
 
-use crate::adapter::inbound::InboundAdapter;
 use crate::adapter::outbound;
-use crate::adapter::ApiKind;
+use crate::adapter::{ApiKind, StreamRenderer};
 use crate::router::Target;
 use crate::router::{execute_with_failover, resolve_targets_with_strategy, RequestNeeds};
 use crate::server::handlers::{
@@ -47,9 +46,13 @@ pub async fn google_generate(State(state): State<AppState>, req: Request) -> Res
     native_chat(state, ApiKind::Google, req).await
 }
 
-/// Codex chat surface: `/codex/v1/chat/completions`.
-pub async fn codex_chat(State(state): State<AppState>, req: Request) -> Response {
-    native_chat(state, ApiKind::Codex, req).await
+/// Codex Responses surface: `POST /codex/v1/responses`.
+///
+/// The Codex CLI only speaks the OpenAI Responses API (its
+/// `wire_api = "chat"` mode was removed upstream), so this is the endpoint a
+/// Codex client points its provider `base_url` at.
+pub async fn codex_responses(State(state): State<AppState>, req: Request) -> Response {
+    native_chat(state, ApiKind::Responses, req).await
 }
 
 async fn native_chat(state: AppState, kind: ApiKind, req: Request) -> Response {
@@ -200,7 +203,6 @@ async fn chat_stream(
     chat_req: ChatRequest,
 ) -> Response {
     let model = chat_req.model.clone();
-    let adapter = state.adapter.inbound(kind);
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(16);
     let store = state.store.clone();
     let attempt_timeout = state.attempt_timeout;
@@ -229,6 +231,9 @@ async fn chat_stream(
         for target in targets {
             let started = std::time::Instant::now();
             let req = chat_req.clone();
+            // One renderer per attempt: the Responses surface accumulates text
+            // and tool arguments, and that state must not leak into a retry.
+            let mut renderer = state.adapter.stream_renderer(kind);
             let (url, headers, body) = match outbound::build_upstream_request(&target, &req, true) {
                 Ok(v) => v,
                 Err(e) => {
@@ -298,7 +303,9 @@ async fn chat_stream(
                         buf.push_str(&String::from_utf8_lossy(&bytes));
                         while let Some(pos) = buf.find('\n') {
                             let line = buf.drain(..=pos).collect::<String>();
-                            if let Some((frame, done)) = decode_line(&target, &line, adapter) {
+                            if let Some((frame, done)) =
+                                decode_line(&target, &line, renderer.as_mut())
+                            {
                                 saw_terminal |= done;
                                 let _ = tx.send(Ok(Bytes::from(frame))).await;
                             }
@@ -314,13 +321,16 @@ async fn chat_stream(
             }
             // Flush any trailing partial line.
             if !saw_terminal {
-                if let Some((frame, done)) = decode_line(&target, &buf, adapter) {
+                if let Some((frame, done)) = decode_line(&target, &buf, renderer.as_mut()) {
                     let _ = tx.send(Ok(Bytes::from(frame))).await;
                     saw_terminal |= done;
                 }
             }
+            // A surface that needs a closing frame (OpenAI's `data: [DONE]`, or
+            // the Responses API's mandatory `response.completed`) gets its
+            // chance here, when the upstream ended without a terminal event.
             if !saw_terminal {
-                if let Some(marker) = adapter.stream_end_marker() {
+                if let Some(marker) = renderer.finish("chatcmpl-agos") {
                     let _ = tx.send(Ok(Bytes::from(marker))).await;
                 }
             }
@@ -349,24 +359,25 @@ async fn chat_stream(
 }
 
 /// Decode a raw stream line against the outbound provider kind and re-encode it
-/// as a native SSE frame on the inbound surface. Returns `(frame, done)` where
+/// as native SSE frames on the inbound surface. Returns `(frames, done)` where
 /// `done` reports whether the decoded event terminates the stream.
 fn decode_line(
     target: &Target,
     line: &str,
-    adapter: &'static dyn InboundAdapter,
+    renderer: &mut dyn StreamRenderer,
 ) -> Option<(String, bool)> {
     let line = line.trim();
     if !line.starts_with("data:") {
         return None;
     }
     let payload = line.trim_start_matches("data:").trim();
+    if payload == "[DONE]" {
+        return None;
+    }
     let ev: Option<StreamEvent> = outbound::parse_stream_chunk(target.provider.kind, payload);
     let ev = ev?;
-    let done = ev.done;
-    adapter
-        .render_stream_event(&ev, "chatcmpl-agos")
-        .map(|f| (f, done))
+    let done = ev.done || ev.finish_reason.is_some();
+    renderer.render(&ev, "chatcmpl-agos").map(|f| (f, done))
 }
 
 /// List the routes a profile can reach, in the Anthropic models response shape.

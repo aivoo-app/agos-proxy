@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use agos::domain::{ProviderKind, RoutingStrategy};
+use agos::domain::{ProviderKind, RouteCapabilities, RoutingStrategy};
 use agos::server::{create_app, AppState};
 use agos::storage::Store;
 use tower::util::ServiceExt;
@@ -13,17 +13,95 @@ use tower::util::ServiceExt;
 async fn mock_upstream(port: u16) -> tokio::task::JoinHandle<()> {
     let app = axum::Router::new().route(
         "/v1/chat/completions",
-        axum::routing::post(|| async {
+        axum::routing::post(|body: axum::Json<serde_json::Value>| async move {
+            let streaming = body
+                .0
+                .get("stream")
+                .and_then(|s| s.as_bool())
+                .unwrap_or(false);
+            let wants_tool = body
+                .0
+                .get("messages")
+                .and_then(|m| m.as_array())
+                .map(|msgs| {
+                    msgs.iter()
+                        .any(|m| m.get("content").and_then(|c| c.as_str()) == Some("call the tool"))
+                })
+                .unwrap_or(false);
+
+            if streaming {
+                let (delta, finish) = if wants_tool {
+                    (
+                        serde_json::json!({
+                            "role": "assistant",
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "call_mock_1",
+                                "type": "function",
+                                "function": { "name": "sh", "arguments": "{\"cmd\":\"ls\"}" }
+                            }]
+                        }),
+                        "tool_calls",
+                    )
+                } else {
+                    (
+                        serde_json::json!({ "role": "assistant", "content": "hel" }),
+                        "stop",
+                    )
+                };
+                let frame = |choice: serde_json::Value, finish_reason: Option<&str>| {
+                    let chunk = serde_json::json!({
+                        "id": "mock-1",
+                        "object": "chat.completion.chunk",
+                        "choices": [{
+                            "index": 0,
+                            "delta": choice,
+                            "finish_reason": finish_reason,
+                        }]
+                    });
+                    format!("data: {chunk}\n\n")
+                };
+                let sse = format!(
+                    "{}{}{}data: [DONE]\n\n",
+                    frame(delta, None),
+                    frame(serde_json::json!({ "content": "lo from mock" }), None),
+                    frame(serde_json::json!({}), Some(finish)),
+                );
+                return (
+                    axum::http::StatusCode::OK,
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    sse,
+                );
+            }
+
+            let message = if wants_tool {
+                serde_json::json!({
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_mock_1",
+                        "type": "function",
+                        "function": { "name": "sh", "arguments": "{\"cmd\":\"ls\"}" }
+                    }]
+                })
+            } else {
+                serde_json::json!({ "role": "assistant", "content": "hello from mock" })
+            };
+            let finish = if wants_tool { "tool_calls" } else { "stop" };
             let body = serde_json::json!({
                 "id": "mock-1",
                 "object": "chat.completion",
                 "choices": [{
                     "index": 0,
-                    "message": { "role": "assistant", "content": "hello from mock" },
-                    "finish_reason": "stop"
+                    "message": message,
+                    "finish_reason": finish
                 }]
             });
-            (axum::http::StatusCode::OK, axum::Json(body))
+            (
+                axum::http::StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                body.to_string(),
+            )
         }),
     );
     let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
@@ -32,6 +110,18 @@ async fn mock_upstream(port: u16) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     })
+}
+
+fn test_state(store: Store) -> AppState {
+    AppState {
+        store: Arc::new(store),
+        attempt_timeout: Duration::from_secs(5),
+        http_client: reqwest::Client::new(),
+        routing_state: agos::router::RoutingState::default(),
+        rate_limiter: Arc::new(agos::server::ratelimit::RateLimiter::new()),
+        require_auth_on_health: false,
+        adapter: agos::adapter::Registry::default(),
+    }
 }
 
 fn setup_store(base_url: &str) -> (Store, String) {
@@ -71,7 +161,12 @@ fn setup_store(base_url: &str) -> (Store, String) {
             "mock-model",
             1,
             1.0,
-            Default::default(),
+            RouteCapabilities {
+                tools: true,
+                vision: false,
+                json_mode: false,
+                max_context: None,
+            },
         )
         .expect("add route entry");
 
@@ -313,33 +408,25 @@ async fn google_surface_translates_to_gemini_shape() {
 /// A Codex client hitting `/codex/v1/chat/completions` is served through the
 /// Codex inbound adapter and routed to the upstream via the canonical pipeline.
 #[tokio::test]
-async fn codex_surface_translates_to_openai_shape() {
+async fn codex_responses_non_streaming() {
     let mock_port = 19881;
     let mock_base = format!("http://127.0.0.1:{mock_port}");
     let _mock = mock_upstream(mock_port).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let (store, profile_id) = setup_store(&mock_base);
-    let http_client = reqwest::Client::new();
-    let state = AppState {
-        store: Arc::new(store),
-        attempt_timeout: Duration::from_secs(5),
-        http_client,
-        routing_state: agos::router::RoutingState::default(),
-        rate_limiter: Arc::new(agos::server::ratelimit::RateLimiter::new()),
-        require_auth_on_health: false,
-        adapter: agos::adapter::Registry::default(),
-    };
-    let app = create_app(state);
+    let app = create_app(test_state(store));
 
     let req_body = serde_json::json!({
         "model": "programmer/php-dev",
-        "messages": [{ "role": "user", "content": "write a function" }],
-        "stream": false
+        "instructions": "be terse",
+        "input": [{ "type": "message", "role": "user", "content": "write a function" }],
+        "stream": false,
+        "store": false,
     });
     let request = axum::http::Request::builder()
         .method("POST")
-        .uri("/codex/v1/chat/completions")
+        .uri("/codex/v1/responses")
         .header("Authorization", format!("Bearer {profile_id}"))
         .header("Content-Type", "application/json")
         .body(axum::body::Body::from(req_body.to_string()))
@@ -351,6 +438,95 @@ async fn codex_surface_translates_to_openai_shape() {
         .await
         .expect("read body");
     let json: serde_json::Value = serde_json::from_slice(&body).expect("parse json");
-    assert_eq!(json["choices"][0]["message"]["content"], "hello from mock");
-    assert_eq!(json["choices"][0]["finish_reason"], "stop");
+    assert_eq!(json["object"], "response");
+    assert_eq!(json["status"], "completed");
+    assert_eq!(json["output"][0]["type"], "message");
+    assert_eq!(json["output"][0]["content"][0]["text"], "hello from mock");
+    assert_eq!(json["usage"]["total_tokens"], 0);
+}
+
+#[tokio::test]
+async fn codex_responses_stream_emits_completed() {
+    let mock_port = 19882;
+    let mock_base = format!("http://127.0.0.1:{mock_port}");
+    let _mock = mock_upstream(mock_port).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (store, profile_id) = setup_store(&mock_base);
+    let app = create_app(test_state(store));
+
+    let req_body = serde_json::json!({
+        "model": "programmer/php-dev",
+        "input": [{ "type": "message", "role": "user", "content": "hi" }],
+        "stream": true,
+    });
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/codex/v1/responses")
+        .header("Authorization", format!("Bearer {profile_id}"))
+        .header("Content-Type", "application/json")
+        .body(axum::body::Body::from(req_body.to_string()))
+        .expect("build request");
+
+    let response = app.oneshot(request).await.expect("oneshot");
+    assert_eq!(response.status(), 200);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let text = String::from_utf8(body.to_vec()).expect("utf8");
+
+    // The events Codex depends on, in order.
+    let created = text.find("response.created").expect("response.created");
+    let delta = text.find("response.output_text.delta").expect("text delta");
+    let done = text.find("response.output_item.done").expect("item done");
+    let completed = text.find("response.completed").expect("response.completed");
+    assert!(created < delta && delta < done && done < completed);
+    // The accumulated message item carries the full text, not a fragment.
+    let item = &text[done..completed];
+    assert!(item.contains("hello from mock"), "item: {item}");
+}
+
+#[tokio::test]
+async fn codex_responses_tool_call_round_trip() {
+    let mock_port = 19883;
+    let mock_base = format!("http://127.0.0.1:{mock_port}");
+    let _mock = mock_upstream(mock_port).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (store, profile_id) = setup_store(&mock_base);
+    let app = create_app(test_state(store));
+
+    let req_body = serde_json::json!({
+        "model": "programmer/php-dev",
+        "input": [
+            { "type": "message", "role": "user", "content": "call the tool" },
+        ],
+        "tools": [{
+            "type": "function",
+            "name": "sh",
+            "description": "run a shell command",
+            "parameters": { "type": "object", "properties": { "cmd": { "type": "string" } } },
+        }],
+        "stream": false,
+    });
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/codex/v1/responses")
+        .header("Authorization", format!("Bearer {profile_id}"))
+        .header("Content-Type", "application/json")
+        .body(axum::body::Body::from(req_body.to_string()))
+        .expect("build request");
+
+    let response = app.oneshot(request).await.expect("oneshot");
+    assert_eq!(response.status(), 200);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("parse json");
+    let call = &json["output"][0];
+    assert_eq!(call["type"], "function_call");
+    assert_eq!(call["name"], "sh");
+    assert_eq!(call["call_id"], "call_mock_1");
+    // `arguments` is a JSON string on the wire, which Codex parses itself.
+    assert_eq!(call["arguments"], "{\"cmd\":\"ls\"}");
 }

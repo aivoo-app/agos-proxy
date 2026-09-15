@@ -1,10 +1,11 @@
 //! Master adapter module.
 //!
 //! AGOS Proxy can speak several *native* APIs at once. Each inbound surface
-//! (OpenAI, Anthropic, Gemini) is implemented by an [`inbound::InboundAdapter`]
-//! that parses a native request into the canonical [`ChatRequest`] and renders
-//! canonical results back in its own wire format. Each upstream provider
-//! kind gets an outbound adapter in [`outbound`] doing the mirror image.
+//! (OpenAI, Anthropic, Gemini, OpenAI Responses) is implemented by an
+//! [`inbound::InboundAdapter`] that parses a native request into the canonical
+//! [`ChatRequest`] and renders canonical results back in its own wire format.
+//! Each upstream provider kind gets an outbound adapter in [`outbound`] doing
+//! the mirror image.
 //!
 //! This module is the single point of allocation: it maps an inbound request to
 //! the correct inbound adapter (by [`ApiKind`]) and hands the canonical request
@@ -19,7 +20,7 @@ use std::collections::HashMap;
 
 use crate::translator::{CanonicalResponse, ChatRequest, StreamEvent};
 
-pub use inbound::InboundAdapter;
+pub use inbound::{InboundAdapter, StatelessRenderer, StreamRenderer};
 
 /// The native API surface an inbound request speaks. Each variant maps to a
 /// namespaced URL prefix and an [`InboundAdapter`] implementation.
@@ -28,7 +29,12 @@ pub enum ApiKind {
     OpenAI,
     Anthropic,
     Google,
-    Codex,
+    /// The OpenAI *Responses* API, served under `/codex` for the Codex CLI.
+    ///
+    /// Codex removed its `wire_api = "chat"` mode, so the Responses API is the
+    /// only dialect a current Codex client speaks. See
+    /// [`crate::adapter::inbound::responses`].
+    Responses,
 }
 
 impl ApiKind {
@@ -38,7 +44,7 @@ impl ApiKind {
             ApiKind::OpenAI => "/openai",
             ApiKind::Anthropic => "/anthropic",
             ApiKind::Google => "/google",
-            ApiKind::Codex => "/codex",
+            ApiKind::Responses => "/codex",
         }
     }
 
@@ -50,7 +56,7 @@ impl ApiKind {
             "openai" => Some(ApiKind::OpenAI),
             "anthropic" => Some(ApiKind::Anthropic),
             "google" => Some(ApiKind::Google),
-            "codex" => Some(ApiKind::Codex),
+            "codex" => Some(ApiKind::Responses),
             _ => None,
         }
     }
@@ -72,7 +78,7 @@ impl Default for Registry {
         registry.register(&inbound::openai::OpenAiAdapter);
         registry.register(&inbound::anthropic::AnthropicAdapter);
         registry.register(&inbound::google::GoogleAdapter);
-        registry.register(&inbound::codex::CodexAdapter);
+        registry.register(&inbound::responses::ResponsesAdapter);
         registry
     }
 }
@@ -110,5 +116,19 @@ impl Registry {
     /// Render one canonical stream event as a native SSE frame on the surface.
     pub fn render_stream_event(&self, kind: ApiKind, ev: &StreamEvent, id: &str) -> Option<String> {
         self.inbound(kind).render_stream_event(ev, id)
+    }
+
+    /// Create the per-stream SSE renderer for a surface.
+    ///
+    /// The Responses API needs state that outlives a single event (accumulated
+    /// text and tool-call arguments) to emit its terminal
+    /// `response.output_item.done` items, so it supplies its own renderer.
+    /// Every other surface is stateless and uses the default. This is the one
+    /// place that knows which surface is stateful.
+    pub fn stream_renderer(&self, kind: ApiKind) -> Box<dyn StreamRenderer> {
+        match kind {
+            ApiKind::Responses => Box::new(inbound::responses::ResponsesRenderer::default()),
+            _ => Box::new(StatelessRenderer::new(self.inbound(kind))),
+        }
     }
 }
