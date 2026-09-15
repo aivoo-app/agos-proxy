@@ -1,6 +1,6 @@
 //! Provider management: the upstreams (base URL + credentials) a profile talks to.
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use clap::Subcommand;
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, Select};
 
@@ -19,6 +19,25 @@ pub enum ProviderArgs {
         /// Name of the owning profile.
         #[arg(long)]
         profile: Option<String>,
+        /// Provider name (e.g. `openrouter`); triggers non-interactive mode
+        /// when combined with `--base-url` and `--auth-token`.
+        #[arg(long)]
+        name: Option<String>,
+        /// Upstream base URL.
+        #[arg(long)]
+        base_url: Option<String>,
+        /// Upstream API token.
+        #[arg(long)]
+        auth_token: Option<String>,
+        /// Provider kind (openai_compatible | anthropic | google | custom).
+        #[arg(long)]
+        kind: Option<String>,
+        /// Free-text description.
+        #[arg(long)]
+        description: Option<String>,
+        /// Extra header sent upstream, as `Name: value` (repeatable).
+        #[arg(long = "header")]
+        headers: Vec<String>,
     },
     /// List the providers configured on a profile.
     List {
@@ -37,6 +56,12 @@ pub enum ProviderArgs {
         /// Name of the owning profile.
         #[arg(long)]
         profile: Option<String>,
+        /// Name of the provider to remove.
+        #[arg(long)]
+        provider: Option<String>,
+        /// Skip the confirmation prompt (for scripts/CI).
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -44,10 +69,31 @@ pub enum ProviderArgs {
 pub fn run(args: ProviderArgs) -> Result<()> {
     let store = open_store()?;
     match args {
-        ProviderArgs::Add { profile } => add(&store, profile),
+        ProviderArgs::Add {
+            profile,
+            name,
+            base_url,
+            auth_token,
+            kind,
+            description,
+            headers,
+        } => add(
+            &store,
+            profile,
+            name,
+            base_url,
+            auth_token,
+            kind,
+            description,
+            headers,
+        ),
         ProviderArgs::List { profile } => list(&store, profile),
         ProviderArgs::Edit { profile } => edit(&store, profile),
-        ProviderArgs::Delete { profile } => delete(&store, profile),
+        ProviderArgs::Delete {
+            profile,
+            provider,
+            yes,
+        } => delete(&store, profile, provider, yes),
     }
 }
 
@@ -62,14 +108,59 @@ fn resolve_profile(
     }
 }
 
-fn add(store: &crate::storage::Store, profile: Option<String>) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn add(
+    store: &crate::storage::Store,
+    profile: Option<String>,
+    name: Option<String>,
+    base_url: Option<String>,
+    auth_token: Option<String>,
+    kind: Option<String>,
+    description: Option<String>,
+    headers: Vec<String>,
+) -> Result<()> {
     let theme = ColorfulTheme::default();
     let profile = resolve_profile(store, profile)?;
     ensure_password_ok(&profile)?;
 
-    let name: String = Input::<String>::with_theme(&theme)
-        .with_prompt("Provider name (e.g. deepseek)")
-        .interact_text()?;
+    // Flag-driven mode: all of name + base_url + auth_token supplied.
+    if let (Some(name), Some(base_url), Some(auth_token)) =
+        (name.clone(), base_url.clone(), auth_token.clone())
+    {
+        let kind = parse_kind(kind.as_deref())?;
+        let mut extra_headers = std::collections::BTreeMap::new();
+        for h in &headers {
+            let (k, v) = h
+                .split_once(':')
+                .with_context(|| format!("header {h:?} must be `Name: value`"))?;
+            extra_headers.insert(k.trim().to_string(), v.trim().to_string());
+        }
+        let provider = store.create_provider(
+            profile.id.as_str(),
+            NewProvider {
+                name,
+                description,
+                base_url: base_url.trim_end_matches('/').to_string(),
+                auth_token,
+                kind,
+                extra_headers,
+            },
+        )?;
+        println!(
+            "Added provider {:?} ({}) under profile {:?}.",
+            provider.name,
+            kind_label(&provider.kind),
+            profile.name
+        );
+        return Ok(());
+    }
+
+    let name: String = match name {
+        Some(n) if !n.is_empty() => n,
+        _ => Input::<String>::with_theme(&theme)
+            .with_prompt("Provider name (e.g. deepseek)")
+            .interact_text()?,
+    };
     let base_url: String = Input::<String>::with_theme(&theme)
         .with_prompt("Base URL")
         .default("https://api.deepseek.com".into())
@@ -189,25 +280,50 @@ fn edit(store: &crate::storage::Store, profile: Option<String>) -> Result<()> {
 }
 
 /// Remove a provider after a confirmation.
-fn delete(store: &crate::storage::Store, profile: Option<String>) -> Result<()> {
+fn delete(
+    store: &crate::storage::Store,
+    profile: Option<String>,
+    provider: Option<String>,
+    yes: bool,
+) -> Result<()> {
     let theme = ColorfulTheme::default();
     let profile = resolve_profile(store, profile)?;
     ensure_password_ok(&profile)?;
-    let provider = pick_provider(store, &profile, "Provider to delete")?;
-    let sure = Confirm::with_theme(&theme)
-        .with_prompt(format!(
-            "Delete provider {:?} ({})?",
-            provider.name, provider.base_url
-        ))
-        .default(false)
-        .interact()?;
-    if !sure {
-        println!("Cancelled.");
-        return Ok(());
+    let provider = match provider {
+        Some(n) if !n.is_empty() => store
+            .list_providers(profile.id.as_str())?
+            .into_iter()
+            .find(|p| p.name == n)
+            .with_context(|| format!("no provider named {n:?} under profile {:?}", profile.name))?,
+        _ => pick_provider(store, &profile, "Provider to delete")?,
+    };
+    if !yes {
+        let sure = Confirm::with_theme(&theme)
+            .with_prompt(format!(
+                "Delete provider {:?} ({})?",
+                provider.name, provider.base_url
+            ))
+            .default(false)
+            .interact()?;
+        if !sure {
+            println!("Cancelled.");
+            return Ok(());
+        }
     }
     store.delete_provider(provider.id)?;
     println!("Deleted provider {:?}.", provider.name);
     Ok(())
+}
+
+/// Parse a provider-kind tag (`openai_compatible` | `anthropic` | `google` | `custom`).
+fn parse_kind(raw: Option<&str>) -> Result<ProviderKind> {
+    match raw.unwrap_or("openai_compatible") {
+        "openai_compatible" => Ok(ProviderKind::OpenAICompatible),
+        "custom" => Ok(ProviderKind::Custom),
+        "anthropic" => Ok(ProviderKind::Anthropic),
+        "google" => Ok(ProviderKind::Google),
+        other => anyhow::bail!("unknown provider kind {other:?}"),
+    }
 }
 
 fn pick_kind(theme: &ColorfulTheme) -> Result<ProviderKind> {

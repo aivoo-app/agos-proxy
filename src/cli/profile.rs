@@ -44,6 +44,9 @@ pub enum ProfileArgs {
         /// Name of the profile to delete.
         #[arg(long)]
         name: Option<String>,
+        /// Skip the confirmation prompt (for scripts/CI).
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -67,7 +70,7 @@ pub fn run(args: ProfileArgs) -> Result<()> {
         ProfileArgs::Token(TokenArgs::Rotate { name }) => rotate(&store, &name),
         ProfileArgs::Limit { name, rpm } => limit(&store, &name, rpm),
         ProfileArgs::Edit { name } => edit(&store, name),
-        ProfileArgs::Delete { name } => delete(&store, name),
+        ProfileArgs::Delete { name, yes } => delete(&store, name, yes),
     }
 }
 
@@ -286,21 +289,23 @@ fn edit(store: &Store, name: Option<String>) -> Result<()> {
 }
 
 /// Delete a profile and everything under it, after a confirmation.
-fn delete(store: &Store, name: Option<String>) -> Result<()> {
+fn delete(store: &Store, name: Option<String>, yes: bool) -> Result<()> {
     use dialoguer::{theme::ColorfulTheme, Confirm};
     let theme = ColorfulTheme::default();
     let profile = resolve_profile(store, name)?;
     ensure_password_ok(&profile)?;
-    let sure = Confirm::with_theme(&theme)
-        .with_prompt(format!(
-            "Delete profile {:?} and ALL its providers, proxies and routes?",
-            profile.name
-        ))
-        .default(false)
-        .interact()?;
-    if !sure {
-        println!("Cancelled.");
-        return Ok(());
+    if !yes {
+        let sure = Confirm::with_theme(&theme)
+            .with_prompt(format!(
+                "Delete profile {:?} and ALL its providers, proxies and routes?",
+                profile.name
+            ))
+            .default(false)
+            .interact()?;
+        if !sure {
+            println!("Cancelled.");
+            return Ok(());
+        }
     }
     store.delete_profile(profile.id.as_str())?;
     println!("Deleted profile {:?}.", profile.name);
