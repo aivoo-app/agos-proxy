@@ -530,3 +530,185 @@ async fn codex_responses_tool_call_round_trip() {
     // `arguments` is a JSON string on the wire, which Codex parses itself.
     assert_eq!(call["arguments"], "{\"cmd\":\"ls\"}");
 }
+
+/// Economy tier end-to-end: cheap-first routing, `X-Agos-Cache: HIT` on the
+/// exact repeat, and escalation forcing the flagship.
+#[tokio::test]
+async fn economy_routes_cheap_first_caches_and_escalates() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Mock upstream records which model string it was hit with.
+    let hits = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let mock_app = {
+        let hits = hits.clone();
+        let seen = seen.clone();
+        axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |body: axum::Json<serde_json::Value>| {
+                let hits = hits.clone();
+                let seen = seen.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let model = body
+                        .0
+                        .get("model")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("?")
+                        .to_string();
+                    seen.lock().unwrap().push(model);
+                    let resp = serde_json::json!({
+                        "id": "mock-eco", "object": "chat.completion",
+                        "choices": [{"index": 0,
+                            "message": {"role": "assistant", "content": "eco answer"},
+                            "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+                    });
+                    (
+                        axum::http::StatusCode::OK,
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        resp.to_string(),
+                    )
+                }
+            }),
+        )
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:19884")
+        .await
+        .expect("bind mock");
+    tokio::spawn(async move {
+        axum::serve(listener, mock_app).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Store: one Economy route with a cheap + flagship entry.
+    let store = Store::open_in_memory().expect("open store");
+    let profile = store.create_profile("eco", None, None).expect("profile");
+    let profile_id = profile.id.clone();
+    let provider = store
+        .create_provider(
+            &profile_id,
+            agos::storage::NewProvider {
+                name: "mock".into(),
+                description: None,
+                base_url: "http://127.0.0.1:19884".into(),
+                auth_token: "sk-mock".into(),
+                kind: ProviderKind::OpenAICompatible,
+                extra_headers: std::collections::BTreeMap::new(),
+            },
+        )
+        .expect("provider");
+    let proxy = store
+        .create_proxy(&profile_id, "prog", None)
+        .expect("proxy");
+    let route = store
+        .create_route(proxy.id, "eco", None, RoutingStrategy::Economy, None)
+        .expect("route");
+    store
+        .set_route_economy(route.id, 1024, 3600)
+        .expect("economy");
+    // Insert flagship first — Economy must still try the cheap entry first.
+    let flagship = store
+        .add_route_entry(
+            route.id,
+            provider.id,
+            "gpt-4o",
+            1,
+            1.0,
+            RouteCapabilities::default(),
+        )
+        .expect("flagship");
+    let cheap = store
+        .add_route_entry(
+            route.id,
+            provider.id,
+            "gpt-4o-mini",
+            2,
+            1.0,
+            RouteCapabilities::default(),
+        )
+        .expect("cheap");
+    store
+        .set_route_entry_price(flagship.id, 6.0)
+        .expect("price");
+    store.set_route_entry_price(cheap.id, 0.4).expect("price");
+
+    let app = create_app(test_state(store));
+    let build = |body: serde_json::Value, escalate: bool| {
+        let mut b = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("Authorization", format!("Bearer {profile_id}"))
+            .header("Content-Type", "application/json");
+        if escalate {
+            b = b.header("X-Economy-Escalate", "true");
+        }
+        b.body(axum::body::Body::from(body.to_string()))
+            .expect("request")
+    };
+    let meta = |resp: axum::response::Response| async move {
+        let cache = resp
+            .headers()
+            .get("X-Agos-Cache")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("?")
+            .to_string();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        (status, cache, body)
+    };
+
+    // 1. First request -> MISS, served by the cheap entry.
+    let req_body = serde_json::json!({"model": "prog/eco",
+        "messages": [{"role": "user", "content": "what is 2+2?"}], "stream": false});
+    let resp = app
+        .clone()
+        .oneshot(build(req_body.clone(), false))
+        .await
+        .expect("oneshot");
+    let (status, cache, _b) = meta(resp).await;
+    assert_eq!(status, 200);
+    assert_eq!(cache, "MISS");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert_eq!(seen.lock().unwrap().last().unwrap(), "gpt-4o-mini");
+
+    // 2. Exact repeat -> HIT, no new upstream call.
+    let resp = app
+        .clone()
+        .oneshot(build(req_body.clone(), false))
+        .await
+        .expect("oneshot");
+    let (status, cache, body) = meta(resp).await;
+    assert_eq!(status, 200);
+    assert_eq!(cache, "HIT");
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "cache hit must not hit upstream"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(json["choices"][0]["message"]["content"], "eco answer");
+
+    // 3. Header escalation -> bypasses cache, hits the flagship.
+    let resp = app
+        .clone()
+        .oneshot(build(req_body.clone(), true))
+        .await
+        .expect("oneshot");
+    let (status, _c, _b) = meta(resp).await;
+    assert_eq!(status, 200);
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    assert_eq!(seen.lock().unwrap().last().unwrap(), "gpt-4o");
+
+    // 4. Body-flag escalation -> also hits the flagship.
+    let esc = serde_json::json!({"model": "prog/eco",
+        "messages": [{"role": "user", "content": "what is 2+2?"}],
+        "stream": false, "economy_escalate": true});
+    let resp = app.oneshot(build(esc, false)).await.expect("oneshot");
+    let (status, _c, _b) = meta(resp).await;
+    assert_eq!(status, 200);
+    assert_eq!(hits.load(Ordering::SeqCst), 3);
+    assert_eq!(seen.lock().unwrap().last().unwrap(), "gpt-4o");
+}
