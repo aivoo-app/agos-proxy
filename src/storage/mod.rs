@@ -44,18 +44,20 @@ mod schema;
 
 fn provider_kind_tag(k: ProviderKind) -> &'static str {
     match k {
-        ProviderKind::OpenAICompatible => "openai",
+        ProviderKind::OpenAI => "openai",
         ProviderKind::Anthropic => "anthropic",
         ProviderKind::Google => "google",
+        ProviderKind::OpenAIResponses => "openai_responses",
         ProviderKind::Custom => "custom",
     }
 }
 
 fn provider_kind_from_tag(tag: &str) -> Result<ProviderKind> {
     match tag {
-        "openai" => Ok(ProviderKind::OpenAICompatible),
+        "openai" => Ok(ProviderKind::OpenAI),
         "anthropic" => Ok(ProviderKind::Anthropic),
         "google" => Ok(ProviderKind::Google),
+        "openai_responses" => Ok(ProviderKind::OpenAIResponses),
         "custom" => Ok(ProviderKind::Custom),
         _ => bail!("unknown provider kind tag {tag:?}"),
     }
@@ -118,28 +120,17 @@ fn now_millis() -> i64 {
 }
 
 /// Heuristic blended price (USD / 1M tokens) so Economy works out of the box.
-/// Cheap flash/mini/haiku ≈ 0.4, flagship gpt-4o/sonnet/opus ≈ 6.0.
+/// Cheap flash/mini/micro/nano ≈ 0.4, pro/max/ultra ≈ 6.0.
 pub fn default_price_for(model_id: &str) -> f64 {
     let m = model_id.to_lowercase();
     // Cheap tier markers.
-    for cheap in [
-        "mini", "haiku", "flash", "3.5", "glm", "deepseek", "qwen", "llama", "mistral",
-    ] {
+    for cheap in ["mini", "micro", "flash", "nano"] {
         if m.contains(cheap) {
             return 0.4;
         }
     }
     // Flagship markers.
-    for expensive in [
-        "gpt-4o",
-        "gpt-4",
-        "sonnet",
-        "opus",
-        "o1",
-        "o3",
-        "gemini-1.5-pro",
-        "gemini-2",
-    ] {
+    for expensive in ["pro", "max", "ultra"] {
         if m.contains(expensive) {
             return 6.0;
         }
@@ -1302,6 +1293,37 @@ mod tests {
     use crate::domain::{ProviderKind, RoutingStrategy};
 
     #[test]
+    fn provider_kind_tags_roundtrip_through_the_db() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let profile = store.create_profile("kinds", None, None)?;
+        let kinds = [
+            (ProviderKind::OpenAI, "openai"),
+            (ProviderKind::Anthropic, "anthropic"),
+            (ProviderKind::Google, "google"),
+            (ProviderKind::OpenAIResponses, "openai_responses"),
+            (ProviderKind::Custom, "custom"),
+        ];
+        for (i, (kind, tag)) in kinds.iter().enumerate() {
+            store.create_provider(
+                profile.id.as_str(),
+                NewProvider {
+                    name: format!("p{i}"),
+                    description: None,
+                    base_url: "https://up.test".to_string(),
+                    auth_token: "tok".to_string(),
+                    kind: *kind,
+                    extra_headers: Default::default(),
+                },
+            )?;
+            let listed = store.list_providers(profile.id.as_str())?;
+            let stored = listed.iter().find(|p| p.name == format!("p{i}")).unwrap();
+            assert_eq!(stored.kind, *kind, "kind must survive the roundtrip");
+            assert_eq!(provider_kind_tag(stored.kind), *tag);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn rpm_limit_roundtrip_and_unknown_profile() -> Result<()> {
         let store = Store::open_in_memory()?;
 
@@ -1345,11 +1367,11 @@ mod tests {
         let provider = store.create_provider(
             profile.id.as_str(),
             NewProvider {
-                name: "Deepseek".to_string(),
+                name: "provider-a".to_string(),
                 description: None,
-                base_url: "https://api.deepseek.com".to_string(),
+                base_url: "https://api.example.com".to_string(),
                 auth_token: "sk-secret".to_string(),
-                kind: ProviderKind::OpenAICompatible,
+                kind: ProviderKind::OpenAI,
                 extra_headers: headers,
             },
         )?;
@@ -1399,7 +1421,7 @@ mod tests {
                 description: None,
                 base_url: "https://a".to_string(),
                 auth_token: "t1".to_string(),
-                kind: ProviderKind::OpenAICompatible,
+                kind: ProviderKind::OpenAI,
                 extra_headers: std::collections::BTreeMap::new(),
             },
         )?;
@@ -1483,25 +1505,25 @@ mod tests {
         let store = Store::open_in_memory()?;
         let profile = store.create_profile("coder1", None, None)?;
 
-        let deepseek = store.create_provider(
+        let provider_a = store.create_provider(
             profile.id.as_str(),
             NewProvider {
-                name: "Deepseek".to_string(),
+                name: "provider-a".to_string(),
                 description: None,
-                base_url: "https://api.deepseek.com".to_string(),
+                base_url: "https://api.example.com".to_string(),
                 auth_token: "a".to_string(),
-                kind: ProviderKind::OpenAICompatible,
+                kind: ProviderKind::OpenAI,
                 extra_headers: std::collections::BTreeMap::new(),
             },
         )?;
-        let openrouter = store.create_provider(
+        let provider_b = store.create_provider(
             profile.id.as_str(),
             NewProvider {
-                name: "OpenRouter".to_string(),
+                name: "provider-b".to_string(),
                 description: None,
-                base_url: "https://openrouter.ai".to_string(),
+                base_url: "https://upstream.example".to_string(),
                 auth_token: "b".to_string(),
-                kind: ProviderKind::OpenAICompatible,
+                kind: ProviderKind::OpenAI,
                 extra_headers: std::collections::BTreeMap::new(),
             },
         )?;
@@ -1517,16 +1539,16 @@ mod tests {
 
         let second = store.add_route_entry(
             route.id,
-            openrouter.id,
-            "glm-5.3-flash",
+            provider_b.id,
+            "provider-flash",
             2,
             1.0,
             RouteCapabilities::default(),
         )?;
         let first = store.add_route_entry(
             route.id,
-            deepseek.id,
-            "deepseek-v4-flash",
+            provider_a.id,
+            "example-model",
             1,
             1.0,
             RouteCapabilities::default(),
@@ -1534,9 +1556,9 @@ mod tests {
 
         let chain = store.route_entries(route.id)?;
         // Insertion order was reversed, but the chain must surface priority order.
-        assert_eq!(chain[0].provider_id, deepseek.id);
+        assert_eq!(chain[0].provider_id, provider_a.id);
         assert_eq!(chain[0].id, first.id);
-        assert_eq!(chain[1].provider_id, openrouter.id);
+        assert_eq!(chain[1].provider_id, provider_b.id);
         assert_eq!(chain[1].id, second.id);
 
         store.set_route_entry_status(first.id, ModelStatus::Unhealthy)?;
@@ -1556,7 +1578,7 @@ mod tests {
                 description: None,
                 base_url: "https://a.example".to_string(),
                 auth_token: "t".to_string(),
-                kind: ProviderKind::OpenAICompatible,
+                kind: ProviderKind::OpenAI,
                 extra_headers: std::collections::BTreeMap::new(),
             },
         )?;
@@ -1570,7 +1592,7 @@ mod tests {
         let entry = store.add_route_entry(
             route.id,
             provider.id,
-            "gpt-4o-mini",
+            "provider-mini",
             1,
             1.0,
             RouteCapabilities::default(),
@@ -1602,9 +1624,9 @@ mod tests {
 
     #[test]
     fn default_price_heuristics() {
-        assert!(crate::storage::default_price_for("gpt-4o-mini") < 1.0);
-        assert!(crate::storage::default_price_for("claude-haiku") < 1.0);
-        assert!(crate::storage::default_price_for("gpt-4o") > 5.0);
-        assert!(crate::storage::default_price_for("gemini-flash") < 1.0);
+        assert!(crate::storage::default_price_for("provider-mini") < 1.0);
+        assert!(crate::storage::default_price_for("provider-micro") < 1.0);
+        assert!(crate::storage::default_price_for("provider-pro") > 5.0);
+        assert!(crate::storage::default_price_for("provider-flash") < 1.0);
     }
 }

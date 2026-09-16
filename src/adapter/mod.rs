@@ -1,7 +1,7 @@
 //! Master adapter module.
 //!
 //! AGOS Proxy can speak several *native* APIs at once. Each inbound surface
-//! (OpenAI, Anthropic, Gemini, OpenAI Responses) is implemented by an
+//! (OpenAI, Anthropic, Google, OpenAI Responses) is implemented by an
 //! [`inbound::InboundAdapter`] that parses a native request into the canonical
 //! [`ChatRequest`] and renders canonical results back in its own wire format.
 //! Each upstream provider kind gets an outbound adapter in [`outbound`] doing

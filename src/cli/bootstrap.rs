@@ -72,7 +72,7 @@ pub struct ProviderSpec {
     pub base_url: String,
     /// Upstream API token; stored encrypted at rest.
     pub auth_token: String,
-    /// Defaults to `openai_compatible`.
+    /// Defaults to `openai`.
     #[serde(default)]
     pub kind: Option<String>,
     /// Extra headers sent with every upstream request.
@@ -120,7 +120,7 @@ pub struct RouteSpec {
 pub struct ModelSpec {
     /// Provider `name` the entry points at.
     pub provider: String,
-    /// Upstream model identifier, e.g. `gpt-4o-mini`.
+    /// Upstream model identifier, e.g. `provider/model`.
     pub model: String,
     /// Lower wins; defaults to declaration order.
     #[serde(default)]
@@ -166,10 +166,14 @@ fn default_capabilities() -> CapabilitiesSpec {
 }
 
 fn parse_kind(raw: Option<&str>) -> Result<ProviderKind> {
-    match raw.unwrap_or("openai_compatible") {
-        "openai_compatible" | "custom" => Ok(ProviderKind::OpenAICompatible),
+    match raw.unwrap_or("openai") {
+        "openai" => Ok(ProviderKind::OpenAI),
+        "openai_responses" => Ok(ProviderKind::OpenAIResponses),
         "anthropic" => Ok(ProviderKind::Anthropic),
         "google" => Ok(ProviderKind::Google),
+        // Same alias `provider add` accepts: custom providers are OpenAI
+        // passthrough, so a setup document may declare them directly.
+        "custom" => Ok(ProviderKind::Custom),
         other => bail!("unknown provider kind {other:?}"),
     }
 }
@@ -315,10 +319,7 @@ mod tests {
 
     #[test]
     fn parse_kind_accepts_known_tags_and_rejects_unknown() {
-        assert!(matches!(
-            parse_kind(None),
-            Ok(ProviderKind::OpenAICompatible)
-        ));
+        assert!(matches!(parse_kind(None), Ok(ProviderKind::OpenAI)));
         assert!(matches!(
             parse_kind(Some("anthropic")),
             Ok(ProviderKind::Anthropic)
@@ -327,7 +328,49 @@ mod tests {
             parse_kind(Some("google")),
             Ok(ProviderKind::Google)
         ));
+        assert!(matches!(
+            parse_kind(Some("openai_responses")),
+            Ok(ProviderKind::OpenAIResponses)
+        ));
+        assert!(matches!(
+            parse_kind(Some("custom")),
+            Ok(ProviderKind::Custom)
+        ));
         assert!(parse_kind(Some("nope")).is_err());
+    }
+
+    /// The kind tags embedded in the shipped docker-compose seed must be ones
+    /// the CLI actually parses. This guards the docs/config ↔ code contract:
+    /// a rename that only lands in the examples (as happened with
+    /// `openai_compatible` → `generic`) would otherwise ship a compose stack
+    /// whose bootstrap seed is rejected at first run.
+    #[test]
+    fn compose_seed_only_uses_kinds_the_cli_accepts() {
+        let raw = include_str!("../../docker-compose.yml");
+        let start = raw
+            .find("AGOS_SETUP: |")
+            .expect("docker-compose.yml carries an AGOS_SETUP heredoc");
+        let mut json = String::new();
+        for line in raw[start..].lines().skip(1) {
+            match line.strip_prefix("        ") {
+                Some(rest) => {
+                    json.push_str(rest);
+                    json.push('\n');
+                }
+                None => break,
+            }
+        }
+        let setup: Setup =
+            serde_json::from_str(&json).expect("the AGOS_SETUP heredoc must be valid setup JSON");
+        assert!(!setup.providers.is_empty(), "compose seed has no providers");
+        for provider in &setup.providers {
+            assert!(
+                parse_kind(provider.kind.as_deref()).is_ok(),
+                "docker-compose.yml provider {:?} declares kind {:?}, which the CLI rejects",
+                provider.name,
+                provider.kind
+            );
+        }
     }
 
     #[test]

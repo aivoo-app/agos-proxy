@@ -24,7 +24,7 @@ const PROBE_INTERVAL: Duration = Duration::from_secs(30);
 const PING_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Lightweight ping request: ask the upstream for its model list. Cheap, fast,
-/// and works across every OpenAI-compatible provider.
+/// and works across every OpenAI provider.
 const PING_PATH: &str = "/v1/models";
 
 /// Start the background health-probe runner. Returns a JoinHandle so the caller
@@ -90,7 +90,7 @@ async fn run_once(store: Arc<Store>, client: &reqwest::Client) -> Result<()> {
     for (entry, provider) in candidates {
         let span = info_span!("probe", entry_id = entry.id, provider = %provider.name);
         let _guard = span.enter();
-        let outcome = ping(client, &provider).await;
+        let outcome = ping(client, &provider, &entry.model_id).await;
         let new_status = decide_status(&entry.status, outcome);
         if new_status != entry.status {
             // Update status in a blocking task to avoid blocking the async runtime.
@@ -103,8 +103,18 @@ async fn run_once(store: Arc<Store>, client: &reqwest::Client) -> Result<()> {
     Ok(())
 }
 
-/// Send a lightweight ping to the provider. Returns true on any success.
-async fn ping(client: &reqwest::Client, provider: &crate::domain::Provider) -> bool {
+/// Send a lightweight ping to the provider, scoped to the route entry's model.
+///
+/// Returns true on any success. On a reachable provider, a parsable
+/// OpenAI-style model list is also checked for the entry's `model_id`: a wrong
+/// or renamed model id (404 on every real request) must not keep probing green
+/// and permanently occupying its failover position. When the provider does not
+/// expose a parsable list (custom gateways), reachability alone counts.
+async fn ping(
+    client: &reqwest::Client,
+    provider: &crate::domain::Provider,
+    model_id: &str,
+) -> bool {
     let base = normalize_base(&provider.base_url);
     let url = format!("{base}{PING_PATH}");
     let mut req = client.get(&url);
@@ -116,8 +126,34 @@ async fn ping(client: &reqwest::Client, provider: &crate::domain::Provider) -> b
             let ok = resp.status().is_success();
             if !ok {
                 tracing::debug!(status = %resp.status(), "ping non-success");
+                return false;
             }
-            ok
+            // Model-level validation: if the endpoint returns a parsable model
+            // list, the entry's model must be in it.
+            if let Ok(Ok(bytes)) = timeout(PING_TIMEOUT, resp.bytes()).await {
+                if let Ok(body) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    if let Some(ids) = body.get("data").and_then(|d| d.as_array()) {
+                        let listed: Vec<&str> = ids
+                            .iter()
+                            .filter_map(|m| m.get("id").and_then(|i| i.as_str()))
+                            .collect();
+                        // Non-empty list ⇒ trust it; an empty/unshaped list
+                        // falls back to reachability-only.
+                        if !listed.is_empty()
+                            && !listed
+                                .iter()
+                                .any(|id| *id == model_id || id.ends_with(&format!("/{model_id}")))
+                        {
+                            tracing::debug!(
+                                model = %model_id,
+                                "model not listed by provider; treating entry as down"
+                            );
+                            return false;
+                        }
+                    }
+                }
+            }
+            true
         }
         Ok(Err(e)) => {
             tracing::debug!(error = %e, "ping failed");

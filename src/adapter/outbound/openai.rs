@@ -1,6 +1,6 @@
-//! OpenAI-compatible outbound adapter.
+//! OpenAI outbound adapter.
 //!
-//! OpenAI-compatible providers (including `custom` kinds, which supply their
+//! OpenAI providers (including `custom` kinds, which supply their
 //! own base URL) pass requests through untouched: the canonical
 //! [`ChatRequest`] *is* the OpenAI wire format, so the outbound side only
 //! stamps the route's model id, auth headers, and strips pipeline-internal
@@ -38,11 +38,11 @@ fn strip_internal_keys(body: &mut serde_json::Value) {
     }
 }
 
-/// Build the upstream request for an OpenAI-compatible chat target.
+/// Build the upstream request for an OpenAI chat target.
 pub fn build_upstream_request(
     target: &Target,
     chat_req: &ChatRequest,
-    _stream: bool,
+    stream: bool,
 ) -> Result<(String, BTreeMap<String, String>, serde_json::Value)> {
     let base = normalize_base(&target.provider.base_url);
     let url = format!("{base}/v1/chat/completions");
@@ -63,12 +63,21 @@ pub fn build_upstream_request(
             "model".to_string(),
             serde_json::Value::String(target.entry.model_id.clone()),
         );
+        // Ask streaming upstreams for the usage frame so streamed traffic gets
+        // real token counts in the usage log. Providers that don't support the
+        // field fail the attempt and fail over, same as any other 4xx.
+        if stream && !obj.contains_key("stream_options") {
+            obj.insert(
+                "stream_options".to_string(),
+                serde_json::json!({ "include_usage": true }),
+            );
+        }
     }
     Ok((url, headers, body))
 }
 
 /// Coerce a `function.arguments` value into the raw JSON *string* the wire
-/// format specifies. OpenAI sends a string; some compatible providers send an
+/// format specifies. OpenAI sends a string; some non-OpenAI providers send an
 /// already-parsed object, which is re-serialized so downstream code can always
 /// treat the value as a string.
 fn arguments_to_string(value: Option<&serde_json::Value>) -> String {
@@ -245,16 +254,16 @@ pub fn parse_stream_chunk(data: &str) -> Option<StreamEvent> {
     })
 }
 
-/// Build the upstream request for a completions target. OpenAI-compatible
+/// Build the upstream request for a completions target. OpenAI
 /// providers get a straight passthrough with the route entry's model_id;
 /// other provider kinds are rejected because they do not expose an
-/// OpenAI-compatible completions endpoint.
+/// OpenAI completions endpoint.
 pub fn build_completion_upstream_request(
     target: &Target,
     req: &CompletionRequest,
 ) -> Result<(String, BTreeMap<String, String>, serde_json::Value)> {
     match target.provider.kind {
-        ProviderKind::OpenAICompatible | ProviderKind::Custom => {
+        ProviderKind::OpenAI | ProviderKind::Custom => {
             let base = target.provider.base_url.trim_end_matches('/');
             let url = format!("{base}/v1/completions");
             let mut headers = target.provider.extra_headers.clone();
@@ -286,7 +295,7 @@ pub fn build_embedding_upstream_request(
     req: &EmbeddingRequest,
 ) -> Result<(String, BTreeMap<String, String>, serde_json::Value)> {
     match target.provider.kind {
-        ProviderKind::OpenAICompatible | ProviderKind::Custom => {
+        ProviderKind::OpenAI | ProviderKind::Custom => {
             let base = target.provider.base_url.trim_end_matches('/');
             let url = format!("{base}/v1/embeddings");
             let mut headers = target.provider.extra_headers.clone();
@@ -382,18 +391,18 @@ mod tests {
             provider: Provider {
                 id: 1,
                 profile_id: "p1".into(),
-                name: "deepseek".into(),
+                name: "example".into(),
                 description: None,
-                base_url: "https://api.deepseek.com".into(),
+                base_url: "https://api.example.com".into(),
                 auth_token: "sk-secret".into(),
-                kind: ProviderKind::OpenAICompatible,
+                kind: ProviderKind::OpenAI,
                 extra_headers: extra,
             },
             entry: RouteEntry {
                 id: 1,
                 route_id: 1,
                 provider_id: 1,
-                model_id: "deepseek-v4-flash".into(),
+                model_id: "example-model".into(),
                 priority: 1,
                 weight: 1.0,
                 status: ModelStatus::Healthy,
@@ -414,10 +423,10 @@ mod tests {
             extra: serde_json::Value::Null,
         };
         let (url, headers, body) = build_upstream_request(&target, &chat_req, false).unwrap();
-        assert_eq!(url, "https://api.deepseek.com/v1/chat/completions");
+        assert_eq!(url, "https://api.example.com/v1/chat/completions");
         assert_eq!(headers.get("Authorization").unwrap(), "Bearer sk-secret");
         assert_eq!(headers.get("X-Custom").unwrap(), "yes");
-        assert_eq!(body["model"], "deepseek-v4-flash");
+        assert_eq!(body["model"], "example-model");
     }
 
     #[test]
@@ -483,7 +492,7 @@ mod tests {
 
     #[test]
     fn tool_call_arguments_object_is_coerced_to_a_string() {
-        // Some compatible providers send arguments already parsed; the wire
+        // Some non-OpenAI providers send arguments already parsed; the wire
         // format says string, so it is re-serialized rather than dropped.
         let bytes = serde_json::json!({
             "choices": [{
@@ -580,6 +589,6 @@ mod tests {
         assert!(body.get("agos_responses").is_none());
         assert!(body.get("economy_escalate").is_none());
         assert!(body.get("tools").is_some());
-        assert_eq!(body["model"], "deepseek-v4-flash");
+        assert_eq!(body["model"], "example-model");
     }
 }

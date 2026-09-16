@@ -8,3 +8,8 @@ AGENT.md
 # Local agent rules — never shared
 .clinerules
 .agostmp/
+
+# Generated docs artifacts of `make docs` (regenerated per release, not
+# reviewed in diffs); docs/CLI.md and docs/reference/ stay tracked.
+docs/man/
+docs/completions/

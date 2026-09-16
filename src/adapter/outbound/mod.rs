@@ -6,13 +6,14 @@
 //! dispatcher that picks the right adapter for a [`Target`] based on its
 //! [`ProviderKind`], so callers never match on provider kinds themselves.
 //!
-//! - [`openai`]: OpenAI-compatible passthrough (also covers `custom` kinds)
+//! - [`openai`]: OpenAI passthrough (also covers `custom` kinds)
 //! - [`anthropic`]: Anthropic `/v1/messages`
-//! - [`google`]: Gemini `generateContent`
+//! - [`google`]: Google `generateContent`
 
 pub mod anthropic;
 pub mod google;
 pub mod openai;
+pub mod responses;
 
 use std::collections::BTreeMap;
 
@@ -27,7 +28,7 @@ use crate::translator::{ChatRequest, StreamEvent};
 /// base URL. The URL builders append their own versioned path
 /// (`/v1/chat/completions`, `/v1/messages`, `/v1beta/models/...`), so a base
 /// URL copied from provider docs that already ends in `/v1` (e.g.
-/// `https://openrouter.ai/api/v1`) would otherwise produce a doubled segment
+/// `https://api.example.com/v1`) would otherwise produce a doubled segment
 /// like `/v1/v1/chat/completions` and 404 on every request and health probe.
 pub fn normalize_base(base_url: &str) -> &str {
     let base = base_url.trim_end_matches('/');
@@ -45,7 +46,7 @@ pub struct ProviderError {
 
 /// Check whether a provider kind is supported by the current adapter set.
 pub fn is_supported(_kind: ProviderKind) -> bool {
-    // Custom providers are treated as OpenAI-compatible passthrough,
+    // Custom providers are treated as OpenAI passthrough,
     // so they are supported.
     true
 }
@@ -70,18 +71,26 @@ pub fn build_upstream_request(
             let body = google::translate_request(chat_req);
             Ok((url, headers, body))
         }
-        // OpenAI-compatible and custom providers share the passthrough adapter.
-        ProviderKind::OpenAICompatible | ProviderKind::Custom => {
+        // The Responses endpoint is only served non-streamed in v1; the
+        // streaming handler wraps the full answer into an SSE response.
+        ProviderKind::OpenAIResponses => {
+            let url = responses::build_url(target);
+            let headers = responses::build_headers(target);
+            let body = responses::translate_request(chat_req, &target.entry.model_id);
+            Ok((url, headers, body))
+        }
+        // OpenAI and custom providers share the passthrough adapter.
+        ProviderKind::OpenAI | ProviderKind::Custom => {
             openai::build_upstream_request(target, chat_req, stream)
         }
     }
 }
 
-/// Reshape a successful upstream response into OpenAI-compatible JSON bytes.
-/// OpenAI-compatible responses pass through as-is.
+/// Reshape a successful upstream response into OpenAI JSON bytes.
+/// OpenAI responses pass through as-is.
 pub fn translate_response(target: &Target, bytes: &[u8]) -> Result<Vec<u8>> {
     match target.provider.kind {
-        ProviderKind::OpenAICompatible => Ok(bytes.to_vec()),
+        ProviderKind::OpenAI => Ok(bytes.to_vec()),
         ProviderKind::Anthropic => {
             let resp: serde_json::Value =
                 serde_json::from_slice(bytes).context("parsing anthropic response")?;
@@ -90,8 +99,14 @@ pub fn translate_response(target: &Target, bytes: &[u8]) -> Result<Vec<u8>> {
         }
         ProviderKind::Google => {
             let resp: serde_json::Value =
-                serde_json::from_slice(bytes).context("parsing gemini response")?;
+                serde_json::from_slice(bytes).context("parsing google response")?;
             let out = google::translate_response(&resp, &target.entry.model_id)?;
+            serde_json::to_vec(&out).context("serializing translated response")
+        }
+        ProviderKind::OpenAIResponses => {
+            let resp: serde_json::Value =
+                serde_json::from_slice(bytes).context("parsing responses body")?;
+            let out = responses::translate_response(&resp, &target.entry.model_id)?;
             serde_json::to_vec(&out).context("serializing translated response")
         }
         ProviderKind::Custom => Ok(bytes.to_vec()),
@@ -133,7 +148,9 @@ pub fn parse_stream_chunk(kind: ProviderKind, payload: &str) -> Option<StreamEve
     match kind {
         ProviderKind::Anthropic => anthropic::parse_stream_chunk(payload),
         ProviderKind::Google => google::parse_stream_chunk(payload),
-        ProviderKind::OpenAICompatible | ProviderKind::Custom => {
+        // Never reached: Responses upstreams are served non-streamed, but the
+        // openai decoder is the safest passthrough if a body ever lands here.
+        ProviderKind::OpenAI | ProviderKind::OpenAIResponses | ProviderKind::Custom => {
             openai::parse_stream_chunk(payload)
         }
     }
@@ -148,16 +165,16 @@ mod tests {
     #[test]
     fn normalize_base_strips_trailing_v1() {
         assert_eq!(
-            normalize_base("https://openrouter.ai/api/v1"),
-            "https://openrouter.ai/api"
+            normalize_base("https://api.example.com/v1"),
+            "https://api.example.com"
         );
         assert_eq!(
             normalize_base("https://api.openai.com/v1/"),
             "https://api.openai.com"
         );
         assert_eq!(
-            normalize_base("https://api.deepseek.com"),
-            "https://api.deepseek.com"
+            normalize_base("https://api.example.org"),
+            "https://api.example.org"
         );
         assert_eq!(
             normalize_base("http://localhost:11434/v1"),

@@ -1,6 +1,6 @@
 //! The HTTP surface exposed to callers.
 //!
-//! AGOS Proxy speaks the OpenAI-compatible API - `/v1/chat/completions`,
+//! AGOS Proxy speaks the OpenAI API - `/v1/chat/completions`,
 //! `/v1/completions`, `/v1/embeddings`, `/v1/models` - so an existing OpenAI
 //! SDK client can be pointed at this server unchanged. Requests are
 //! authenticated with the caller profile's bearer token and subject to the
@@ -27,6 +27,7 @@ mod handlers;
 pub mod middleware;
 mod native;
 pub mod ratelimit;
+pub mod sse;
 
 pub use handlers::{chat_completions, list_models, AppState};
 
@@ -40,7 +41,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Build a CORS layer based on the AGOS_CORS_ORIGINS environment variable.
 /// When the env var is set, only the specified origins are allowed.
-/// When not set, permissive CORS is used for backward compatibility.
+/// When not set, permissive CORS is used.
 fn build_cors_layer() -> tower_http::cors::CorsLayer {
     let origins: Option<Vec<String>> = std::env::var("AGOS_CORS_ORIGINS")
         .ok()
@@ -88,7 +89,7 @@ pub fn create_app(state: AppState) -> Router {
     let cors_layer = build_cors_layer();
 
     Router::new()
-        // Legacy OpenAI-compatible surface (backward-compatible alias).
+        // Legacy OpenAI surface.
         .route(
             "/v1/chat/completions",
             axum::routing::post(handlers::chat_completions),
@@ -191,7 +192,11 @@ async fn readiness_check(State(state): State<AppState>) -> axum::response::Respo
     }
 }
 
-pub async fn serve(bind_addr: &str, cli_attempt_timeout: Option<Duration>) -> Result<()> {
+pub async fn serve(
+    bind_addr: &str,
+    cli_attempt_timeout: Option<Duration>,
+    cli_stream_idle_timeout: Option<Duration>,
+) -> Result<()> {
     if std::env::var("RUST_LOG").unwrap_or_default() != "off" {
         tracing_subscriber::fmt()
             .with_env_filter(
@@ -222,9 +227,22 @@ pub async fn serve(bind_addr: &str, cli_attempt_timeout: Option<Duration>) -> Re
                 .map(Duration::from_secs)
         })
         .unwrap_or(Duration::from_secs(10));
+    // Idle-chunk timeout for committed streams: how long the upstream may stay
+    // silent between body chunks before the stream is failed. Configurable via
+    // `--stream-idle-timeout` or `AGOS_STREAM_IDLE_TIMEOUT_SECS`. Precedence:
+    // flag > env > 60s.
+    let stream_idle_timeout = cli_stream_idle_timeout
+        .or_else(|| {
+            std::env::var("AGOS_STREAM_IDLE_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .map(Duration::from_secs)
+        })
+        .unwrap_or(Duration::from_secs(60));
     let state = AppState {
         store: store.clone(),
         attempt_timeout,
+        stream_idle_timeout,
         http_client: http_client.clone(),
         routing_state: RoutingState::default(),
         rate_limiter: rate_limiter.clone(),

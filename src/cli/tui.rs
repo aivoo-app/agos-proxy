@@ -718,7 +718,7 @@ mod tests {
 
     #[tokio::test]
     async fn submit_and_drain_round_trip_through_mock_upstream() {
-        let port = 19880;
+        let port = 19889;
         let base = format!("http://127.0.0.1:{port}");
         let _mock = mock_upstream(port).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -733,7 +733,7 @@ mod tests {
                     description: None,
                     base_url: base,
                     auth_token: "sk-mock".into(),
-                    kind: ProviderKind::OpenAICompatible,
+                    kind: ProviderKind::OpenAI,
                     extra_headers: BTreeMap::new(),
                 },
             )

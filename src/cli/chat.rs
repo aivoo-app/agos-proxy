@@ -368,7 +368,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_turn_routes_through_route_and_returns_reply() {
-        let port = 19879;
+        let port = 19890;
         let base = format!("http://127.0.0.1:{port}");
         let _mock = mock_upstream(port).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -385,7 +385,7 @@ mod tests {
                     description: None,
                     base_url: base,
                     auth_token: "sk-mock".into(),
-                    kind: ProviderKind::OpenAICompatible,
+                    kind: ProviderKind::OpenAI,
                     extra_headers: BTreeMap::new(),
                 },
             )

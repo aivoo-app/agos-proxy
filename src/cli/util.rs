@@ -16,9 +16,10 @@ pub fn open_store() -> Result<Store> {
 /// Render a human-friendly provider-kind label.
 pub fn kind_label(kind: &crate::domain::ProviderKind) -> &'static str {
     match kind {
-        crate::domain::ProviderKind::OpenAICompatible => "OpenAI-compatible",
+        crate::domain::ProviderKind::OpenAI => "OpenAI",
         crate::domain::ProviderKind::Anthropic => "Anthropic",
-        crate::domain::ProviderKind::Google => "Google (Gemini)",
+        crate::domain::ProviderKind::Google => "Google",
+        crate::domain::ProviderKind::OpenAIResponses => "OpenAI Responses",
         crate::domain::ProviderKind::Custom => "Custom",
     }
 }
@@ -170,7 +171,7 @@ pub fn prompt_token(
     }
 }
 
-/// Fetch the model catalogue from an OpenAI-compatible provider
+/// Fetch the model catalogue from an OpenAI provider
 /// (`GET {base}/models` with the provider's bearer token). Returns sorted
 /// model IDs.
 pub fn fetch_provider_models(provider: &crate::domain::Provider) -> Result<Vec<String>> {
@@ -223,7 +224,7 @@ pub fn prompt_model_id(
     use dialoguer::{FuzzySelect, Input, Select};
     let browseable = matches!(
         provider.kind,
-        crate::domain::ProviderKind::OpenAICompatible | crate::domain::ProviderKind::Custom
+        crate::domain::ProviderKind::OpenAI | crate::domain::ProviderKind::Custom
     );
     loop {
         if browseable {
@@ -256,7 +257,7 @@ pub fn prompt_model_id(
             }
         }
         let model_id: String = Input::<String>::with_theme(theme)
-            .with_prompt("Model ID (e.g. deepseek/deepseek-v4-flash)")
+            .with_prompt("Model ID (e.g. vendor/model-id)")
             .interact_text()?;
         let model_id = model_id.trim().to_string();
         if model_id.is_empty() {

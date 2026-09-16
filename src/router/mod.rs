@@ -83,7 +83,7 @@ pub struct RequestNeeds {
 }
 
 impl RequestNeeds {
-    /// Infer the needs from a raw OpenAI-compatible request body.
+    /// Infer the needs from a raw OpenAI request body.
     pub fn from_body(body: &serde_json::Value) -> Self {
         let tools = body
             .get("tools")
@@ -283,11 +283,24 @@ where
     }
 
     let mut last_error = None;
+    // (target, upstream status code if the attempt carried one, upstream error
+    // message). Both drive the demotion classification below.
+    let mut failures: Vec<(Target, Option<i64>, String)> = Vec::new();
     for target in &targets {
         match timeout(attempt_timeout, attempt_fn(target.clone())).await {
             Ok(Ok(bytes)) => return Ok(bytes),
             Ok(Err(e)) => {
+                let provider_err = e.downcast_ref::<crate::adapter::outbound::ProviderError>();
+                let status = provider_err.map(|pe| pe.status.as_u16() as i64);
+                // anyhow's Display only shows the outer context, so the raw
+                // upstream body (which names images on a rejection) must come
+                // from the downcast. Transport failures fall back to the error
+                // string.
+                let message = provider_err
+                    .map(|pe| pe.body.clone())
+                    .unwrap_or_else(|| e.to_string());
                 last_error = Some(e);
+                failures.push((target.clone(), status, message));
                 tracing::warn!(
                     provider = %target.provider.name,
                     model = %target.entry.model_id,
@@ -298,6 +311,7 @@ where
                 last_error = Some(anyhow::anyhow!(
                     "attempt timed out after {attempt_timeout:?}"
                 ));
+                failures.push((target.clone(), None, "upstream timeout".to_string()));
                 tracing::warn!(
                     provider = %target.provider.name,
                     model = %target.entry.model_id,
@@ -307,14 +321,194 @@ where
         }
     }
 
-    for target in &targets {
-        let _ = store.set_route_entry_status(target.entry.id, ModelStatus::Unhealthy);
+    // Demote per failure classification (see [`demote_status_for`]): only
+    // provider-side failures (5xx, transport errors, timeouts, 429 as
+    // Degraded) take an entry out of rotation. Client-side 4xx that originate
+    // from the translated request body would otherwise take a perfectly
+    // healthy chain dark on a single malformed request — unless the upstream
+    // names images in its rejection, which means the upstream cannot serve
+    // vision requests at all and it should be skipped for them.
+    for (target, status_code, message) in &failures {
+        if let Some(status) = demote_status_for(*status_code, message) {
+            let _ = store.set_route_entry_status(target.entry.id, status);
+        }
     }
 
     match last_error {
         Some(e) => Err(e),
         None => bail!("all targets failed"),
     }
+}
+
+/// Classify a failure status into a demotion decision. Provider-side failures
+/// demote the entry (429 only Degraded, everything else Unhealthy); client-side
+/// 4xx that originates from the translated request body itself never demotes —
+/// except a 4xx whose error message refuses images/vision, meaning the upstream
+/// cannot serve image requests at all. Failures without a known status
+/// (transport errors, timeouts) are treated as provider-side.
+pub(crate) fn demote_status_for(status_code: Option<i64>, message: &str) -> Option<ModelStatus> {
+    match status_code {
+        Some(429) => Some(ModelStatus::Degraded),
+        Some(c) if (400..500).contains(&c) => {
+            if image_rejection(message) {
+                Some(ModelStatus::Unhealthy)
+            } else {
+                None
+            }
+        }
+        _ => Some(ModelStatus::Unhealthy),
+    }
+}
+
+/// Recognize explicit capability refusals, not arbitrary mentions of images.
+/// For JSON envelopes, inspect only the dedicated error field, never request
+/// echoes.
+fn image_rejection(message: &str) -> bool {
+    let Some(text) = error_text(message) else {
+        return false;
+    };
+    let lower = text.to_ascii_lowercase();
+    let normalized = lower.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // A rejection aimed at one file's encoding, size or transfer is a property
+    // of the payload, not a missing model capability: the upstream may accept
+    // the next image just fine, and non-image traffic must not be affected.
+    const PAYLOAD_SPECIFIC: [&str; 12] = [
+        "media type",
+        "mime",
+        "file format",
+        "image format",
+        "vision format",
+        "too large",
+        "corrupt",
+        "decode",
+        "download",
+        "dimensions",
+        "resolution",
+        "aspect ratio",
+    ];
+    if PAYLOAD_SPECIFIC
+        .iter()
+        .any(|qualifier| normalized.contains(qualifier))
+    {
+        return false;
+    }
+
+    // Strong signal: "image input" and friends name the modality capability
+    // itself. A request echo carries `image_url`, never "image input", and we
+    // already read only the dedicated error field, so any refusal wording in
+    // the same message is enough. This catches Gemini's
+    // "Unable to process the provided image input".
+    const INPUT_TOKENS: [&str; 4] = [
+        "image input",
+        "image inputs",
+        "vision input",
+        "multimodal input",
+    ];
+    const REFUSALS_ANYWHERE: [&str; 11] = [
+        "not supported",
+        "unsupported",
+        "not able to",
+        "unable to",
+        "cannot",
+        "can't",
+        "does not support",
+        "do not support",
+        "doesn't support",
+        "does not accept",
+        "doesn't accept",
+    ];
+    if INPUT_TOKENS
+        .iter()
+        .any(|token| contains_phrase(&normalized, token))
+        && REFUSALS_ANYWHERE
+            .iter()
+            .any(|refusal| normalized.contains(refusal))
+    {
+        return true;
+    }
+
+    // Precise pairs, for phrasings that never say "input" (e.g. "images are
+    // not supported", "this model does not support images").
+    const REFUSALS: [&str; 5] = [
+        "does not support",
+        "do not support",
+        "doesn't support",
+        "does not accept",
+        "doesn't accept",
+    ];
+    const MODALITIES: [&str; 5] = ["image", "images", "vision", "vision inputs", "multimodal"];
+    MODALITIES.iter().any(|modality| {
+        REFUSALS
+            .iter()
+            .any(|refusal| contains_phrase(&normalized, &format!("{refusal} {modality}")))
+            || [
+                "not supported",
+                "is not supported",
+                "are not supported",
+                "is unsupported",
+                "are unsupported",
+            ]
+            .iter()
+            .any(|suffix| contains_phrase(&normalized, &format!("{modality} {suffix}")))
+    })
+}
+
+/// Pull the human-readable error out of an upstream body. Only dedicated error
+/// fields are read — never arbitrary request-echo fields — and `message` may be
+/// a plain string, an array of `{"type":"text","text":…}` blocks, or an object
+/// carrying `text`. Bodies that are already plain text or a bare JSON string
+/// are used as-is.
+fn error_text(body: &str) -> Option<String> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return Some(body.to_string());
+    };
+    match &parsed {
+        serde_json::Value::String(s) => Some(s.clone()),
+        _ => ["/error/message", "/error", "/message", "/detail"]
+            .iter()
+            .find_map(|pointer| parsed.pointer(pointer).and_then(value_text)),
+    }
+}
+
+/// Extract text from a value that may be a string, an array of content blocks,
+/// or an object carrying `text`.
+fn value_text(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Object(map) => map
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        serde_json::Value::Array(items) => {
+            let parts: Vec<&str> = items.iter().filter_map(value_text_ref).collect();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join(" "))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn value_text_ref(value: &serde_json::Value) -> Option<&str> {
+    value
+        .as_str()
+        .or_else(|| value.get("text").and_then(serde_json::Value::as_str))
+}
+
+/// Do not match modality words inside model names or request-field names.
+fn contains_phrase(message: &str, phrase: &str) -> bool {
+    let is_word = |c: char| c.is_alphanumeric() || matches!(c, '_' | '-');
+    message.match_indices(phrase).any(|(start, _)| {
+        !message[..start].ends_with(is_word)
+            && !message[start + phrase.len()..].starts_with(is_word)
+    })
 }
 
 #[cfg(test)]
@@ -336,7 +530,7 @@ mod tests {
                     description: None,
                     base_url: "https://example.com".into(),
                     auth_token: "tok".into(),
-                    kind: ProviderKind::OpenAICompatible,
+                    kind: ProviderKind::OpenAI,
                     extra_headers: BTreeMap::new(),
                 },
             )
@@ -395,7 +589,7 @@ mod tests {
                     description: None,
                     base_url: "https://a.example".into(),
                     auth_token: "tok1".into(),
-                    kind: ProviderKind::OpenAICompatible,
+                    kind: ProviderKind::OpenAI,
                     extra_headers: BTreeMap::new(),
                 },
             )
@@ -408,7 +602,7 @@ mod tests {
                     description: None,
                     base_url: "https://b.example".into(),
                     auth_token: "tok2".into(),
-                    kind: ProviderKind::OpenAICompatible,
+                    kind: ProviderKind::OpenAI,
                     extra_headers: BTreeMap::new(),
                 },
             )
@@ -482,7 +676,7 @@ mod tests {
                     description: None,
                     base_url: "https://a.example".into(),
                     auth_token: "tok".into(),
-                    kind: ProviderKind::OpenAICompatible,
+                    kind: ProviderKind::OpenAI,
                     extra_headers: BTreeMap::new(),
                 },
             )
@@ -495,7 +689,7 @@ mod tests {
                     description: None,
                     base_url: "https://b.example".into(),
                     auth_token: "tok".into(),
-                    kind: ProviderKind::OpenAICompatible,
+                    kind: ProviderKind::OpenAI,
                     extra_headers: BTreeMap::new(),
                 },
             )
@@ -568,7 +762,7 @@ mod tests {
                         description: None,
                         base_url: "https://a.example".into(),
                         auth_token: "tok".into(),
-                        kind: ProviderKind::OpenAICompatible,
+                        kind: ProviderKind::OpenAI,
                         extra_headers: BTreeMap::new(),
                     },
                 )
@@ -587,7 +781,7 @@ mod tests {
             .add_route_entry(
                 route.id,
                 flagship_p.id,
-                "gpt-4o",
+                "provider-pro",
                 1,
                 1.0,
                 Default::default(),
@@ -597,7 +791,7 @@ mod tests {
             .add_route_entry(
                 route.id,
                 cheap_p.id,
-                "gpt-4o-mini",
+                "provider-mini",
                 2,
                 1.0,
                 Default::default(),
@@ -616,8 +810,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(targets.len(), 2);
-        assert_eq!(targets[0].entry.model_id, "gpt-4o-mini");
-        assert_eq!(targets[1].entry.model_id, "gpt-4o");
+        assert_eq!(targets[0].entry.model_id, "provider-mini");
+        assert_eq!(targets[1].entry.model_id, "provider-pro");
     }
 
     #[test]
@@ -721,6 +915,174 @@ mod tests {
         assert_eq!(content_text(&arr), "line one\nline two");
     }
 
+    #[test]
+    fn image_rejection_ignores_unrelated_errors_and_echoes() {
+        for message in [
+            "unsupported parameter max_tokens; image_url=x",
+            "cannot decode image: corrupt data",
+            "unable to download image URL",
+            "unsupported image format: use PNG",
+            "model vision-pro was not found",
+            "this model does not support image_url.detail",
+            "this model does not support vision-pro",
+            "revision is not supported",
+            "錯誤： image too large",
+            r#"{"error":{"message":"unsupported parameter"},"request":{"text":"image input not supported","image_url":"x"}}"#,
+            r#"{"request":{"message":"image input not supported"}}"#,
+            r#"{"error":{"message":null},"request":"image input not supported"}"#,
+            "",
+        ] {
+            assert_eq!(demote_status_for(Some(400), message), None, "{message}");
+            assert_eq!(demote_status_for(Some(422), message), None, "{message}");
+        }
+    }
+
+    #[test]
+    fn image_rejection_recognizes_explicit_capability_refusals() {
+        for message in [
+            "image input not supported",
+            "Images are not supported by this model.",
+            "This model does not support IMAGE input.",
+            "This model doesn't accept images.",
+            "vision is unsupported",
+            "multimodal input is not supported",
+            "錯誤： images are not supported",
+            "image  input\nnot supported",
+            r#"{"error":{"message":"image input not supported"}}"#,
+            r#"{"error":"This model does not accept images"}"#,
+            r#"{"message":"vision is not supported"}"#,
+        ] {
+            assert_eq!(
+                demote_status_for(Some(400), message),
+                Some(ModelStatus::Unhealthy),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn image_rejection_handles_real_upstream_error_envelopes() {
+        // Anthropic: {"type":"error","error":{"type":…,"message":…}}
+        assert_eq!(
+            demote_status_for(
+                Some(400),
+                r#"{"type":"error","error":{"type":"invalid_request_error","message":"This model does not support image input."}}"#
+            ),
+            Some(ModelStatus::Unhealthy)
+        );
+        // Google/Gemini: refusal wording is "unable to process".
+        assert_eq!(
+            demote_status_for(
+                Some(400),
+                r#"{"error":{"code":400,"message":"Unable to process the provided image input.","status":"INVALID_ARGUMENT"}}"#
+            ),
+            Some(ModelStatus::Unhealthy)
+        );
+        // `message` as an array of content blocks.
+        assert_eq!(
+            demote_status_for(
+                Some(400),
+                r#"{"error":{"message":[{"type":"text","text":"images are not supported"}]}}"#
+            ),
+            Some(ModelStatus::Unhealthy)
+        );
+        // A bare JSON string body.
+        assert_eq!(
+            demote_status_for(Some(400), r#""images are not supported""#),
+            Some(ModelStatus::Unhealthy)
+        );
+        // Non-standard top-level `detail` field.
+        assert_eq!(
+            demote_status_for(Some(400), r#"{"detail":"images are not supported"}"#),
+            Some(ModelStatus::Unhealthy)
+        );
+        // An array with no extractable text is not evidence of a capability gap.
+        assert_eq!(
+            demote_status_for(Some(400), r#"{"error":{"message":[{"foo":"bar"}]}}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn payload_specific_image_errors_do_not_demote() {
+        // The upstream can take images; this particular file is the problem.
+        for message in [
+            "unsupported media type for vision input",
+            "unsupported image format: use PNG",
+            "image dimensions exceed the maximum resolution",
+            "Unsupported MIME type: image/webp",
+            "unable to decode image data",
+            "request payload too large",
+        ] {
+            assert_eq!(demote_status_for(Some(415), message), None, "{message}");
+            assert_eq!(demote_status_for(Some(400), message), None, "{message}");
+        }
+    }
+
+    #[test]
+    fn image_rejecting_4xx_demotes_but_plain_4xx_does_not() {
+        // Explicit capability refusals still demote the whole route entry.
+        assert_eq!(
+            demote_status_for(
+                Some(400),
+                r#"{"error":{"message":"image input not supported"}}"#
+            ),
+            Some(ModelStatus::Unhealthy)
+        );
+        assert_eq!(
+            demote_status_for(Some(415), "unsupported media type for vision input"),
+            None
+        );
+        // Matching is ASCII-case-insensitive.
+        assert_eq!(
+            demote_status_for(Some(404), "Model does not support IMAGE input"),
+            Some(ModelStatus::Unhealthy)
+        );
+        // A refusal phrase and the image term must actually pair up: a 4xx that
+        // echoes the request payload (whose parts carry `image_url` keys) next
+        // to an unrelated error must not demote a healthy upstream.
+        assert_eq!(
+            demote_status_for(Some(400), "invalid parameter: max_tokens"),
+            None
+        );
+        assert_eq!(
+            demote_status_for(Some(422), "request body exceeds the context window"),
+            None
+        );
+        // A request echo is not a capability rejection.
+        assert_eq!(
+            demote_status_for(
+                Some(400),
+                "cannot process the request: the upstream rejected it. request echo: \
+                 {\"messages\":[{\"content\":[{\"type\":\"image_url\"}]}]}"
+            ),
+            None
+        );
+        // A mere mention without a refusal phrase is not a rejection either.
+        assert_eq!(
+            demote_status_for(Some(404), "model vision-pro was not found"),
+            None
+        );
+        // A processing failure does not prove missing modality support.
+        assert_eq!(demote_status_for(Some(400), "cannot process images"), None);
+
+        // Everything else about the old classification is unchanged.
+        assert_eq!(demote_status_for(Some(400), "invalid temperature"), None);
+        assert_eq!(demote_status_for(Some(422), "request too large"), None);
+        assert_eq!(
+            demote_status_for(Some(429), "rate limited"),
+            Some(ModelStatus::Degraded)
+        );
+        assert_eq!(
+            demote_status_for(Some(500), "boom"),
+            Some(ModelStatus::Unhealthy)
+        );
+        assert_eq!(
+            demote_status_for(None, "transport failure"),
+            Some(ModelStatus::Unhealthy)
+        );
+    }
+
     #[tokio::test]
     async fn failover_filters_out_unhealthy_entries() {
         let (store, _) = setup();
@@ -751,7 +1113,7 @@ mod tests {
                     description: None,
                     base_url: "https://a.example".into(),
                     auth_token: "tok".into(),
-                    kind: ProviderKind::OpenAICompatible,
+                    kind: ProviderKind::OpenAI,
                     extra_headers: BTreeMap::new(),
                 },
             )

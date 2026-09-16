@@ -161,11 +161,11 @@ fn add_provider(store: &Store, theme: &ColorfulTheme, profile: &Profile) -> Resu
     ensure_password_ok(profile)?;
 
     let name: String = Input::<String>::with_theme(theme)
-        .with_prompt("Provider name (e.g. deepseek)")
+        .with_prompt("Provider name (e.g. upstream)")
         .interact_text()?;
     let base_url: String = Input::<String>::with_theme(theme)
         .with_prompt("Base URL")
-        .default("https://api.deepseek.com".into())
+        .default("https://api.example.com".into())
         .interact_text()?;
     let auth_token = crate::cli::util::prompt_token(theme, "API token (stored encrypted)", false)?;
     let kind = pick_kind(theme)?;
@@ -378,10 +378,10 @@ fn prompt_capabilities(theme: &ColorfulTheme) -> Result<RouteCapabilities> {
     })
 }
 
-/// Let the user pick which provider kind (OpenAI-compatible, Anthropic, ...).
+/// Let the user pick which provider kind (OpenAI, Anthropic, ...).
 fn pick_kind(theme: &ColorfulTheme) -> Result<ProviderKind> {
     let kinds = [
-        ProviderKind::OpenAICompatible,
+        ProviderKind::OpenAI,
         ProviderKind::Anthropic,
         ProviderKind::Google,
         ProviderKind::Custom,

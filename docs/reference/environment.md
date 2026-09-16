@@ -90,6 +90,27 @@ seconds to produce their first token.
 
 ---
 
+### `AGOS_STREAM_IDLE_TIMEOUT_SECS`
+
+| | |
+|---|---|
+| **Purpose** | Idle timeout for committed streams: how long the upstream may stay silent between SSE body chunks before the stream is failed instead of hanging the client |
+| **Default** | `60` seconds |
+| **Used by** | `agos-proxy serve` only |
+| **Example** | `AGOS_STREAM_IDLE_TIMEOUT_SECS=120 agos-proxy serve` |
+
+`--attempt-timeout` only bounds the time to receive response *headers*. Once a
+stream is committed (HTTP 200 with `Content-Type: text/event-stream`), each
+subsequent chunk must arrive within this window; otherwise the proxy emits an
+SSE error event, closes the stream, logs the attempt as failed, and demotes the
+route entry. Set it to `0` to disable the idle timeout entirely (not
+recommended — a stalled upstream will then hang the client indefinitely).
+
+The `--stream-idle-timeout` command-line flag takes precedence over this
+variable, which in turn takes precedence over the built-in default.
+
+---
+
 ## Docker / Bootstrap
 
 ### `AGOS_SETUP`
@@ -111,7 +132,7 @@ environment:
     {
       "profile": "ci-agent",
       "providers": [
-        {"name": "mock", "base_url": "http://mock:9999", "auth_token": "sk-mock", "kind": "openai_compatible"}
+        {"name": "mock", "base_url": "http://mock:9999", "auth_token": "sk-mock", "kind": "openai"}
       ],
       "proxies": [
         {"name": "main", "routes": [

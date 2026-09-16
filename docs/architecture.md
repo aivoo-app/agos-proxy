@@ -57,7 +57,7 @@ src/
 ├── crypto/          secrets at rest (ChaCha20-Poly1305 + Argon2id)
 ├── adapter/         modular API adapters, master registry (ApiKind)
 │   ├── inbound/     per-surface inbound: openai, anthropic, google
-│   └── outbound/    per-provider outbound: openai, anthropic, google
+│   └── outbound/    per-provider outbound: openai, anthropic, google, responses
 ├── translator/      canonical request/response model (no provider logic)
 └── bin/
     └── gen-docs     developer-only: man pages, completions, CLI markdown
@@ -110,6 +110,7 @@ outbound adapter that shapes requests and decodes responses.
 | Variant              | Use case                                              |
 |----------------------|-------------------------------------------------------|
 | `OpenAICompatible`  | Most providers; request/response pass through.        |
+| `OpenAIResponses`   | Responses-only upstreams (`POST /v1/responses`), e.g. Zen muse-*. |
 | `Anthropic`         | Native `/v1/messages` translation.                    |
 | `Google`            | Native Gemini `generateContent` translation.          |
 | `Custom`            | Reserved for future native integrations.              |
@@ -236,6 +237,32 @@ Aggregate usage per model over a window: calls, failures, latency, tokens.
 6. On failure: that model is marked unhealthy and the next one is tried
    immediately — the caller perceives extra latency, not a failed request.
 7. Only if the whole chain is exhausted does the route return an error.
+
+### Multimodal (vision) requests
+
+Image parts survive the whole pipeline. The canonical request keeps message
+content as raw JSON — plain text as a string, multimodal content as the OpenAI
+parts array (`text` / `image_url` entries). From there each outbound adapter
+rebuilds its native shape:
+
+| Upstream kind   | Image encoding                                                        |
+|-----------------|-----------------------------------------------------------------------|
+| OpenAI/custom   | Parts array passed through untouched.                                 |
+| Anthropic       | `{"type":"image","source":{"type":"url"…}}` for `http(s)` references; `{"type":"image","source":{"type":"base64",…}}` for `data:` URLs. |
+| Google          | `{"fileData":{mimeType,fileUri}}` for `http(s)` references; `{"inlineData":{mimeType,data}}` for `data:` URLs. |
+
+The Anthropic and Gemini inbound surfaces accept their native image shapes
+(Anthropic `image` blocks, Gemini `inlineData`/`fileData` parts — camelCase and
+snake_case both) and normalize them into the same canonical parts array.
+
+Limitations: `system` prompts and `systemInstruction` stay text-only (images
+there are dropped, the upstreams do not accept them); OpenAI's
+`image_url.detail` has no Anthropic/Gemini analogue and is dropped; Google
+`fileData` requires a publicly resolvable URL, with the MIME type inferred
+from the file extension (`image/jpeg` default).
+
+Text-only requests are unaffected: their content remains a plain JSON string
+through every adapter, byte-identical to pre-vision behavior.
 
 ## Health and circuit breaking
 

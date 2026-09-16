@@ -344,11 +344,11 @@ mod tests {
             .create_provider(
                 profile.id.as_str(),
                 NewProvider {
-                    name: "deepseek".into(),
+                    name: "example".into(),
                     description: None,
-                    base_url: "https://api.deepseek.com".into(),
+                    base_url: "https://api.example.com".into(),
                     auth_token: "sk-secret".into(),
-                    kind: ProviderKind::OpenAICompatible,
+                    kind: ProviderKind::OpenAI,
                     extra_headers: BTreeMap::new(),
                 },
             )
@@ -363,7 +363,7 @@ mod tests {
             .add_route_entry(
                 route.id,
                 provider.id,
-                "deepseek-v4-flash",
+                "example-model",
                 1,
                 1.0,
                 RouteCapabilities::default(),
@@ -384,7 +384,7 @@ mod tests {
         assert_eq!(bundle.proxies.len(), 1);
         assert_eq!(
             bundle.proxies[0].routes[0].entries[0].model_id,
-            "deepseek-v4-flash"
+            "example-model"
         );
         assert_eq!(bundle.providers[0].auth_token, "sk-secret");
 
@@ -401,7 +401,7 @@ mod tests {
         let route = target.list_routes(proxies[0].id).unwrap()[0].clone();
         let entries = target.route_entries(route.id).unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].model_id, "deepseek-v4-flash");
+        assert_eq!(entries[0].model_id, "example-model");
     }
 
     #[test]

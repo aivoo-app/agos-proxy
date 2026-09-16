@@ -1,4 +1,4 @@
-//! OpenAI-compatible inbound adapter.
+//! OpenAI inbound adapter.
 //!
 //! Serves `/openai/v1/chat/completions`. Because OpenAI's shape is the canonical
 //! shape, parsing is a lossless deserialize; response rendering mirrors the
@@ -8,7 +8,7 @@ use crate::adapter::inbound::InboundAdapter;
 use crate::adapter::ApiKind;
 use crate::translator::{CanonicalResponse, ChatRequest, StreamEvent};
 
-/// OpenAI-compatible inbound surface.
+/// OpenAI inbound surface.
 pub struct OpenAiAdapter;
 
 impl InboundAdapter for OpenAiAdapter {

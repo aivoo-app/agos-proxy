@@ -116,6 +116,7 @@ fn test_state(store: Store) -> AppState {
     AppState {
         store: Arc::new(store),
         attempt_timeout: Duration::from_secs(5),
+        stream_idle_timeout: Duration::from_secs(5),
         http_client: reqwest::Client::new(),
         routing_state: agos::router::RoutingState::default(),
         rate_limiter: Arc::new(agos::server::ratelimit::RateLimiter::new()),
@@ -124,7 +125,74 @@ fn test_state(store: Store) -> AppState {
     }
 }
 
+/// Start a mock Anthropic `/v1/messages` upstream that reports whether the
+/// translated request actually carried an `image` block — the multimodal
+/// passthrough test asserts on the answer, proving the image reached upstream.
+async fn mock_anthropic_upstream(port: u16) -> tokio::task::JoinHandle<()> {
+    let app = axum::Router::new().route(
+        "/v1/messages",
+        axum::routing::post(|body: axum::Json<serde_json::Value>| async move {
+            let saw_image = body
+                .0
+                .get("messages")
+                .and_then(|m| m.as_array())
+                .map(|msgs| {
+                    msgs.iter().any(|m| {
+                        m.get("content")
+                            .and_then(|c| c.as_array())
+                            .map(|blocks| {
+                                blocks.iter().any(|b| {
+                                    b.get("type").and_then(|t| t.as_str()) == Some("image")
+                                })
+                            })
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false);
+            let text = if saw_image { "saw image" } else { "no image" };
+            let resp = serde_json::json!({
+                "id": "msg_mock",
+                "type": "message",
+                "role": "assistant",
+                "model": "mock-model",
+                "content": [{ "type": "text", "text": text }],
+                "stop_reason": "end_turn",
+                "stop_sequence": null,
+                "usage": { "input_tokens": 1, "output_tokens": 1 }
+            });
+            (
+                axum::http::StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                resp.to_string(),
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
+        .await
+        .expect("bind mock anthropic upstream");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    })
+}
+
 fn setup_store(base_url: &str) -> (Store, String) {
+    setup_store_kind(base_url, ProviderKind::OpenAI)
+}
+
+/// Same tree as [`setup_store`], but the provider is created with the given
+/// kind — used by the OpenAI Responses upstream tests.
+fn setup_store_kind(base_url: &str, kind: ProviderKind) -> (Store, String) {
+    setup_store_inner(base_url, kind, false)
+}
+
+/// Same tree again, but the route entry advertises the vision capability —
+/// required by the multimodal passthrough test, whose request carries an
+/// image part that the capability filter would otherwise route away.
+fn setup_vision_store(base_url: &str, kind: ProviderKind) -> (Store, String) {
+    setup_store_inner(base_url, kind, true)
+}
+
+fn setup_store_inner(base_url: &str, kind: ProviderKind, vision: bool) -> (Store, String) {
     let store = Store::open_in_memory().expect("open in-memory store");
     let profile = store
         .create_profile("coder1", Some("test profile"), None)
@@ -139,7 +207,7 @@ fn setup_store(base_url: &str) -> (Store, String) {
                 description: None,
                 base_url: base_url.into(),
                 auth_token: "sk-mock".into(),
-                kind: ProviderKind::OpenAICompatible,
+                kind,
                 extra_headers: std::collections::BTreeMap::new(),
             },
         )
@@ -163,7 +231,7 @@ fn setup_store(base_url: &str) -> (Store, String) {
             1.0,
             RouteCapabilities {
                 tools: true,
-                vision: false,
+                vision,
                 json_mode: false,
                 max_context: None,
             },
@@ -188,6 +256,7 @@ async fn chat_completions_routes_through_mock_upstream() {
     let state = AppState {
         store: Arc::new(store),
         attempt_timeout: Duration::from_secs(5),
+        stream_idle_timeout: Duration::from_secs(5),
         http_client,
         routing_state: agos::router::RoutingState::default(),
         rate_limiter: Arc::new(agos::server::ratelimit::RateLimiter::new()),
@@ -234,6 +303,7 @@ async fn chat_completions_rejects_missing_auth() {
     let state = AppState {
         store: Arc::new(store),
         attempt_timeout: Duration::from_secs(5),
+        stream_idle_timeout: Duration::from_secs(5),
         http_client,
         routing_state: agos::router::RoutingState::default(),
         rate_limiter: Arc::new(agos::server::ratelimit::RateLimiter::new()),
@@ -274,6 +344,7 @@ async fn list_models_returns_caller_routes() {
     let state = AppState {
         store: Arc::new(store),
         attempt_timeout: Duration::from_secs(5),
+        stream_idle_timeout: Duration::from_secs(5),
         http_client,
         routing_state: agos::router::RoutingState::default(),
         rate_limiter: Arc::new(agos::server::ratelimit::RateLimiter::new()),
@@ -316,6 +387,7 @@ async fn anthropic_surface_translates_to_anthropic_shape() {
     let state = AppState {
         store: Arc::new(store),
         attempt_timeout: Duration::from_secs(5),
+        stream_idle_timeout: Duration::from_secs(5),
         http_client,
         routing_state: agos::router::RoutingState::default(),
         rate_limiter: Arc::new(agos::server::ratelimit::RateLimiter::new()),
@@ -354,11 +426,11 @@ async fn anthropic_surface_translates_to_anthropic_shape() {
     assert_eq!(json["usage"]["input_tokens"], 0);
 }
 
-/// The Gemini surface is served under `/google/v1beta/models/{model}:generateContent`
+/// The Google surface is served under `/google/v1beta/models/{model}:generateContent`
 /// and authenticated with a `key=` query parameter. As with the other surfaces the
-/// response is translated back into Gemini's native shape.
+/// response is translated back into the native shape.
 #[tokio::test]
-async fn google_surface_translates_to_gemini_shape() {
+async fn google_surface_translates_to_native_shape() {
     let mock_port = 19880;
     let mock_base = format!("http://127.0.0.1:{mock_port}");
     let _mock = mock_upstream(mock_port).await;
@@ -369,6 +441,7 @@ async fn google_surface_translates_to_gemini_shape() {
     let state = AppState {
         store: Arc::new(store),
         attempt_timeout: Duration::from_secs(5),
+        stream_idle_timeout: Duration::from_secs(5),
         http_client,
         routing_state: agos::router::RoutingState::default(),
         rate_limiter: Arc::new(agos::server::ratelimit::RateLimiter::new()),
@@ -593,7 +666,7 @@ async fn economy_routes_cheap_first_caches_and_escalates() {
                 description: None,
                 base_url: "http://127.0.0.1:19884".into(),
                 auth_token: "sk-mock".into(),
-                kind: ProviderKind::OpenAICompatible,
+                kind: ProviderKind::OpenAI,
                 extra_headers: std::collections::BTreeMap::new(),
             },
         )
@@ -612,7 +685,7 @@ async fn economy_routes_cheap_first_caches_and_escalates() {
         .add_route_entry(
             route.id,
             provider.id,
-            "gpt-4o",
+            "provider-pro",
             1,
             1.0,
             RouteCapabilities::default(),
@@ -622,7 +695,7 @@ async fn economy_routes_cheap_first_caches_and_escalates() {
         .add_route_entry(
             route.id,
             provider.id,
-            "gpt-4o-mini",
+            "provider-mini",
             2,
             1.0,
             RouteCapabilities::default(),
@@ -672,7 +745,7 @@ async fn economy_routes_cheap_first_caches_and_escalates() {
     assert_eq!(status, 200);
     assert_eq!(cache, "MISS");
     assert_eq!(hits.load(Ordering::SeqCst), 1);
-    assert_eq!(seen.lock().unwrap().last().unwrap(), "gpt-4o-mini");
+    assert_eq!(seen.lock().unwrap().last().unwrap(), "provider-mini");
 
     // 2. Exact repeat -> HIT, no new upstream call.
     let resp = app
@@ -700,7 +773,7 @@ async fn economy_routes_cheap_first_caches_and_escalates() {
     let (status, _c, _b) = meta(resp).await;
     assert_eq!(status, 200);
     assert_eq!(hits.load(Ordering::SeqCst), 2);
-    assert_eq!(seen.lock().unwrap().last().unwrap(), "gpt-4o");
+    assert_eq!(seen.lock().unwrap().last().unwrap(), "provider-pro");
 
     // 4. Body-flag escalation -> also hits the flagship.
     let esc = serde_json::json!({"model": "prog/eco",
@@ -710,5 +783,246 @@ async fn economy_routes_cheap_first_caches_and_escalates() {
     let (status, _c, _b) = meta(resp).await;
     assert_eq!(status, 200);
     assert_eq!(hits.load(Ordering::SeqCst), 3);
-    assert_eq!(seen.lock().unwrap().last().unwrap(), "gpt-4o");
+    assert_eq!(seen.lock().unwrap().last().unwrap(), "provider-pro");
+}
+
+// --- OpenAI Responses upstream ------------------------------------------------
+
+/// A mock Responses-only upstream that returns a Responses-shaped reply.
+async fn mock_responses_upstream(port: u16, fail: bool) -> tokio::task::JoinHandle<()> {
+    let app = axum::Router::new().route(
+        "/v1/responses",
+        axum::routing::post(move || async move {
+            if fail {
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(serde_json::json!({ "error": { "message": "boom" } })),
+                );
+            }
+            (
+                axum::http::StatusCode::OK,
+                axum::Json(serde_json::json!({
+                    "id": "resp_mock",
+                    "created_at": 1_700_000_000i64,
+                    "model": "mock-model",
+                    "output": [
+                        { "type": "reasoning", "summary": [] },
+                        {
+                            "type": "message",
+                            "content": [{ "type": "output_text", "text": "hello from responses" }]
+                        }
+                    ],
+                    "usage": { "input_tokens": 5, "output_tokens": 3 }
+                })),
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
+        .await
+        .expect("bind mock responses upstream");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    })
+}
+
+fn responses_request(stream: bool) -> axum::http::Request<axum::body::Body> {
+    let req_body = serde_json::json!({
+        "model": "programmer/php-dev",
+        "messages": [{ "role": "user", "content": "hi" }],
+        "stream": stream
+    });
+    axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("Authorization", "Bearer profile")
+        .header("Content-Type", "application/json")
+        .body(axum::body::Body::from(req_body.to_string()))
+        .expect("build request")
+}
+
+/// A Responses-only upstream serves a non-streaming chat completion, reshaped
+/// back into chat-completion form with the upstream usage counts.
+#[tokio::test]
+async fn responses_upstream_serves_non_streaming_chat() {
+    let mock_port = 19891;
+    let mock_base = format!("http://127.0.0.1:{mock_port}");
+    let _mock = mock_responses_upstream(mock_port, false).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (store, profile_id) = setup_store_kind(&mock_base, ProviderKind::OpenAIResponses);
+    let mut state = test_state(store);
+    state.attempt_timeout = Duration::from_secs(5);
+    let app = create_app(state);
+
+    let mut request = responses_request(false);
+    request.headers_mut().insert(
+        axum::http::header::AUTHORIZATION,
+        format!("Bearer {profile_id}").parse().unwrap(),
+    );
+
+    let response = app.oneshot(request).await.expect("oneshot");
+    assert_eq!(response.status(), 200);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("parse json");
+    assert_eq!(json["object"], "chat.completion");
+    assert_eq!(
+        json["choices"][0]["message"]["content"],
+        "hello from responses"
+    );
+    assert_eq!(json["choices"][0]["finish_reason"], "stop");
+    assert_eq!(json["usage"]["input_tokens"], 5);
+    assert_eq!(json["usage"]["output_tokens"], 3);
+}
+
+/// A streaming request against a Responses-only upstream is served from the
+/// non-streamed answer, wrapped into a minimal OpenAI SSE stream.
+#[tokio::test]
+async fn responses_upstream_streams_sse_wrapped_completion() {
+    let mock_port = 19892;
+    let mock_base = format!("http://127.0.0.1:{mock_port}");
+    let _mock = mock_responses_upstream(mock_port, false).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (store, profile_id) = setup_store_kind(&mock_base, ProviderKind::OpenAIResponses);
+    let mut state = test_state(store);
+    state.attempt_timeout = Duration::from_secs(5);
+    let app = create_app(state);
+
+    let mut request = responses_request(true);
+    request.headers_mut().insert(
+        axum::http::header::AUTHORIZATION,
+        format!("Bearer {profile_id}").parse().unwrap(),
+    );
+
+    let response = app.oneshot(request).await.expect("oneshot");
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "text/event-stream"
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("chat.completion.chunk"), "body: {text}");
+    assert!(text.contains("hello from responses"), "body: {text}");
+    assert!(text.contains("finish_reason\":\"stop\""), "body: {text}");
+    assert!(text.contains("data: [DONE]"), "body: {text}");
+}
+
+/// When the Responses-only upstream fails, the router fails over to the next
+/// entry in the chain (an OpenAI fallback here).
+#[tokio::test]
+async fn responses_upstream_failure_fails_over_to_next_entry() {
+    let responses_port = 19893;
+    let fallback_port = 19894;
+    let responses_base = format!("http://127.0.0.1:{responses_port}");
+    let fallback_base = format!("http://127.0.0.1:{fallback_port}");
+    let _responses = mock_responses_upstream(responses_port, true).await;
+    let _fallback = mock_upstream(fallback_port).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (store, profile_id) = setup_store_kind(&responses_base, ProviderKind::OpenAIResponses);
+    // Second (fallback) provider + entry at lower priority.
+    store
+        .create_provider(
+            &profile_id,
+            agos::storage::NewProvider {
+                name: "fallback".into(),
+                description: None,
+                base_url: fallback_base,
+                auth_token: "sk-fallback".into(),
+                kind: ProviderKind::OpenAI,
+                extra_headers: std::collections::BTreeMap::new(),
+            },
+        )
+        .expect("create fallback provider");
+    let providers = store.list_providers(&profile_id).expect("list providers");
+    let fallback = providers.iter().find(|p| p.name == "fallback").unwrap();
+    let proxy = &store.list_proxies(&profile_id).expect("proxies")[0];
+    let routes = store.list_routes(proxy.id).expect("routes");
+    store
+        .add_route_entry(
+            routes[0].id,
+            fallback.id,
+            "mock-model",
+            2,
+            1.0,
+            RouteCapabilities::default(),
+        )
+        .expect("add fallback entry");
+
+    let mut state = test_state(store);
+    state.attempt_timeout = Duration::from_secs(5);
+    let app = create_app(state);
+
+    let mut request = responses_request(false);
+    request.headers_mut().insert(
+        axum::http::header::AUTHORIZATION,
+        format!("Bearer {profile_id}").parse().unwrap(),
+    );
+
+    let response = app.oneshot(request).await.expect("oneshot");
+    assert_eq!(response.status(), 200);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("parse json");
+    assert_eq!(
+        json["choices"][0]["message"]["content"], "hello from mock",
+        "the fallback entry must have served the request"
+    );
+}
+
+/// A multimodal request sent to the Anthropic surface must reach an Anthropic
+/// upstream with the image intact. The mock upstream answers differently
+/// depending on whether the translated request actually carried an `image`
+/// block, so the asserted reply proves the image survived the pipeline
+/// (Anthropic inbound base64 block → canonical `image_url` data URL →
+/// Anthropic outbound base64 source block).
+#[tokio::test]
+async fn anthropic_multimodal_request_reaches_upstream_with_image() {
+    let mock_port = 19895;
+    let mock_base = format!("http://127.0.0.1:{mock_port}");
+    let _mock = mock_anthropic_upstream(mock_port).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (store, profile_id) = setup_vision_store(&mock_base, ProviderKind::Anthropic);
+    let app = create_app(test_state(store));
+
+    let req_body = serde_json::json!({
+        "model": "programmer/php-dev",
+        "max_tokens": 128,
+        "stream": false,
+        "messages": [{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "what is in this picture?" },
+                { "type": "image", "source": {
+                    "type": "base64", "media_type": "image/png", "data": "QUJD"
+                }}
+            ]
+        }]
+    });
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/anthropic/v1/messages")
+        .header("x-api-key", &profile_id)
+        .header("Content-Type", "application/json")
+        .body(axum::body::Body::from(req_body.to_string()))
+        .expect("build request");
+
+    let response = app.oneshot(request).await.expect("oneshot");
+    assert_eq!(response.status(), 200);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("parse json");
+    assert_eq!(
+        json["content"][0]["text"], "saw image",
+        "the upstream must have received the image block"
+    );
+    assert_eq!(json["stop_reason"], "end_turn");
 }

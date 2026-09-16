@@ -1,4 +1,4 @@
-//! Native multi-adapter inbound surfaces (Anthropic, Gemini, the namespaced
+//! Native multi-adapter inbound surfaces (Anthropic, Google, the namespaced
 //! OpenAI chat route, and the Responses API for the Codex CLI).
 //!
 //! Every handler here runs the same canonical pipeline:
@@ -9,8 +9,8 @@
 //! ```
 //!
 //! Streaming re-encodes each upstream SSE chunk into the inbound surface's own
-//! SSE framing, so a Claude or Gemini outbound stream is served to an OpenAI,
-//! Anthropic, Gemini, or Codex client correctly.
+//! SSE framing, so an Anthropic or Google outbound stream is served to an OpenAI,
+//! Anthropic, Google, or Codex client correctly.
 
 use axum::body::Bytes;
 use axum::extract::{Request, State};
@@ -31,7 +31,7 @@ use anyhow;
 /// Per-handler body size cap, mirroring the OpenAI handler.
 const BODY_LIMIT: usize = 5 * 1024 * 1024;
 
-/// OpenAI-compatible chat surface mounted under `/openai/v1/chat/completions`.
+/// OpenAI chat surface mounted under `/openai/v1/chat/completions`.
 pub async fn openai_chat(State(state): State<AppState>, req: Request) -> Response {
     native_chat(state, ApiKind::OpenAI, req).await
 }
@@ -41,7 +41,7 @@ pub async fn anthropic_messages(State(state): State<AppState>, req: Request) -> 
     native_chat(state, ApiKind::Anthropic, req).await
 }
 
-/// Gemini generateContent surface: `/google/v1beta/models/{model}:generateContent`
+/// Google generateContent surface: `/google/v1beta/models/{model}:generateContent`
 /// and `:streamGenerateContent` (both are wildcard-routed to this handler).
 pub async fn google_generate(State(state): State<AppState>, req: Request) -> Response {
     native_chat(state, ApiKind::Google, req).await
@@ -71,10 +71,10 @@ async fn native_chat(state: AppState, kind: ApiKind, req: Request) -> Response {
         Err(e) => return bad_request(format!("invalid request body: {e}")),
     };
 
-    // The Gemini SDK carries the model in the URL path, so the handler injects
+    // The Google SDK carries the model in the URL path, so the handler injects
     // it into the body before the adapter parses the request.
     if kind == ApiKind::Google {
-        if let Some(m) = model_from_gemini_path(parts.uri.path()) {
+        if let Some(m) = model_from_google_path(parts.uri.path()) {
             if let Some(obj) = body_value.as_object_mut() {
                 obj.insert("model".to_string(), serde_json::Value::String(m));
             }
@@ -86,7 +86,7 @@ async fn native_chat(state: AppState, kind: ApiKind, req: Request) -> Response {
         Err(e) => return bad_request(format!("invalid request body: {e}")),
     };
     // Derive capability needs from the canonical request (after native parsing),
-    // so Anthropic/Gemini text arrays are not mistaken for vision content.
+    // so Anthropic/Google text arrays are not mistaken for vision content.
     let canonical_value = serde_json::to_value(&chat_req).unwrap_or(serde_json::Value::Null);
     let needs = RequestNeeds::from_body(&canonical_value);
     if chat_req.stream {
@@ -96,9 +96,9 @@ async fn native_chat(state: AppState, kind: ApiKind, req: Request) -> Response {
     }
 }
 
-/// Extract the model name from a Gemini `models/{name}:{method}` path, decoding
+/// Extract the model name from a Google `models/{name}:{method}` path, decoding
 /// `%2F` so a `proxy/route` model can pass through the single path segment.
-fn model_from_gemini_path(path: &str) -> Option<String> {
+fn model_from_google_path(path: &str) -> Option<String> {
     let idx = path.find("models/")?;
     let rest = &path[idx + "models/".len()..];
     let model = rest.split(':').next()?.to_string();
@@ -419,7 +419,7 @@ pub async fn anthropic_models(State(state): State<AppState>, req: Request) -> Re
     }
 }
 
-/// List the routes a profile can reach, in the Gemini models response shape.
+/// List the routes a profile can reach, in the Google models response shape.
 pub async fn google_models(State(state): State<AppState>, req: Request) -> Response {
     let token = req
         .extensions()

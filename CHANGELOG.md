@@ -31,6 +31,17 @@ Anthropic, OpenAI Responses (Codex), and Gemini native endpoints.
 
 ### Added
 
+- **Vision passthrough:** multimodal chat requests (OpenAI parts arrays with
+  `text` + `image_url` entries) now keep their images end to end. The
+  Anthropic outbound adapter maps image parts to `image` blocks (`url` and
+  `base64` sources), the Google adapter maps them to Gemini `fileData` /
+  `inlineData` parts, and the Anthropic and Gemini inbound surfaces accept
+  their native image shapes and normalize them into the canonical parts array.
+  OpenAI/custom upstreams were already lossless and are unchanged; text-only
+  requests serialize byte-identically to before.
+- Failover for image-rejecting upstreams: a 4xx whose error message explicitly
+  refuses image/vision capability marks the route entry Unhealthy so the next
+  chain entry is tried. Other 4xx keep the existing no-demotion behavior.
 - Comprehensive documentation tree: README, architecture, configuration,
   security, API, providers, failover, development, deployment, workflow,
   contributing guide, and security policy.
@@ -47,6 +58,34 @@ Anthropic, OpenAI Responses (Codex), and Gemini native endpoints.
 - README reorganized into a structured document with quick start, architecture
   overview, command summary, request lifecycle, health model, routing strategies,
   security model, tech stack, and documentation index.
+
+### Fixed
+
+- Image-error classification no longer demotes healthy entries merely because
+  an unrelated 4xx mentions images or echoes image fields. Both request paths
+  now share a conservative capability-refusal classifier that inspects JSON
+  error messages rather than entire response bodies. Error text is extracted
+  from dedicated error fields only (`error.message`, a string `error`,
+  `message`, or `detail`), handling string, content-block array and object
+  shapes, so Anthropic and Gemini envelopes classify correctly. Rejections
+  about the payload rather than the model — unsupported media type/MIME,
+  unsupported image format, corrupt or undecodable data, oversized or
+  wrong-resolution images, download failures — no longer demote either.
+  Regression tests cover request echoes, corrupt images, model names, Unicode,
+  real upstream envelopes, and streaming health persistence; rate-limit and
+  server-error classifications are unchanged.
+- Provider-kind examples in the documentation, README, quick reference and the
+  docker-compose seed used `generic`, a tag the CLI has never accepted; the
+  binary's canonical tag is `openai`. Every example now matches the code, and
+  the stale `openai_compatible` references in `docs/configuration.md` and
+  `docs/providers.md` were corrected too. Before this fix, seeding the compose
+  stack failed with `unknown provider kind "generic"`.
+- `bootstrap` setup documents accept `"kind": "custom"` again (the alias
+  `provider add --kind custom` always accepted); it regressed out of the
+  bootstrap parser during the provider-kind rename.
+- New regression test asserts the provider kinds embedded in
+  `docker-compose.yml` are tags the CLI actually parses, so docs/config and
+  code cannot silently drift apart again.
 
 ## [0.1.1] - 2026-09-14
 

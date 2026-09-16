@@ -19,7 +19,7 @@ pub enum ProviderArgs {
         /// Name of the owning profile.
         #[arg(long)]
         profile: Option<String>,
-        /// Provider name (e.g. `openrouter`); triggers non-interactive mode
+        /// Provider name (e.g. `upstream`); triggers non-interactive mode
         /// when combined with `--base-url` and `--auth-token`.
         #[arg(long)]
         name: Option<String>,
@@ -29,7 +29,7 @@ pub enum ProviderArgs {
         /// Upstream API token.
         #[arg(long)]
         auth_token: Option<String>,
-        /// Provider kind (openai_compatible | anthropic | google | custom).
+        /// Provider kind (openai | openai_responses | anthropic | google | custom).
         #[arg(long)]
         kind: Option<String>,
         /// Free-text description.
@@ -158,12 +158,12 @@ fn add(
     let name: String = match name {
         Some(n) if !n.is_empty() => n,
         _ => Input::<String>::with_theme(&theme)
-            .with_prompt("Provider name (e.g. deepseek)")
+            .with_prompt("Provider name (e.g. upstream)")
             .interact_text()?,
     };
     let base_url: String = Input::<String>::with_theme(&theme)
         .with_prompt("Base URL")
-        .default("https://api.deepseek.com".into())
+        .default("https://api.example.com".into())
         .interact_text()?;
     let auth_token = crate::cli::util::prompt_token(&theme, "API token", false)?;
     let kind = pick_kind(&theme)?;
@@ -315,10 +315,12 @@ fn delete(
     Ok(())
 }
 
-/// Parse a provider-kind tag (`openai_compatible` | `anthropic` | `google` | `custom`).
+/// Parse a provider-kind tag (`openai` | `openai_responses` |
+/// `anthropic` | `google` | `custom`).
 fn parse_kind(raw: Option<&str>) -> Result<ProviderKind> {
-    match raw.unwrap_or("openai_compatible") {
-        "openai_compatible" => Ok(ProviderKind::OpenAICompatible),
+    match raw.unwrap_or("openai") {
+        "openai" => Ok(ProviderKind::OpenAI),
+        "openai_responses" => Ok(ProviderKind::OpenAIResponses),
         "custom" => Ok(ProviderKind::Custom),
         "anthropic" => Ok(ProviderKind::Anthropic),
         "google" => Ok(ProviderKind::Google),
@@ -328,7 +330,8 @@ fn parse_kind(raw: Option<&str>) -> Result<ProviderKind> {
 
 fn pick_kind(theme: &ColorfulTheme) -> Result<ProviderKind> {
     let kinds = [
-        ProviderKind::OpenAICompatible,
+        ProviderKind::OpenAI,
+        ProviderKind::OpenAIResponses,
         ProviderKind::Anthropic,
         ProviderKind::Google,
         ProviderKind::Custom,
