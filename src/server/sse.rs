@@ -179,6 +179,8 @@ pub fn frame_usage(kind: ProviderKind, json: &serde_json::Value) -> (Option<u64>
             let completion = usage.and_then(|u| u.get("completion_tokens")).and_then(num);
             (prompt, completion)
         }
+        // Never reached in-stream: Responses upstreams are served non-streamed.
+        ProviderKind::OpenAIResponses => (None, None),
         ProviderKind::Anthropic => match json.get("type").and_then(|t| t.as_str()) {
             Some("message_start") => (
                 json.pointer("/message/usage/input_tokens").and_then(num),

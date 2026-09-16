@@ -969,6 +969,8 @@ async fn pump_stream(
                         // for us to inject.
                         first_chunk = false;
                     }
+                    // Never reached: Responses upstreams are served non-streamed.
+                    ProviderKind::OpenAIResponses => {}
                     ProviderKind::Anthropic | ProviderKind::Google => {
                         if let Some(ev) = crate::adapter::outbound::parse_stream_chunk(kind, raw) {
                             if let Some(chunk) =

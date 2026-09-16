@@ -19,6 +19,7 @@ pub fn kind_label(kind: &crate::domain::ProviderKind) -> &'static str {
         crate::domain::ProviderKind::OpenAICompatible => "OpenAI-compatible",
         crate::domain::ProviderKind::Anthropic => "Anthropic",
         crate::domain::ProviderKind::Google => "Google (Gemini)",
+        crate::domain::ProviderKind::OpenAIResponses => "OpenAI Responses",
         crate::domain::ProviderKind::Custom => "Custom",
     }
 }

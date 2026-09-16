@@ -47,6 +47,7 @@ fn provider_kind_tag(k: ProviderKind) -> &'static str {
         ProviderKind::OpenAICompatible => "openai",
         ProviderKind::Anthropic => "anthropic",
         ProviderKind::Google => "google",
+        ProviderKind::OpenAIResponses => "openai_responses",
         ProviderKind::Custom => "custom",
     }
 }
@@ -56,6 +57,7 @@ fn provider_kind_from_tag(tag: &str) -> Result<ProviderKind> {
         "openai" => Ok(ProviderKind::OpenAICompatible),
         "anthropic" => Ok(ProviderKind::Anthropic),
         "google" => Ok(ProviderKind::Google),
+        "openai_responses" => Ok(ProviderKind::OpenAIResponses),
         "custom" => Ok(ProviderKind::Custom),
         _ => bail!("unknown provider kind tag {tag:?}"),
     }
@@ -1300,6 +1302,37 @@ pub type CacheHit = (Vec<u8>, Option<i64>, Option<i64>);
 mod tests {
     use super::*;
     use crate::domain::{ProviderKind, RoutingStrategy};
+
+    #[test]
+    fn provider_kind_tags_roundtrip_through_the_db() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let profile = store.create_profile("kinds", None, None)?;
+        let kinds = [
+            (ProviderKind::OpenAICompatible, "openai"),
+            (ProviderKind::Anthropic, "anthropic"),
+            (ProviderKind::Google, "google"),
+            (ProviderKind::OpenAIResponses, "openai_responses"),
+            (ProviderKind::Custom, "custom"),
+        ];
+        for (i, (kind, tag)) in kinds.iter().enumerate() {
+            store.create_provider(
+                profile.id.as_str(),
+                NewProvider {
+                    name: format!("p{i}"),
+                    description: None,
+                    base_url: "https://up.test".to_string(),
+                    auth_token: "tok".to_string(),
+                    kind: *kind,
+                    extra_headers: Default::default(),
+                },
+            )?;
+            let listed = store.list_providers(profile.id.as_str())?;
+            let stored = listed.iter().find(|p| p.name == format!("p{i}")).unwrap();
+            assert_eq!(stored.kind, *kind, "kind must survive the roundtrip");
+            assert_eq!(provider_kind_tag(stored.kind), *tag);
+        }
+        Ok(())
+    }
 
     #[test]
     fn rpm_limit_roundtrip_and_unknown_profile() -> Result<()> {

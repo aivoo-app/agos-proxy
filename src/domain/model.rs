@@ -37,6 +37,10 @@ pub enum ProviderKind {
     OpenAICompatible,
     Anthropic,
     Google,
+    /// OpenAI *Responses* API (`POST {base}/v1/responses`). Some models (e.g.
+    /// Zen muse-*) only serve this endpoint; chat requests are translated on
+    /// the way out and the reply is reshaped back into chat-completion form.
+    OpenAIResponses,
     Custom,
 }
 
