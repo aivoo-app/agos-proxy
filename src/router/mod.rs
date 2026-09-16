@@ -283,18 +283,24 @@ where
     }
 
     let mut last_error = None;
-    // (target, upstream status code if the attempt carried one). The status
-    // drives the demotion classification below.
-    let mut failures: Vec<(Target, Option<i64>)> = Vec::new();
+    // (target, upstream status code if the attempt carried one, upstream error
+    // message). Both drive the demotion classification below.
+    let mut failures: Vec<(Target, Option<i64>, String)> = Vec::new();
     for target in &targets {
         match timeout(attempt_timeout, attempt_fn(target.clone())).await {
             Ok(Ok(bytes)) => return Ok(bytes),
             Ok(Err(e)) => {
-                let status = e
-                    .downcast_ref::<crate::adapter::outbound::ProviderError>()
-                    .map(|pe| pe.status.as_u16() as i64);
+                let provider_err = e.downcast_ref::<crate::adapter::outbound::ProviderError>();
+                let status = provider_err.map(|pe| pe.status.as_u16() as i64);
+                // anyhow's Display only shows the outer context, so the raw
+                // upstream body (which names images on a rejection) must come
+                // from the downcast. Transport failures fall back to the error
+                // string.
+                let message = provider_err
+                    .map(|pe| pe.body.clone())
+                    .unwrap_or_else(|| e.to_string());
                 last_error = Some(e);
-                failures.push((target.clone(), status));
+                failures.push((target.clone(), status, message));
                 tracing::warn!(
                     provider = %target.provider.name,
                     model = %target.entry.model_id,
@@ -305,7 +311,7 @@ where
                 last_error = Some(anyhow::anyhow!(
                     "attempt timed out after {attempt_timeout:?}"
                 ));
-                failures.push((target.clone(), None));
+                failures.push((target.clone(), None, "upstream timeout".to_string()));
                 tracing::warn!(
                     provider = %target.provider.name,
                     model = %target.entry.model_id,
@@ -319,9 +325,11 @@ where
     // provider-side failures (5xx, transport errors, timeouts, 429 as
     // Degraded) take an entry out of rotation. Client-side 4xx that originate
     // from the translated request body would otherwise take a perfectly
-    // healthy chain dark on a single malformed request.
-    for (target, status_code) in &failures {
-        if let Some(status) = demote_status_for(*status_code) {
+    // healthy chain dark on a single malformed request — unless the upstream
+    // names images in its rejection, which means the upstream cannot serve
+    // vision requests at all and it should be skipped for them.
+    for (target, status_code, message) in &failures {
+        if let Some(status) = demote_status_for(*status_code, message) {
             let _ = store.set_route_entry_status(target.entry.id, status);
         }
     }
@@ -334,15 +342,30 @@ where
 
 /// Classify a failure status into a demotion decision. Provider-side failures
 /// demote the entry (429 only Degraded, everything else Unhealthy); client-side
-/// 4xx that originates from the translated request body itself never demotes.
-/// Failures without a known status (transport errors, timeouts) are treated as
-/// provider-side.
-fn demote_status_for(status_code: Option<i64>) -> Option<ModelStatus> {
+/// 4xx that originates from the translated request body itself never demotes —
+/// except a 4xx whose error message names images/vision, meaning the upstream
+/// cannot serve image requests at all. Failures without a known status
+/// (transport errors, timeouts) are treated as provider-side.
+fn demote_status_for(status_code: Option<i64>, message: &str) -> Option<ModelStatus> {
     match status_code {
         Some(429) => Some(ModelStatus::Degraded),
-        Some(c) if (400..500).contains(&c) => None,
+        Some(c) if (400..500).contains(&c) => {
+            if image_rejection(message) {
+                Some(ModelStatus::Unhealthy)
+            } else {
+                None
+            }
+        }
         _ => Some(ModelStatus::Unhealthy),
     }
+}
+
+/// Whether an upstream error message reads like an image/vision rejection
+/// (e.g. "image input not supported by this model"). Matched ASCII-
+/// case-insensitively so "Image", "IMAGE" and "image" all hit.
+fn image_rejection(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("image") || lower.contains("vision")
 }
 
 #[cfg(test)]
@@ -747,6 +770,44 @@ mod tests {
             {"type": "text", "text": "line two"}
         ]);
         assert_eq!(content_text(&arr), "line one\nline two");
+    }
+
+    #[test]
+    fn image_rejecting_4xx_demotes_but_plain_4xx_does_not() {
+        // An upstream that names images in its rejection cannot serve vision
+        // requests, so the entry is taken out of rotation for them.
+        assert_eq!(
+            demote_status_for(
+                Some(400),
+                r#"{"error":{"message":"image input not supported"}}"#
+            ),
+            Some(ModelStatus::Unhealthy)
+        );
+        assert_eq!(
+            demote_status_for(Some(415), "unsupported media type for vision input"),
+            Some(ModelStatus::Unhealthy)
+        );
+        // Matching is ASCII-case-insensitive.
+        assert_eq!(
+            demote_status_for(Some(404), "Model does not support IMAGE input"),
+            Some(ModelStatus::Unhealthy)
+        );
+
+        // Everything else about the old classification is unchanged.
+        assert_eq!(demote_status_for(Some(400), "invalid temperature"), None);
+        assert_eq!(demote_status_for(Some(422), "request too large"), None);
+        assert_eq!(
+            demote_status_for(Some(429), "rate limited"),
+            Some(ModelStatus::Degraded)
+        );
+        assert_eq!(
+            demote_status_for(Some(500), "boom"),
+            Some(ModelStatus::Unhealthy)
+        );
+        assert_eq!(
+            demote_status_for(None, "transport failure"),
+            Some(ModelStatus::Unhealthy)
+        );
     }
 
     #[tokio::test]

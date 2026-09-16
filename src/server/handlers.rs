@@ -525,15 +525,21 @@ async fn handle_streaming(
                     return sse_response_from_completion(&completion);
                 }
                 Err(e) => {
-                    let status = e
-                        .downcast_ref::<crate::adapter::outbound::ProviderError>()
-                        .map(|pe| pe.status.as_u16() as i32);
+                    // anyhow's Display only shows the outer context, so the
+                    // raw upstream body (which names images on a rejection)
+                    // must come from the downcast. Format it the same way the
+                    // streaming branch does so classification sees it too.
+                    let provider_err = e.downcast_ref::<crate::adapter::outbound::ProviderError>();
+                    let status = provider_err.map(|pe| pe.status.as_u16() as i32);
+                    let message = provider_err
+                        .map(|pe| format!("provider returned {}: {}", pe.status, pe.body))
+                        .unwrap_or_else(|| e.to_string());
                     fail_stream_attempt(
                         &store,
                         &profile_id,
                         &target,
                         status,
-                        e.to_string(),
+                        message,
                         started_at.elapsed().as_millis() as i64,
                     );
                     continue;
@@ -835,13 +841,30 @@ async fn probe_stream(idle_timeout: Duration, resp: reqwest::Response) -> Probe 
 
 /// Classify a failure status into a demotion decision. Provider-side failures
 /// demote the entry (429 only Degraded, everything else Unhealthy); client-side
-/// 4xx that originates from the translated request body itself never demotes.
-fn demote_status_for(code: Option<i64>) -> Option<crate::domain::ModelStatus> {
+/// 4xx that originates from the translated request body itself never demotes —
+/// except a 4xx whose error message names images/vision, meaning the upstream
+/// cannot serve image requests at all. Failures without a known status
+/// (transport errors, timeouts) are treated as provider-side.
+fn demote_status_for(code: Option<i64>, message: &str) -> Option<crate::domain::ModelStatus> {
     match code {
         Some(429) => Some(crate::domain::ModelStatus::Degraded),
-        Some(c) if (400..500).contains(&c) => None,
+        Some(c) if (400..500).contains(&c) => {
+            if image_rejection(message) {
+                Some(crate::domain::ModelStatus::Unhealthy)
+            } else {
+                None
+            }
+        }
         _ => Some(crate::domain::ModelStatus::Unhealthy),
     }
+}
+
+/// Whether an upstream error message reads like an image/vision rejection
+/// (e.g. "image input not supported by this model"). Matched ASCII-
+/// case-insensitively so "Image", "IMAGE" and "image" all hit.
+fn image_rejection(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("image") || lower.contains("vision")
 }
 
 /// Log one failed streaming attempt and demote the entry per the failure
@@ -860,12 +883,12 @@ fn fail_stream_attempt(
         target,
         false,
         status_code,
-        Some(message),
+        Some(message.clone()),
         latency_ms,
         None,
         None,
     );
-    if let Some(status) = demote_status_for(status_code.map(|c| c as i64)) {
+    if let Some(status) = demote_status_for(status_code.map(|c| c as i64), &message) {
         let _ = store.set_route_entry_status(target.entry.id, status);
     }
 }
@@ -1709,6 +1732,35 @@ mod economy_tests {
         assert_eq!(
             cache_hash("p", "prog/r", &base),
             cache_hash("p", "prog/r", &esc)
+        );
+    }
+
+    #[test]
+    fn image_rejecting_4xx_demotes_the_streaming_entry() {
+        use crate::domain::ModelStatus;
+
+        // An upstream that names images in its rejection cannot serve vision
+        // requests, so the entry is taken out of rotation for them.
+        assert_eq!(
+            demote_status_for(
+                Some(400),
+                r#"{"error":{"message":"image input not supported"}}"#
+            ),
+            Some(ModelStatus::Unhealthy)
+        );
+        // Everything else about the old classification is unchanged.
+        assert_eq!(demote_status_for(Some(400), "invalid temperature"), None);
+        assert_eq!(
+            demote_status_for(Some(429), "rate limited"),
+            Some(ModelStatus::Degraded)
+        );
+        assert_eq!(
+            demote_status_for(Some(503), "overloaded"),
+            Some(ModelStatus::Unhealthy)
+        );
+        assert_eq!(
+            demote_status_for(None, "upstream timeout"),
+            Some(ModelStatus::Unhealthy)
         );
     }
 }
