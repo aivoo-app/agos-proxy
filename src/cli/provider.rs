@@ -29,7 +29,7 @@ pub enum ProviderArgs {
         /// Upstream API token.
         #[arg(long)]
         auth_token: Option<String>,
-        /// Provider kind (openai_compatible | anthropic | google | custom).
+        /// Provider kind (openai_compatible | openai_responses | anthropic | google | custom).
         #[arg(long)]
         kind: Option<String>,
         /// Free-text description.
@@ -315,10 +315,12 @@ fn delete(
     Ok(())
 }
 
-/// Parse a provider-kind tag (`openai_compatible` | `anthropic` | `google` | `custom`).
+/// Parse a provider-kind tag (`openai_compatible` | `openai_responses` |
+/// `anthropic` | `google` | `custom`).
 fn parse_kind(raw: Option<&str>) -> Result<ProviderKind> {
     match raw.unwrap_or("openai_compatible") {
         "openai_compatible" => Ok(ProviderKind::OpenAICompatible),
+        "openai_responses" => Ok(ProviderKind::OpenAIResponses),
         "custom" => Ok(ProviderKind::Custom),
         "anthropic" => Ok(ProviderKind::Anthropic),
         "google" => Ok(ProviderKind::Google),
@@ -329,6 +331,7 @@ fn parse_kind(raw: Option<&str>) -> Result<ProviderKind> {
 fn pick_kind(theme: &ColorfulTheme) -> Result<ProviderKind> {
     let kinds = [
         ProviderKind::OpenAICompatible,
+        ProviderKind::OpenAIResponses,
         ProviderKind::Anthropic,
         ProviderKind::Google,
         ProviderKind::Custom,

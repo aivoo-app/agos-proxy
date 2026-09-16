@@ -574,6 +574,17 @@ fn pick_entry(
     Ok(entries[idx].clone())
 }
 
+fn provider_label(store: &crate::storage::Store, id: i64) -> Result<String> {
+    match store.get_provider(id)? {
+        Some(p) => Ok(format!(
+            "{} ({})",
+            p.name,
+            crate::cli::util::kind_label(&p.kind)
+        )),
+        None => Ok("(unknown)".to_string()),
+    }
+}
+
 fn provider_name(store: &crate::storage::Store, id: i64) -> Result<String> {
     match store.get_provider(id)? {
         Some(p) => Ok(p.name.clone()),
@@ -768,13 +779,13 @@ fn status(store: &crate::storage::Store, route_name: Option<String>) -> Result<(
         route.name, proxy.name, route.strategy, route.max_tokens, route.cache_ttl_secs
     );
     println!(
-        "{:<5} {:<6} {:<8} {:<24} {:<24} {:<8} PRICE",
+        "{:<5} {:<6} {:<8} {:<24} {:<40} {:<8} PRICE",
         "PRI", "ID", "STATUS", "MODEL", "PROVIDER", "WEIGHT"
     );
     for e in entries {
-        let provider_name = provider_name(store, e.provider_id)?;
+        let provider_name = provider_label(store, e.provider_id)?;
         println!(
-            "{:<5} {:<6} {:<8} {:<24} {:<24} {:<8} ${}/1M",
+            "{:<5} {:<6} {:<8} {:<24} {:<40} {:<8} ${}/1M",
             e.priority,
             e.id,
             status_label(&e.status),

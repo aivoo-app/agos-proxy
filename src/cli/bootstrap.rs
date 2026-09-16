@@ -168,6 +168,7 @@ fn default_capabilities() -> CapabilitiesSpec {
 fn parse_kind(raw: Option<&str>) -> Result<ProviderKind> {
     match raw.unwrap_or("openai_compatible") {
         "openai_compatible" | "custom" => Ok(ProviderKind::OpenAICompatible),
+        "openai_responses" => Ok(ProviderKind::OpenAIResponses),
         "anthropic" => Ok(ProviderKind::Anthropic),
         "google" => Ok(ProviderKind::Google),
         other => bail!("unknown provider kind {other:?}"),
@@ -326,6 +327,10 @@ mod tests {
         assert!(matches!(
             parse_kind(Some("google")),
             Ok(ProviderKind::Google)
+        ));
+        assert!(matches!(
+            parse_kind(Some("openai_responses")),
+            Ok(ProviderKind::OpenAIResponses)
         ));
         assert!(parse_kind(Some("nope")).is_err());
     }
