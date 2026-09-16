@@ -57,7 +57,7 @@ src/
 ├── crypto/          secrets at rest (ChaCha20-Poly1305 + Argon2id)
 ├── adapter/         modular API adapters, master registry (ApiKind)
 │   ├── inbound/     per-surface inbound: openai, anthropic, google
-│   └── outbound/    per-provider outbound: openai, anthropic, google
+│   └── outbound/    per-provider outbound: openai, anthropic, google, responses
 ├── translator/      canonical request/response model (no provider logic)
 └── bin/
     └── gen-docs     developer-only: man pages, completions, CLI markdown
@@ -110,6 +110,7 @@ outbound adapter that shapes requests and decodes responses.
 | Variant              | Use case                                              |
 |----------------------|-------------------------------------------------------|
 | `OpenAICompatible`  | Most providers; request/response pass through.        |
+| `OpenAIResponses`   | Responses-only upstreams (`POST /v1/responses`), e.g. Zen muse-*. |
 | `Anthropic`         | Native `/v1/messages` translation.                    |
 | `Google`            | Native Gemini `generateContent` translation.          |
 | `Custom`            | Reserved for future native integrations.              |

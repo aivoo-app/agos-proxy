@@ -121,7 +121,7 @@ tree.
 | `description`  | no       | string    | Free-text.                                               |
 | `base_url`     | yes      | string    | Upstream base URL.                                       |
 | `auth_token`   | yes      | string    | Upstream API token; stored encrypted at rest.           |
-| `kind`         | no       | string    | One of `openai_compatible`, `anthropic`, `google`.      |
+| `kind`         | no       | string    | One of `openai_compatible`, `openai_responses`, `anthropic`, `google`. |
 | `extra_headers`| no       | object    | Extra headers sent with every upstream request.         |
 
 Defaults: `kind` = `openai_compatible`; `extra_headers` = `{}`.

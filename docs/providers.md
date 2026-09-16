@@ -12,6 +12,7 @@ interprets the response after receiving it.
 | Kind                  | Protocol                     | Notes                                              |
 |-----------------------|------------------------------|-----------------------------------------------------|
 | `OpenAICompatible`  | OpenAI REST (pass-through)   | Most providers: DeepSeek, OpenRouter, Ollama, etc. |
+| `OpenAIResponses`   | OpenAI Responses (`/v1/responses`) | Responses-only models (e.g. Zen muse-* free tiers). |
 | `Anthropic`          | Anthropic `/v1/messages`     | Native translation of chat completions.            |
 | `Google`             | Gemini `generateContent`     | Native translation of chat completions.            |
 | `Custom`             | Reserved for future use      | Not implemented yet.                               |
@@ -202,6 +203,44 @@ Route entry:
   when the base URL and provider kind indicate Google.
 - Streaming is supported through the Gemini streaming endpoint.
 - Token usage is reported as Google returns it.
+
+## OpenAI Responses upstreams
+
+Some models — notably the Zen `muse-*` free tiers — only serve the OpenAI
+*Responses* endpoint (`POST {base}/v1/responses`) and reject
+`/v1/chat/completions`. Create the provider with
+`provider add --kind openai_responses` (same base URL, Bearer token and
+repeatable `--header` support as `openai_compatible`).
+
+How a chat request is served:
+
+- The transcript is flattened into a single `input` string
+  (`role: content` lines, in order).
+- `temperature` and `top_p` are passed through; `max_tokens` /
+  `max_completion_tokens` map to `max_output_tokens`.
+- `tools`, `tool_choice` and `response_format` are dropped with a debug log
+  (tool calling over Responses is a future feature).
+- The reply's `output[]` items are walked for `message` entries and the
+  `output_text`/`text` parts are joined into the assistant message. If the
+  reply carries no assistant text (e.g. reasoning-only output), the attempt
+  fails and the router falls over to the next chain entry.
+- Token usage is reported only when the upstream sends `input_tokens` /
+  `output_tokens`; nothing is fabricated.
+
+**Streaming:** the Responses adapter serves `stream: true` requests from the
+non-streamed answer, wrapped into a minimal OpenAI SSE stream (content chunk,
+`stop` chunk, `[DONE]`) so standard OpenAI SDK clients keep working.
+
+### Zen setup example
+
+```console
+$ agos-proxy provider add --profile coder1 --name zen \
+    --base-url https://api.zen.ai \
+    --auth-token sk-zen-... \
+    --kind openai_responses
+$ agos-proxy route entry add --proxy programmer --route php-dev \
+    --provider zen --model muse-spark-x-contributor-free --priority 1
+```
 
 ## Provider-specific headers and auth styles
 
