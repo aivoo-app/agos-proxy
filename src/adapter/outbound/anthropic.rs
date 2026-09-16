@@ -11,7 +11,7 @@ use anyhow::{Context as _, Result};
 use super::normalize_base;
 use crate::domain::ProviderKind;
 use crate::router::Target;
-use crate::translator::{content_text, ChatRequest};
+use crate::translator::{content_parts, content_text, parse_data_url, ChatRequest, ContentPart};
 
 /// Build the upstream URL for an Anthropic request.
 pub fn build_url(target: &Target) -> String {
@@ -39,11 +39,13 @@ pub fn translate_request(chat_req: &ChatRequest, model_id: &str) -> serde_json::
             if !system_text.is_empty() {
                 system_text.push('\n');
             }
+            // Anthropic system prompts are text-only; image parts there are
+            // dropped (see [`message_content`] for the message-level mapping).
             system_text.push_str(&content_text(&msg.content));
         } else {
             messages.push(serde_json::json!({
                 "role": msg.role,
-                "content": content_text(&msg.content),
+                "content": message_content(&msg.content),
             }));
         }
     }
@@ -78,6 +80,52 @@ pub fn translate_request(chat_req: &ChatRequest, model_id: &str) -> serde_json::
     }
 
     body
+}
+
+/// Rebuild an Anthropic message `content` value from the canonical content.
+///
+/// Text-only content stays a plain JSON string, so a text-only request
+/// serializes byte-identically to the pre-vision behavior. Content carrying
+/// image parts becomes an ordered block array: text parts map to `text`
+/// blocks and image parts map to `image` blocks — `source.type = "url"` for
+/// `http(s)://` references and `source.type = "base64"` for `data:` URLs.
+fn message_content(content: &serde_json::Value) -> serde_json::Value {
+    let has_image = content_parts(content)
+        .iter()
+        .any(|p| matches!(p, ContentPart::Image { .. }));
+    if !has_image {
+        return serde_json::Value::String(content_text(content));
+    }
+
+    let blocks: Vec<serde_json::Value> = content_parts(content)
+        .into_iter()
+        .map(|p| match p {
+            ContentPart::Text(text) => serde_json::json!({ "type": "text", "text": text }),
+            ContentPart::Image { url } => image_block(&url),
+        })
+        .collect();
+    serde_json::Value::Array(blocks)
+}
+
+/// Map one canonical image onto an Anthropic `image` block. A `data:` URL is
+/// split into its MIME type and base64 payload; anything else is passed as a
+/// URL reference for the provider to resolve (or reject — the failure
+/// classifies the entry and fails over, see `demote_status_for`).
+fn image_block(url: &str) -> serde_json::Value {
+    if let Some(data) = parse_data_url(url) {
+        return serde_json::json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": data.mime,
+                "data": data.data,
+            },
+        });
+    }
+    serde_json::json!({
+        "type": "image",
+        "source": { "type": "url", "url": url },
+    })
 }
 
 /// Translate an Anthropic messages response back into OpenAI format.
@@ -206,6 +254,79 @@ pub fn parse_stream_chunk(data: &str) -> Option<crate::translator::StreamEvent> 
 
 pub fn is_supported(_kind: ProviderKind) -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::translator::Message;
+
+    fn chat(messages: Vec<Message>) -> ChatRequest {
+        ChatRequest {
+            model: "prog/route".into(),
+            messages,
+            stream: false,
+            extra: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn text_only_request_keeps_string_content() {
+        // No image parts: content must remain a plain JSON string, exactly as
+        // before the vision passthrough existed.
+        let body = translate_request(
+            &chat(vec![
+                Message::text("system", "be terse"),
+                Message::text("user", "hi"),
+            ]),
+            "model-id",
+        );
+        assert_eq!(body["system"], "be terse");
+        assert!(body["messages"][0]["content"].is_string());
+        assert_eq!(body["messages"][0]["content"], "hi");
+    }
+
+    #[test]
+    fn image_url_parts_map_to_anthropic_blocks() {
+        let body = translate_request(
+            &chat(vec![Message::new(
+                "user",
+                serde_json::json!([
+                    {"type": "text", "text": "what is this"},
+                    {"type": "image_url", "image_url": {"url": "https://x/cat.png"}},
+                ]),
+            )]),
+            "model-id",
+        );
+        let content = &body["messages"][0]["content"];
+        assert!(content.is_array());
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "what is this");
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["source"]["type"], "url");
+        assert_eq!(content[1]["source"]["url"], "https://x/cat.png");
+    }
+
+    #[test]
+    fn data_url_image_maps_to_a_base64_source_block() {
+        let body = translate_request(
+            &chat(vec![Message::new(
+                "user",
+                serde_json::json!([
+                    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,QUJD"}},
+                    {"type": "text", "text": "describe"},
+                ]),
+            )]),
+            "model-id",
+        );
+        let content = &body["messages"][0]["content"];
+        assert_eq!(content[0]["type"], "image");
+        assert_eq!(content[0]["source"]["type"], "base64");
+        assert_eq!(content[0]["source"]["media_type"], "image/jpeg");
+        assert_eq!(content[0]["source"]["data"], "QUJD");
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "describe");
+    }
 }
 
 #[cfg(test)]

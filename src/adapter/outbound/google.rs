@@ -11,7 +11,9 @@ use anyhow::{Context as _, Result};
 use super::normalize_base;
 use crate::domain::ProviderKind;
 use crate::router::Target;
-use crate::translator::{content_text, ChatRequest};
+use crate::translator::{
+    content_parts, content_text, infer_image_mime, parse_data_url, ChatRequest, ContentPart,
+};
 
 /// Build the upstream URL for a Google request. The API key goes in the query
 /// string, so the target's auth token is appended there.
@@ -46,6 +48,45 @@ fn google_role(role: &str) -> &'static str {
     }
 }
 
+/// Rebuild a Google `parts` array from the canonical message content.
+///
+/// Text-only content yields a single text part, so a text-only request
+/// serializes byte-identically to the pre-vision behavior. Content carrying
+/// image parts yields ordered parts: text parts keep their `text` field and
+/// image parts become `fileData` (`http(s)://` references) or `inlineData`
+/// (`data:` URLs).
+fn google_parts(content: &serde_json::Value) -> Vec<serde_json::Value> {
+    let has_image = content_parts(content)
+        .iter()
+        .any(|p| matches!(p, ContentPart::Image { .. }));
+    if !has_image {
+        return vec![serde_json::json!({ "text": content_text(content) })];
+    }
+
+    content_parts(content)
+        .into_iter()
+        .map(|p| match p {
+            ContentPart::Text(text) => serde_json::json!({ "text": text }),
+            ContentPart::Image { url } => image_part(&url),
+        })
+        .collect()
+}
+
+/// Map one canonical image onto a Google content part. A `data:` URL is split
+/// into its MIME type and base64 payload; anything else is passed as a
+/// `fileData` URI (which requires a publicly resolvable URL) with the MIME
+/// type inferred from the file extension.
+fn image_part(url: &str) -> serde_json::Value {
+    if let Some(data) = parse_data_url(url) {
+        return serde_json::json!({
+            "inlineData": { "mimeType": data.mime, "data": data.data },
+        });
+    }
+    serde_json::json!({
+        "fileData": { "mimeType": infer_image_mime(url), "fileUri": url },
+    })
+}
+
 /// Translate an OpenAI chat request into a Google generateContent body.
 pub fn translate_request(chat_req: &ChatRequest) -> serde_json::Value {
     let mut system_parts: Vec<serde_json::Value> = Vec::new();
@@ -53,12 +94,14 @@ pub fn translate_request(chat_req: &ChatRequest) -> serde_json::Value {
 
     for msg in &chat_req.messages {
         if msg.role == "system" {
+            // systemInstruction is text-only; image parts there are dropped
+            // (see [`google_parts`] for the message-level mapping).
             system_parts.push(serde_json::json!({ "text": content_text(&msg.content) }));
             continue;
         }
         contents.push(serde_json::json!({
             "role": google_role(&msg.role),
-            "parts": [{ "text": content_text(&msg.content) }],
+            "parts": google_parts(&msg.content),
         }));
     }
 
@@ -261,6 +304,64 @@ mod tests {
         assert_eq!(body["contents"][1]["role"], "model");
         assert_eq!(body["generationConfig"]["temperature"], 0.5);
         assert_eq!(body["generationConfig"]["maxOutputTokens"], 128);
+    }
+
+    #[test]
+    fn text_only_request_keeps_a_single_text_part() {
+        let chat = ChatRequest {
+            model: "prog/route".into(),
+            messages: vec![Message::text("user", "hi")],
+            stream: false,
+            extra: serde_json::Value::Null,
+        };
+        let body = translate_request(&chat);
+        assert_eq!(
+            body["contents"][0]["parts"],
+            serde_json::json!([{ "text": "hi" }])
+        );
+    }
+
+    #[test]
+    fn image_url_parts_map_to_file_data() {
+        let chat = ChatRequest {
+            model: "prog/route".into(),
+            messages: vec![Message::new(
+                "user",
+                serde_json::json!([
+                    {"type": "text", "text": "what is this"},
+                    {"type": "image_url", "image_url": {"url": "https://x/cat.png"}},
+                ]),
+            )],
+            stream: false,
+            extra: serde_json::Value::Null,
+        };
+        let body = translate_request(&chat);
+        let parts = &body["contents"][0]["parts"];
+        assert_eq!(parts[0]["text"], "what is this");
+        assert_eq!(parts[1]["fileData"]["fileUri"], "https://x/cat.png");
+        assert_eq!(parts[1]["fileData"]["mimeType"], "image/png");
+        assert!(parts[1].get("inlineData").is_none());
+    }
+
+    #[test]
+    fn data_url_image_maps_to_inline_data() {
+        let chat = ChatRequest {
+            model: "prog/route".into(),
+            messages: vec![Message::new(
+                "user",
+                serde_json::json!([
+                    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,QUJD"}},
+                    {"type": "text", "text": "describe"},
+                ]),
+            )],
+            stream: false,
+            extra: serde_json::Value::Null,
+        };
+        let body = translate_request(&chat);
+        let parts = &body["contents"][0]["parts"];
+        assert_eq!(parts[0]["inlineData"]["mimeType"], "image/jpeg");
+        assert_eq!(parts[0]["inlineData"]["data"], "QUJD");
+        assert_eq!(parts[1]["text"], "describe");
     }
 
     #[test]
