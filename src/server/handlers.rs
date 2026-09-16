@@ -458,156 +458,153 @@ async fn handle_streaming(
     chat_req: ChatRequest,
 ) -> Response {
     let model = chat_req.model.clone();
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(16);
     let store = state.store.clone();
     let attempt_timeout = state.attempt_timeout;
     let client = state.http_client.clone();
 
-    tokio::spawn(async move {
-        let targets = match resolve_targets_with_strategy(
-            &store,
-            &profile_id,
-            &model,
-            needs,
-            &state.routing_state,
-        ) {
-            Ok(t) if t.is_empty() => {
-                let _ = tx
-                    .send(Err(std::io::Error::other(
-                        "no healthy providers available for this route",
-                    )))
-                    .await;
-                return;
+    // Try each upstream in sequence to establish a successful HTTP connection
+    let targets = match resolve_targets_with_strategy(
+        &store,
+        &profile_id,
+        &model,
+        needs,
+        &state.routing_state,
+    ) {
+        Ok(t) if t.is_empty() => {
+            return service_unavailable("no healthy providers available for this route");
+        }
+        Ok(t) => t,
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("no proxy named") || msg.contains("no route named") {
+                return not_found(format!("model not found: {msg}"));
+            } else if msg.contains("must be in") {
+                return bad_request(msg);
+            } else {
+                return bad_request(format!("route resolution failed: {msg}"));
             }
-            Ok(t) => t,
+        }
+    };
+
+    // Find the first working upstream: send the request for real and only
+    // commit to the 200 SSE response once an upstream answers 2xx. Failed
+    // attempts are logged and the next target is tried, so the client never
+    // receives a 200 that carries no data.
+    let mut working: Option<(crate::router::Target, reqwest::Response, std::time::Instant)> = None;
+
+    for target in targets {
+        let started_at = std::time::Instant::now();
+        let req = match translate_and_forward_streaming(&client, &target, &chat_req).await {
+            Ok(r) => r,
             Err(e) => {
-                let msg = e.to_string();
-                let err_msg = if msg.contains("no proxy named") || msg.contains("no route named") {
-                    format!("model not found: {msg}")
-                } else if msg.contains("must be in") {
-                    msg
-                } else {
-                    format!("route resolution failed: {msg}")
-                };
-                let _ = tx.send(Err(std::io::Error::other(err_msg))).await;
-                return;
+                tracing::warn!(err = %e, "translate request failed, trying next");
+                continue;
             }
         };
-        for target in targets {
-            let req = {
-                let target = target.clone();
-                translate_and_forward_streaming(&client, &target, &chat_req).await
-            };
-            match req {
-                Ok(stream_req) => {
-                    let started = std::time::Instant::now();
-                    let resp =
-                        match tokio::time::timeout(attempt_timeout, client.execute(stream_req))
-                            .await
-                        {
-                            Ok(Ok(r)) => r,
-                            Ok(Err(e)) => {
-                                let _ = tx
-                                    .send(Err(std::io::Error::other(format!(
-                                        "upstream failed: {e}"
-                                    ))))
-                                    .await;
-                                log_attempt(
-                                    &store,
-                                    &profile_id,
-                                    &target,
-                                    true,
-                                    &Err(anyhow::anyhow!("upstream failed: {e}")),
-                                    started.elapsed().as_millis() as i64,
-                                );
-                                continue;
-                            }
-                            Err(_) => {
-                                let _ = tx
-                                    .send(Err(std::io::Error::other("upstream timeout")))
-                                    .await;
-                                log_attempt(
-                                    &store,
-                                    &profile_id,
-                                    &target,
-                                    true,
-                                    &Err(anyhow::anyhow!("upstream timeout")),
-                                    started.elapsed().as_millis() as i64,
-                                );
-                                continue;
-                            }
-                        };
 
-                    if !resp.status().is_success() {
-                        let status = resp.status();
-                        let bytes = resp.bytes().await.unwrap_or_default();
-                        let _ = tx
-                            .send(Err(std::io::Error::other(format!(
-                                "provider returned {}: {}",
-                                status,
-                                String::from_utf8_lossy(&bytes)
-                            ))))
-                            .await;
-                        log_attempt(
-                            &store,
-                            &profile_id,
-                            &target,
-                            true,
-                            &Err(anyhow::anyhow!(
-                                "provider returned {}: {}",
-                                status,
-                                String::from_utf8_lossy(&bytes)
-                            )),
-                            started.elapsed().as_millis() as i64,
-                        );
-                        continue;
+        match tokio::time::timeout(attempt_timeout, client.execute(req)).await {
+            Ok(Ok(resp)) if resp.status().is_success() => {
+                // Found a working upstream; keep the response and stream it.
+                working = Some((target, resp, started_at));
+                break;
+            }
+            Ok(Ok(resp)) => {
+                // Non-success status, log and try the next target.
+                let status = resp.status();
+                let bytes = resp.bytes().await.unwrap_or_default();
+                log_attempt(
+                    &store,
+                    &profile_id,
+                    &target,
+                    true,
+                    &Err(anyhow::anyhow!(
+                        "provider returned {}: {}",
+                        status,
+                        String::from_utf8_lossy(&bytes)
+                    )),
+                    started_at.elapsed().as_millis() as i64,
+                );
+            }
+            Ok(Err(e)) => {
+                // Upstream connection failed.
+                log_attempt(
+                    &store,
+                    &profile_id,
+                    &target,
+                    true,
+                    &Err(anyhow::anyhow!("upstream failed: {e}")),
+                    started_at.elapsed().as_millis() as i64,
+                );
+            }
+            Err(_) => {
+                // Upstream timed out.
+                log_attempt(
+                    &store,
+                    &profile_id,
+                    &target,
+                    true,
+                    &Err(anyhow::anyhow!("upstream timeout")),
+                    started_at.elapsed().as_millis() as i64,
+                );
+            }
+        }
+    }
+
+    // If no working upstream was found, fail before any 200 is sent.
+    let Some((target, resp, started)) = working else {
+        let error_response = serde_json::json!({
+            "error": {
+                "message": "All upstream providers failed",
+                "type": "provider_error",
+                "code": 502,
+            }
+        });
+        return Response::builder()
+            .status(axum::http::StatusCode::BAD_GATEWAY)
+            .header("Content-Type", "application/json")
+            .body(axum::body::Body::from(error_response.to_string()))
+            .unwrap();
+    };
+
+    // A working upstream is confirmed: stream its response body to the client.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(16);
+    let store_clone = store.clone();
+    let profile_id_clone = profile_id.clone();
+
+    tokio::spawn(async move {
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    if tx.send(Ok(bytes)).await.is_err() {
+                        return;
                     }
-
-                    let mut stream = resp.bytes_stream();
-                    while let Some(chunk) = stream.next().await {
-                        match chunk {
-                            Ok(bytes) => {
-                                if tx.send(Ok(bytes)).await.is_err() {
-                                    return;
-                                }
-                            }
-                            Err(e) => {
-                                let _ = tx
-                                    .send(Err(std::io::Error::other(format!("stream error: {e}"))))
-                                    .await;
-                                log_attempt(
-                                    &store,
-                                    &profile_id,
-                                    &target,
-                                    true,
-                                    &Err(anyhow::anyhow!("stream error: {e}")),
-                                    started.elapsed().as_millis() as i64,
-                                );
-                                return;
-                            }
-                        }
-                    }
-
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(std::io::Error::other(format!("stream error: {e}"))))
+                        .await;
                     log_attempt(
-                        &store,
-                        &profile_id,
+                        &store_clone,
+                        &profile_id_clone,
                         &target,
                         true,
-                        &Ok(Vec::new()),
+                        &Err(anyhow::anyhow!("stream error: {e}")),
                         started.elapsed().as_millis() as i64,
                     );
                     return;
                 }
-                Err(e) => {
-                    let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
-                    tracing::warn!(err = %e, "translate request failed, trying next");
-                    continue;
-                }
             }
         }
-        let _ = tx
-            .send(Err(std::io::Error::other("all providers failed")))
-            .await;
+
+        log_attempt(
+            &store_clone,
+            &profile_id_clone,
+            &target,
+            true,
+            &Ok(Vec::new()),
+            started.elapsed().as_millis() as i64,
+        );
     });
 
     let body = axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
@@ -763,92 +760,58 @@ async fn handle_completion_streaming(
         }
     };
 
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+    // Try each upstream in sequence to establish a successful HTTP connection
     let store = state.store.clone();
     let attempt_timeout = state.attempt_timeout;
     let client = state.http_client.clone();
 
-    tokio::spawn(async move {
-        for target in targets {
-            let started = std::time::Instant::now();
-            let req = completion_req.clone();
-            let base = target.provider.base_url.trim_end_matches('/');
-            let url = format!("{base}/v1/completions");
+    // Find the first working upstream: send the request for real and only
+    // commit to the 200 SSE response once an upstream answers 2xx.
+    let mut working: Option<(crate::router::Target, reqwest::Response, std::time::Instant)> = None;
 
-            let mut body = match serde_json::to_value(&req) {
-                Ok(b) => b,
-                Err(e) => {
-                    let _ = tx
-                        .send(Err(std::io::Error::other(format!(
-                            "serialization failed: {e}"
-                        ))))
-                        .await;
-                    continue;
-                }
-            };
-            if let Some(obj) = body.as_object_mut() {
-                obj.insert(
-                    "model".to_string(),
-                    serde_json::Value::String(target.entry.model_id.clone()),
-                );
+    for target in targets {
+        let started_at = std::time::Instant::now();
+        let base = target.provider.base_url.trim_end_matches('/');
+        let url = format!("{base}/v1/completions");
+
+        let mut body = match serde_json::to_value(&completion_req) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(err = %e, "serialization failed, trying next");
+                continue;
             }
+        };
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert(
+                "model".to_string(),
+                serde_json::Value::String(target.entry.model_id.clone()),
+            );
+        }
 
-            let resp_result = tokio::time::timeout(
-                attempt_timeout,
-                client
-                    .post(&url)
-                    .header(
-                        "Authorization",
-                        format!("Bearer {}", target.provider.auth_token),
-                    )
-                    .header("Content-Type", "application/json")
-                    .json(&body)
-                    .send(),
-            )
-            .await;
+        let resp_result = tokio::time::timeout(
+            attempt_timeout,
+            client
+                .post(&url)
+                .header(
+                    "Authorization",
+                    format!("Bearer {}", target.provider.auth_token),
+                )
+                .header("Content-Type", "application/json")
+                .json(&body)
+                .send(),
+        )
+        .await;
 
-            let resp = match resp_result {
-                Ok(Ok(r)) => r,
-                Ok(Err(e)) => {
-                    let _ = tx
-                        .send(Err(std::io::Error::other(format!("upstream failed: {e}"))))
-                        .await;
-                    log_attempt(
-                        &store,
-                        &profile_id,
-                        &target,
-                        true,
-                        &Err(anyhow::anyhow!("upstream failed: {e}")),
-                        started.elapsed().as_millis() as i64,
-                    );
-                    continue;
-                }
-                Err(_) => {
-                    let _ = tx
-                        .send(Err(std::io::Error::other("upstream timeout")))
-                        .await;
-                    log_attempt(
-                        &store,
-                        &profile_id,
-                        &target,
-                        true,
-                        &Err(anyhow::anyhow!("upstream timeout")),
-                        started.elapsed().as_millis() as i64,
-                    );
-                    continue;
-                }
-            };
-
-            if !resp.status().is_success() {
+        match resp_result {
+            Ok(Ok(resp)) if resp.status().is_success() => {
+                // Found a working upstream; keep the response and stream it.
+                working = Some((target, resp, started_at));
+                break;
+            }
+            Ok(Ok(resp)) => {
+                // Non-success status, log and try the next target.
                 let status = resp.status();
                 let bytes = resp.bytes().await.unwrap_or_default();
-                let _ = tx
-                    .send(Err(std::io::Error::other(format!(
-                        "provider returned {}: {}",
-                        status,
-                        String::from_utf8_lossy(&bytes)
-                    ))))
-                    .await;
                 log_attempt(
                     &store,
                     &profile_id,
@@ -859,41 +822,89 @@ async fn handle_completion_streaming(
                         status,
                         String::from_utf8_lossy(&bytes)
                     )),
-                    started.elapsed().as_millis() as i64,
+                    started_at.elapsed().as_millis() as i64,
                 );
-                continue;
             }
+            Ok(Err(e)) => {
+                // Upstream connection failed.
+                log_attempt(
+                    &store,
+                    &profile_id,
+                    &target,
+                    true,
+                    &Err(anyhow::anyhow!("upstream failed: {e}")),
+                    started_at.elapsed().as_millis() as i64,
+                );
+            }
+            Err(_) => {
+                // Upstream timed out.
+                log_attempt(
+                    &store,
+                    &profile_id,
+                    &target,
+                    true,
+                    &Err(anyhow::anyhow!("upstream timeout")),
+                    started_at.elapsed().as_millis() as i64,
+                );
+            }
+        }
+    }
 
-            let mut stream = resp.bytes_stream();
-            while let Some(chunk) = stream.next().await {
-                match chunk {
-                    Ok(bytes) => {
-                        if tx.send(Ok(bytes)).await.is_err() {
-                            return;
-                        }
-                    }
-                    Err(e) => {
-                        let _ = tx
-                            .send(Err(std::io::Error::other(format!("stream error: {e}"))))
-                            .await;
+    // If no working upstream was found, fail before any 200 is sent.
+    let Some((target, resp, started)) = working else {
+        let error_response = serde_json::json!({
+            "error": {
+                "message": "All upstream providers failed",
+                "type": "provider_error",
+                "code": 502,
+            }
+        });
+        return Response::builder()
+            .status(axum::http::StatusCode::BAD_GATEWAY)
+            .header("Content-Type", "application/json")
+            .body(axum::body::Body::from(error_response.to_string()))
+            .unwrap();
+    };
+
+    // A working upstream is confirmed: stream its response body to the client.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+    let store_clone = store.clone();
+    let profile_id_clone = profile_id.clone();
+
+    tokio::spawn(async move {
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    if tx.send(Ok(bytes)).await.is_err() {
                         return;
                     }
                 }
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(std::io::Error::other(format!("stream error: {e}"))))
+                        .await;
+                    log_attempt(
+                        &store_clone,
+                        &profile_id_clone,
+                        &target,
+                        true,
+                        &Err(anyhow::anyhow!("stream error: {e}")),
+                        started.elapsed().as_millis() as i64,
+                    );
+                    return;
+                }
             }
-
-            log_attempt(
-                &store,
-                &profile_id,
-                &target,
-                true,
-                &Ok(Vec::new()),
-                started.elapsed().as_millis() as i64,
-            );
-            return;
         }
-        let _ = tx
-            .send(Err(std::io::Error::other("all providers failed")))
-            .await;
+
+        log_attempt(
+            &store_clone,
+            &profile_id_clone,
+            &target,
+            true,
+            &Ok(Vec::new()),
+            started.elapsed().as_millis() as i64,
+        );
     });
 
     let body = axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
