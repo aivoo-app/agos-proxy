@@ -125,6 +125,56 @@ fn test_state(store: Store) -> AppState {
     }
 }
 
+/// Start a mock Anthropic `/v1/messages` upstream that reports whether the
+/// translated request actually carried an `image` block — the multimodal
+/// passthrough test asserts on the answer, proving the image reached upstream.
+async fn mock_anthropic_upstream(port: u16) -> tokio::task::JoinHandle<()> {
+    let app = axum::Router::new().route(
+        "/v1/messages",
+        axum::routing::post(|body: axum::Json<serde_json::Value>| async move {
+            let saw_image = body
+                .0
+                .get("messages")
+                .and_then(|m| m.as_array())
+                .map(|msgs| {
+                    msgs.iter().any(|m| {
+                        m.get("content")
+                            .and_then(|c| c.as_array())
+                            .map(|blocks| {
+                                blocks.iter().any(|b| {
+                                    b.get("type").and_then(|t| t.as_str()) == Some("image")
+                                })
+                            })
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false);
+            let text = if saw_image { "saw image" } else { "no image" };
+            let resp = serde_json::json!({
+                "id": "msg_mock",
+                "type": "message",
+                "role": "assistant",
+                "model": "mock-model",
+                "content": [{ "type": "text", "text": text }],
+                "stop_reason": "end_turn",
+                "stop_sequence": null,
+                "usage": { "input_tokens": 1, "output_tokens": 1 }
+            });
+            (
+                axum::http::StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                resp.to_string(),
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
+        .await
+        .expect("bind mock anthropic upstream");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    })
+}
+
 fn setup_store(base_url: &str) -> (Store, String) {
     setup_store_kind(base_url, ProviderKind::OpenAI)
 }
@@ -132,6 +182,17 @@ fn setup_store(base_url: &str) -> (Store, String) {
 /// Same tree as [`setup_store`], but the provider is created with the given
 /// kind — used by the OpenAI Responses upstream tests.
 fn setup_store_kind(base_url: &str, kind: ProviderKind) -> (Store, String) {
+    setup_store_inner(base_url, kind, false)
+}
+
+/// Same tree again, but the route entry advertises the vision capability —
+/// required by the multimodal passthrough test, whose request carries an
+/// image part that the capability filter would otherwise route away.
+fn setup_vision_store(base_url: &str, kind: ProviderKind) -> (Store, String) {
+    setup_store_inner(base_url, kind, true)
+}
+
+fn setup_store_inner(base_url: &str, kind: ProviderKind, vision: bool) -> (Store, String) {
     let store = Store::open_in_memory().expect("open in-memory store");
     let profile = store
         .create_profile("coder1", Some("test profile"), None)
@@ -170,7 +231,7 @@ fn setup_store_kind(base_url: &str, kind: ProviderKind) -> (Store, String) {
             1.0,
             RouteCapabilities {
                 tools: true,
-                vision: false,
+                vision,
                 json_mode: false,
                 max_context: None,
             },
@@ -913,4 +974,55 @@ async fn responses_upstream_failure_fails_over_to_next_entry() {
         json["choices"][0]["message"]["content"], "hello from mock",
         "the fallback entry must have served the request"
     );
+}
+
+/// A multimodal request sent to the Anthropic surface must reach an Anthropic
+/// upstream with the image intact. The mock upstream answers differently
+/// depending on whether the translated request actually carried an `image`
+/// block, so the asserted reply proves the image survived the pipeline
+/// (Anthropic inbound base64 block → canonical `image_url` data URL →
+/// Anthropic outbound base64 source block).
+#[tokio::test]
+async fn anthropic_multimodal_request_reaches_upstream_with_image() {
+    let mock_port = 19895;
+    let mock_base = format!("http://127.0.0.1:{mock_port}");
+    let _mock = mock_anthropic_upstream(mock_port).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (store, profile_id) = setup_vision_store(&mock_base, ProviderKind::Anthropic);
+    let app = create_app(test_state(store));
+
+    let req_body = serde_json::json!({
+        "model": "programmer/php-dev",
+        "max_tokens": 128,
+        "stream": false,
+        "messages": [{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "what is in this picture?" },
+                { "type": "image", "source": {
+                    "type": "base64", "media_type": "image/png", "data": "QUJD"
+                }}
+            ]
+        }]
+    });
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/anthropic/v1/messages")
+        .header("x-api-key", &profile_id)
+        .header("Content-Type", "application/json")
+        .body(axum::body::Body::from(req_body.to_string()))
+        .expect("build request");
+
+    let response = app.oneshot(request).await.expect("oneshot");
+    assert_eq!(response.status(), 200);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("parse json");
+    assert_eq!(
+        json["content"][0]["text"], "saw image",
+        "the upstream must have received the image block"
+    );
+    assert_eq!(json["stop_reason"], "end_turn");
 }
