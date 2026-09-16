@@ -6,6 +6,27 @@ This project adheres to [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and uses the Rust ecosystem convention of a `semver`-compatible version in
 `Cargo.toml` mirrored by `src/lib.rs`.
 
+## [0.1.3] - 2026-09-16
+
+### Fixed
+
+- Streaming requests (`stream: true`) now fail over correctly across
+  upstreams. Previously the proxy committed to a `200 OK` + SSE response
+  before contacting any upstream; when the first upstreams failed (e.g.
+  413/429), clients received an empty chunked stream that terminated
+  abruptly (`incomplete chunked read`). Streaming handlers now probe each
+  upstream with the real request and only return the event-stream response
+  once an upstream answers `2xx`, streaming the already-obtained response
+  body without re-sending the request.
+- When every upstream fails for a streaming request, the proxy now returns
+  a proper `502 Bad Gateway` JSON error before any response is sent,
+  instead of closing an empty stream.
+- Streaming requests no longer hit the chosen upstream twice (probe +
+  re-send); the confirmed response is streamed directly.
+
+Affected surfaces: OpenAI chat completions, legacy `/v1/completions`,
+Anthropic, OpenAI Responses (Codex), and Gemini native endpoints.
+
 ## [Unreleased]
 
 ### Added
