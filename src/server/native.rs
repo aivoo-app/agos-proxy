@@ -26,6 +26,7 @@ use crate::server::handlers::{
     AppState,
 };
 use crate::translator::{ChatRequest, StreamEvent};
+use anyhow;
 
 /// Per-handler body size cap, mirroring the OpenAI handler.
 const BODY_LIMIT: usize = 5 * 1024 * 1024;
@@ -203,150 +204,161 @@ async fn chat_stream(
     chat_req: ChatRequest,
 ) -> Response {
     let model = chat_req.model.clone();
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(16);
     let store = state.store.clone();
     let attempt_timeout = state.attempt_timeout;
     let client = state.http_client.clone();
     let routing_state = state.routing_state.clone();
 
-    tokio::spawn(async move {
-        let targets =
-            match resolve_targets_with_strategy(&store, &profile_id, &model, needs, &routing_state)
-            {
-                Ok(t) if t.is_empty() => {
-                    let _ = tx
-                        .send(Err(std::io::Error::other(
-                            "no healthy providers available for this route",
-                        )))
-                        .await;
-                    return;
-                }
-                Ok(t) => t,
-                Err(e) => {
-                    let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
-                    return;
-                }
-            };
-
-        for target in targets {
-            let started = std::time::Instant::now();
-            let req = chat_req.clone();
-            // One renderer per attempt: the Responses surface accumulates text
-            // and tool arguments, and that state must not leak into a retry.
-            let mut renderer = state.adapter.stream_renderer(kind);
-            let (url, headers, body) = match outbound::build_upstream_request(&target, &req, true) {
-                Ok(v) => v,
-                Err(e) => {
-                    let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
-                    continue;
-                }
-            };
-            let mut request = client.post(&url);
-            for (k, v) in &headers {
-                request = request.header(k, v);
+    // Try each upstream in sequence to establish a successful HTTP connection
+    let targets =
+        match resolve_targets_with_strategy(&store, &profile_id, &model, needs, &routing_state) {
+            Ok(t) if t.is_empty() => {
+                return service_unavailable("no healthy providers available for this route");
             }
-            let resp = match tokio::time::timeout(attempt_timeout, request.json(&body).send()).await
-            {
-                Ok(Ok(r)) => r,
-                Ok(Err(e)) => {
-                    let _ = tx
-                        .send(Err(std::io::Error::other(format!("upstream failed: {e}"))))
-                        .await;
-                    log_attempt(
-                        &store,
-                        &profile_id,
-                        &target,
-                        true,
-                        &Err(anyhow::anyhow!("upstream failed: {e}")),
-                        started.elapsed().as_millis() as i64,
-                    );
-                    continue;
-                }
-                Err(_) => {
-                    let _ = tx
-                        .send(Err(std::io::Error::other("upstream timeout")))
-                        .await;
-                    log_attempt(
-                        &store,
-                        &profile_id,
-                        &target,
-                        true,
-                        &Err(anyhow::anyhow!("upstream timeout")),
-                        started.elapsed().as_millis() as i64,
-                    );
-                    continue;
-                }
-            };
+            Ok(t) => t,
+            Err(e) => {
+                return bad_request(format!("route resolution failed: {e}"));
+            }
+        };
 
-            if !resp.status().is_success() {
+    // Find the first working upstream: send the request for real and only
+    // commit to the 200 SSE response once an upstream answers 2xx.
+    let mut working: Option<(Target, reqwest::Response, std::time::Instant)> = None;
+
+    for target in targets {
+        let started_at = std::time::Instant::now();
+        // One renderer per attempt: the Responses surface accumulates text
+        // and tool arguments, and that state must not leak into a retry.
+        let _renderer = state.adapter.stream_renderer(kind);
+        let (url, headers, body) = match outbound::build_upstream_request(&target, &chat_req, true)
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(err = %e, "build upstream request failed, trying next");
+                continue;
+            }
+        };
+        let mut request = client.post(&url);
+        for (k, v) in &headers {
+            request = request.header(k, v);
+        }
+
+        match tokio::time::timeout(attempt_timeout, request.json(&body).send()).await {
+            Ok(Ok(resp)) if resp.status().is_success() => {
+                // Found a working upstream; keep the response and stream it.
+                working = Some((target, resp, started_at));
+                break;
+            }
+            Ok(Ok(resp)) => {
+                // Non-success status, log and try the next target.
                 let status = resp.status();
                 let _bytes = resp.bytes().await.unwrap_or_default();
                 let msg = format!("provider returned {status}");
-                let _ = tx.send(Err(std::io::Error::other(msg.clone()))).await;
                 log_attempt(
                     &store,
                     &profile_id,
                     &target,
                     true,
                     &Err(anyhow::anyhow!("{msg}")),
-                    started.elapsed().as_millis() as i64,
+                    started_at.elapsed().as_millis() as i64,
                 );
-                continue;
             }
+            Ok(Err(e)) => {
+                // Upstream connection failed.
+                log_attempt(
+                    &store,
+                    &profile_id,
+                    &target,
+                    true,
+                    &Err(anyhow::anyhow!("upstream failed: {e}")),
+                    started_at.elapsed().as_millis() as i64,
+                );
+            }
+            Err(_) => {
+                // Upstream timed out.
+                log_attempt(
+                    &store,
+                    &profile_id,
+                    &target,
+                    true,
+                    &Err(anyhow::anyhow!("upstream timeout")),
+                    started_at.elapsed().as_millis() as i64,
+                );
+            }
+        }
+    }
 
-            let mut stream = resp.bytes_stream();
-            let mut buf = String::new();
-            let mut saw_terminal = false;
-            while let Some(chunk) = stream.next().await {
-                match chunk {
-                    Ok(bytes) => {
-                        buf.push_str(&String::from_utf8_lossy(&bytes));
-                        while let Some(pos) = buf.find('\n') {
-                            let line = buf.drain(..=pos).collect::<String>();
-                            if let Some((frame, done)) =
-                                decode_line(&target, &line, renderer.as_mut())
-                            {
-                                saw_terminal |= done;
-                                let _ = tx.send(Ok(Bytes::from(frame))).await;
-                            }
+    // If no working upstream was found, fail before any 200 is sent.
+    let Some((target, resp, started)) = working else {
+        let error_response = serde_json::json!({
+            "error": {
+                "message": "All upstream providers failed",
+                "type": "provider_error",
+                "code": 502,
+            }
+        });
+        return Response::builder()
+            .status(axum::http::StatusCode::BAD_GATEWAY)
+            .header("Content-Type", "application/json")
+            .body(axum::body::Body::from(error_response.to_string()))
+            .unwrap();
+    };
+
+    // A working upstream is confirmed: stream its SSE lines through the
+    // surface renderer.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(16);
+    let store_clone = store.clone();
+    let profile_id_clone = profile_id.clone();
+
+    tokio::spawn(async move {
+        let mut renderer = state.adapter.stream_renderer(kind);
+        let mut stream = resp.bytes_stream();
+        let mut buf = String::new();
+        let mut saw_terminal = false;
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    buf.push_str(&String::from_utf8_lossy(&bytes));
+                    while let Some(pos) = buf.find('\n') {
+                        let line = buf.drain(..=pos).collect::<String>();
+                        if let Some((frame, done)) = decode_line(&target, &line, renderer.as_mut())
+                        {
+                            saw_terminal |= done;
+                            let _ = tx.send(Ok(Bytes::from(frame))).await;
                         }
                     }
-                    Err(e) => {
-                        let _ = tx
-                            .send(Err(std::io::Error::other(format!("stream error: {e}"))))
-                            .await;
-                        return;
-                    }
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(std::io::Error::other(format!("stream error: {e}"))))
+                        .await;
+                    return;
                 }
             }
-            // Flush any trailing partial line.
-            if !saw_terminal {
-                if let Some((frame, done)) = decode_line(&target, &buf, renderer.as_mut()) {
-                    let _ = tx.send(Ok(Bytes::from(frame))).await;
-                    saw_terminal |= done;
-                }
-            }
-            // A surface that needs a closing frame (OpenAI's `data: [DONE]`, or
-            // the Responses API's mandatory `response.completed`) gets its
-            // chance here, when the upstream ended without a terminal event.
-            if !saw_terminal {
-                if let Some(marker) = renderer.finish("chatcmpl-agos") {
-                    let _ = tx.send(Ok(Bytes::from(marker))).await;
-                }
-            }
-            log_attempt(
-                &store,
-                &profile_id,
-                &target,
-                true,
-                &Ok(Vec::new()),
-                started.elapsed().as_millis() as i64,
-            );
-            return;
         }
-        let _ = tx
-            .send(Err(std::io::Error::other("all providers failed")))
-            .await;
+        // Flush any trailing partial line.
+        if !saw_terminal {
+            if let Some((frame, done)) = decode_line(&target, &buf, renderer.as_mut()) {
+                let _ = tx.send(Ok(Bytes::from(frame))).await;
+                saw_terminal |= done;
+            }
+        }
+        // A surface that needs a closing frame (OpenAI's `data: [DONE]`, or
+        // the Responses API's mandatory `response.completed`) gets its
+        // chance here, when the upstream ended without a terminal event.
+        if !saw_terminal {
+            if let Some(marker) = renderer.finish("chatcmpl-agos") {
+                let _ = tx.send(Ok(Bytes::from(marker))).await;
+            }
+        }
+        log_attempt(
+            &store_clone,
+            &profile_id_clone,
+            &target,
+            true,
+            &Ok(Vec::new()),
+            started.elapsed().as_millis() as i64,
+        );
     });
 
     let body = axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
