@@ -64,9 +64,16 @@ Anthropic, OpenAI Responses (Codex), and Gemini native endpoints.
 - Image-error classification no longer demotes healthy entries merely because
   an unrelated 4xx mentions images or echoes image fields. Both request paths
   now share a conservative capability-refusal classifier that inspects JSON
-  error messages rather than entire response bodies. Regression tests cover
-  request echoes, corrupt images, model names, Unicode, and streaming health
-  persistence; rate-limit and server-error classifications are unchanged.
+  error messages rather than entire response bodies. Error text is extracted
+  from dedicated error fields only (`error.message`, a string `error`,
+  `message`, or `detail`), handling string, content-block array and object
+  shapes, so Anthropic and Gemini envelopes classify correctly. Rejections
+  about the payload rather than the model — unsupported media type/MIME,
+  unsupported image format, corrupt or undecodable data, oversized or
+  wrong-resolution images, download failures — no longer demote either.
+  Regression tests cover request echoes, corrupt images, model names, Unicode,
+  real upstream envelopes, and streaming health persistence; rate-limit and
+  server-error classifications are unchanged.
 - Provider-kind examples in the documentation, README, quick reference and the
   docker-compose seed used `generic`, a tag the CLI has never accepted; the
   binary's canonical tag is `openai`. Every example now matches the code, and

@@ -40,12 +40,17 @@ An entry is marked unhealthy when a live request hits any of:
 - A response that fails schema validation (the upstream returned something the
   translator could not parse).
 - An HTTP 4xx whose error message explicitly refuses image/vision capability
-  (e.g. "image input not supported" or "this model does not support images").
-  Streaming and non-streaming requests use the same classifier. JSON errors
-  are checked only in `error.message`, a string `error`, or `message`, not in
-  echoed request fields. Image decoding/download errors, unsupported image
-  formats, and unrelated errors mentioning `image_url` do not demote entries.
-  Matching is conservative; unfamiliar rejection wording may not demote.
+  (e.g. "image input not supported", "this model does not support images", or
+  Gemini's "Unable to process the provided image input"). Streaming and
+  non-streaming requests use the same classifier. Error text is read only from
+  dedicated error fields (`error.message`, a string `error`, `message`, or
+  `detail`; string, content-block array, and object shapes are all handled),
+  never from echoed request fields. Rejections that are a property of the
+  payload rather than the model — unsupported media type/MIME, unsupported
+  image format, corrupt or undecodable data, oversized or wrong-resolution
+  images, download failures — do not demote, and neither does an unrelated 4xx
+  that merely mentions or echoes `image_url`. Matching is conservative;
+  unfamiliar rejection wording may not demote.
   A confirmed capability rejection marks the **whole entry** Unhealthy (not
   just its vision capability) until recovery. Other 4xx never demote.
 

@@ -361,20 +361,75 @@ pub(crate) fn demote_status_for(status_code: Option<i64>, message: &str) -> Opti
 }
 
 /// Recognize explicit capability refusals, not arbitrary mentions of images.
-/// For JSON envelopes, inspect only the error message, never request echoes.
+/// For JSON envelopes, inspect only the dedicated error field, never request
+/// echoes.
 fn image_rejection(message: &str) -> bool {
-    let parsed = serde_json::from_str::<serde_json::Value>(message).ok();
-    let message = match parsed.as_ref() {
-        Some(value) => value
-            .pointer("/error/message")
-            .and_then(serde_json::Value::as_str)
-            .or_else(|| value.get("error").and_then(serde_json::Value::as_str))
-            .or_else(|| value.get("message").and_then(serde_json::Value::as_str))
-            .unwrap_or(""),
-        None => message,
+    let Some(text) = error_text(message) else {
+        return false;
     };
-    let lower = message.to_ascii_lowercase();
+    let lower = text.to_ascii_lowercase();
     let normalized = lower.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // A rejection aimed at one file's encoding, size or transfer is a property
+    // of the payload, not a missing model capability: the upstream may accept
+    // the next image just fine, and non-image traffic must not be affected.
+    const PAYLOAD_SPECIFIC: [&str; 12] = [
+        "media type",
+        "mime",
+        "file format",
+        "image format",
+        "vision format",
+        "too large",
+        "corrupt",
+        "decode",
+        "download",
+        "dimensions",
+        "resolution",
+        "aspect ratio",
+    ];
+    if PAYLOAD_SPECIFIC
+        .iter()
+        .any(|qualifier| normalized.contains(qualifier))
+    {
+        return false;
+    }
+
+    // Strong signal: "image input" and friends name the modality capability
+    // itself. A request echo carries `image_url`, never "image input", and we
+    // already read only the dedicated error field, so any refusal wording in
+    // the same message is enough. This catches Gemini's
+    // "Unable to process the provided image input".
+    const INPUT_TOKENS: [&str; 4] = [
+        "image input",
+        "image inputs",
+        "vision input",
+        "multimodal input",
+    ];
+    const REFUSALS_ANYWHERE: [&str; 11] = [
+        "not supported",
+        "unsupported",
+        "not able to",
+        "unable to",
+        "cannot",
+        "can't",
+        "does not support",
+        "do not support",
+        "doesn't support",
+        "does not accept",
+        "doesn't accept",
+    ];
+    if INPUT_TOKENS
+        .iter()
+        .any(|token| contains_phrase(&normalized, token))
+        && REFUSALS_ANYWHERE
+            .iter()
+            .any(|refusal| normalized.contains(refusal))
+    {
+        return true;
+    }
+
+    // Precise pairs, for phrasings that never say "input" (e.g. "images are
+    // not supported", "this model does not support images").
     const REFUSALS: [&str; 5] = [
         "does not support",
         "do not support",
@@ -382,15 +437,7 @@ fn image_rejection(message: &str) -> bool {
         "does not accept",
         "doesn't accept",
     ];
-    const MODALITIES: [&str; 7] = [
-        "image",
-        "images",
-        "image input",
-        "image inputs",
-        "vision",
-        "vision input",
-        "multimodal input",
-    ];
+    const MODALITIES: [&str; 5] = ["image", "images", "vision", "vision inputs", "multimodal"];
     MODALITIES.iter().any(|modality| {
         REFUSALS
             .iter()
@@ -405,6 +452,54 @@ fn image_rejection(message: &str) -> bool {
             .iter()
             .any(|suffix| contains_phrase(&normalized, &format!("{modality} {suffix}")))
     })
+}
+
+/// Pull the human-readable error out of an upstream body. Only dedicated error
+/// fields are read — never arbitrary request-echo fields — and `message` may be
+/// a plain string, an array of `{"type":"text","text":…}` blocks, or an object
+/// carrying `text`. Bodies that are already plain text or a bare JSON string
+/// are used as-is.
+fn error_text(body: &str) -> Option<String> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return Some(body.to_string());
+    };
+    match &parsed {
+        serde_json::Value::String(s) => Some(s.clone()),
+        _ => ["/error/message", "/error", "/message", "/detail"]
+            .iter()
+            .find_map(|pointer| parsed.pointer(pointer).and_then(value_text)),
+    }
+}
+
+/// Extract text from a value that may be a string, an array of content blocks,
+/// or an object carrying `text`.
+fn value_text(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Object(map) => map
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        serde_json::Value::Array(items) => {
+            let parts: Vec<&str> = items.iter().filter_map(value_text_ref).collect();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join(" "))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn value_text_ref(value: &serde_json::Value) -> Option<&str> {
+    value
+        .as_str()
+        .or_else(|| value.get("text").and_then(serde_json::Value::as_str))
 }
 
 /// Do not match modality words inside model names or request-field names.
@@ -862,6 +957,65 @@ mod tests {
                 Some(ModelStatus::Unhealthy),
                 "{message}"
             );
+        }
+    }
+
+    #[test]
+    fn image_rejection_handles_real_upstream_error_envelopes() {
+        // Anthropic: {"type":"error","error":{"type":…,"message":…}}
+        assert_eq!(
+            demote_status_for(
+                Some(400),
+                r#"{"type":"error","error":{"type":"invalid_request_error","message":"This model does not support image input."}}"#
+            ),
+            Some(ModelStatus::Unhealthy)
+        );
+        // Google/Gemini: refusal wording is "unable to process".
+        assert_eq!(
+            demote_status_for(
+                Some(400),
+                r#"{"error":{"code":400,"message":"Unable to process the provided image input.","status":"INVALID_ARGUMENT"}}"#
+            ),
+            Some(ModelStatus::Unhealthy)
+        );
+        // `message` as an array of content blocks.
+        assert_eq!(
+            demote_status_for(
+                Some(400),
+                r#"{"error":{"message":[{"type":"text","text":"images are not supported"}]}}"#
+            ),
+            Some(ModelStatus::Unhealthy)
+        );
+        // A bare JSON string body.
+        assert_eq!(
+            demote_status_for(Some(400), r#""images are not supported""#),
+            Some(ModelStatus::Unhealthy)
+        );
+        // Non-standard top-level `detail` field.
+        assert_eq!(
+            demote_status_for(Some(400), r#"{"detail":"images are not supported"}"#),
+            Some(ModelStatus::Unhealthy)
+        );
+        // An array with no extractable text is not evidence of a capability gap.
+        assert_eq!(
+            demote_status_for(Some(400), r#"{"error":{"message":[{"foo":"bar"}]}}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn payload_specific_image_errors_do_not_demote() {
+        // The upstream can take images; this particular file is the problem.
+        for message in [
+            "unsupported media type for vision input",
+            "unsupported image format: use PNG",
+            "image dimensions exceed the maximum resolution",
+            "Unsupported MIME type: image/webp",
+            "unable to decode image data",
+            "request payload too large",
+        ] {
+            assert_eq!(demote_status_for(Some(415), message), None, "{message}");
+            assert_eq!(demote_status_for(Some(400), message), None, "{message}");
         }
     }
 
