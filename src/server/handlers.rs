@@ -502,6 +502,45 @@ async fn handle_streaming(
 
     for target in targets {
         let started_at = std::time::Instant::now();
+
+        // Responses-kind upstreams have no streaming endpoint in v1: the
+        // request is served from the non-streamed answer, wrapped into a
+        // minimal OpenAI SSE stream. A failure here behaves exactly like any
+        // other attempt failure — logged, classified, and the next entry in
+        // the chain is tried.
+        if target.provider.kind == crate::domain::ProviderKind::OpenAIResponses {
+            match forward_responses_attempt(&client, &target, &chat_req, attempt_timeout).await {
+                Ok((completion, prompt_tokens, completion_tokens)) => {
+                    log_stream_outcome(
+                        &store,
+                        &profile_id,
+                        &target,
+                        true,
+                        Some(200),
+                        None,
+                        started_at.elapsed().as_millis() as i64,
+                        prompt_tokens,
+                        completion_tokens,
+                    );
+                    return sse_response_from_completion(&completion);
+                }
+                Err(e) => {
+                    let status = e
+                        .downcast_ref::<crate::adapter::outbound::ProviderError>()
+                        .map(|pe| pe.status.as_u16() as i32);
+                    fail_stream_attempt(
+                        &store,
+                        &profile_id,
+                        &target,
+                        status,
+                        e.to_string(),
+                        started_at.elapsed().as_millis() as i64,
+                    );
+                    continue;
+                }
+            }
+        }
+
         let req = match translate_and_forward_streaming(&client, &target, &chat_req).await {
             Ok(r) => r,
             Err(e) => {
@@ -1026,6 +1065,103 @@ async fn pump_stream(
             );
         }
     }
+}
+
+/// Forward a non-streaming attempt against a Responses upstream, returning the
+/// translated chat-completion JSON plus the token counts when the upstream
+/// reported usage (`input_tokens`/`output_tokens`).
+async fn forward_responses_attempt(
+    client: &reqwest::Client,
+    target: &crate::router::Target,
+    req: &ChatRequest,
+    timeout: Duration,
+) -> anyhow::Result<(serde_json::Value, Option<i64>, Option<i64>)> {
+    let (url, headers, body) =
+        crate::adapter::outbound::build_upstream_request(target, req, false)?;
+    let mut request = client.post(&url);
+    for (k, v) in &headers {
+        request = request.header(k, v);
+    }
+    let resp = tokio::time::timeout(timeout, request.json(&body).send())
+        .await
+        .map_err(|_| anyhow::anyhow!("upstream timeout"))?
+        .map_err(|e| anyhow::anyhow!("upstream failed: {e}"))?;
+    let status = resp.status();
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| anyhow::anyhow!("reading provider response failed: {e}"))?;
+    if !status.is_success() {
+        return Err(anyhow::Error::new(crate::adapter::outbound::ProviderError {
+            status,
+            body: String::from_utf8_lossy(&bytes).into_owned(),
+        })
+        .context("provider returned an error response"));
+    }
+    let translated = crate::adapter::outbound::translate_response(target, &bytes)?;
+    let completion: serde_json::Value = serde_json::from_slice(&translated)
+        .map_err(|e| anyhow::anyhow!("translated response is not JSON: {e}"))?;
+    let usage = completion.get("usage");
+    let prompt_tokens = usage
+        .and_then(|u| u.get("input_tokens"))
+        .and_then(|t| t.as_i64());
+    let completion_tokens = usage
+        .and_then(|u| u.get("output_tokens"))
+        .and_then(|t| t.as_i64());
+    Ok((completion, prompt_tokens, completion_tokens))
+}
+
+/// Wrap a full chat-completion answer into a minimal OpenAI SSE stream so
+/// streaming clients can consume a Responses-only upstream: one content chunk,
+/// one terminal `stop` chunk, then `[DONE]`.
+fn sse_response_from_completion(completion: &serde_json::Value) -> Response {
+    let id = completion
+        .get("id")
+        .and_then(|i| i.as_str())
+        .unwrap_or("responses")
+        .to_string();
+    let model = completion
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or("")
+        .to_string();
+    let created = completion
+        .get("created")
+        .cloned()
+        .unwrap_or(serde_json::json!(0));
+    let content = completion
+        .pointer("/choices/0/message/content")
+        .and_then(|c| c.as_str())
+        .unwrap_or("")
+        .to_string();
+    let chunk = |delta: serde_json::Value, finish: &str| {
+        serde_json::json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": delta,
+                "finish_reason": if finish.is_empty() { serde_json::Value::Null } else { serde_json::json!(finish) },
+            }]
+        })
+        .to_string()
+    };
+    let wire = format!(
+        "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+        chunk(
+            serde_json::json!({ "role": "assistant", "content": content }),
+            ""
+        ),
+        chunk(serde_json::json!({}), "stop"),
+    );
+    Response::builder()
+        .status(200)
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .body(axum::body::Body::from(wire))
+        .unwrap()
 }
 
 /// Translate and prepare the streaming request for a target.

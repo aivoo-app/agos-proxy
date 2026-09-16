@@ -126,6 +126,12 @@ fn test_state(store: Store) -> AppState {
 }
 
 fn setup_store(base_url: &str) -> (Store, String) {
+    setup_store_kind(base_url, ProviderKind::OpenAICompatible)
+}
+
+/// Same tree as [`setup_store`], but the provider is created with the given
+/// kind — used by the OpenAI Responses upstream tests.
+fn setup_store_kind(base_url: &str, kind: ProviderKind) -> (Store, String) {
     let store = Store::open_in_memory().expect("open in-memory store");
     let profile = store
         .create_profile("coder1", Some("test profile"), None)
@@ -140,7 +146,7 @@ fn setup_store(base_url: &str) -> (Store, String) {
                 description: None,
                 base_url: base_url.into(),
                 auth_token: "sk-mock".into(),
-                kind: ProviderKind::OpenAICompatible,
+                kind,
                 extra_headers: std::collections::BTreeMap::new(),
             },
         )
@@ -717,4 +723,194 @@ async fn economy_routes_cheap_first_caches_and_escalates() {
     assert_eq!(status, 200);
     assert_eq!(hits.load(Ordering::SeqCst), 3);
     assert_eq!(seen.lock().unwrap().last().unwrap(), "gpt-4o");
+}
+
+// --- OpenAI Responses upstream ------------------------------------------------
+
+/// A mock Responses-only upstream that returns a Responses-shaped reply.
+async fn mock_responses_upstream(port: u16, fail: bool) -> tokio::task::JoinHandle<()> {
+    let app = axum::Router::new().route(
+        "/v1/responses",
+        axum::routing::post(move || async move {
+            if fail {
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(serde_json::json!({ "error": { "message": "boom" } })),
+                );
+            }
+            (
+                axum::http::StatusCode::OK,
+                axum::Json(serde_json::json!({
+                    "id": "resp_mock",
+                    "created_at": 1_700_000_000i64,
+                    "model": "mock-model",
+                    "output": [
+                        { "type": "reasoning", "summary": [] },
+                        {
+                            "type": "message",
+                            "content": [{ "type": "output_text", "text": "hello from responses" }]
+                        }
+                    ],
+                    "usage": { "input_tokens": 5, "output_tokens": 3 }
+                })),
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
+        .await
+        .expect("bind mock responses upstream");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    })
+}
+
+fn responses_request(stream: bool) -> axum::http::Request<axum::body::Body> {
+    let req_body = serde_json::json!({
+        "model": "programmer/php-dev",
+        "messages": [{ "role": "user", "content": "hi" }],
+        "stream": stream
+    });
+    axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("Authorization", "Bearer profile")
+        .header("Content-Type", "application/json")
+        .body(axum::body::Body::from(req_body.to_string()))
+        .expect("build request")
+}
+
+/// A Responses-only upstream serves a non-streaming chat completion, reshaped
+/// back into chat-completion form with the upstream usage counts.
+#[tokio::test]
+async fn responses_upstream_serves_non_streaming_chat() {
+    let mock_port = 19891;
+    let mock_base = format!("http://127.0.0.1:{mock_port}");
+    let _mock = mock_responses_upstream(mock_port, false).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (store, profile_id) = setup_store_kind(&mock_base, ProviderKind::OpenAIResponses);
+    let mut state = test_state(store);
+    state.attempt_timeout = Duration::from_secs(5);
+    let app = create_app(state);
+
+    let mut request = responses_request(false);
+    request.headers_mut().insert(
+        axum::http::header::AUTHORIZATION,
+        format!("Bearer {profile_id}").parse().unwrap(),
+    );
+
+    let response = app.oneshot(request).await.expect("oneshot");
+    assert_eq!(response.status(), 200);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("parse json");
+    assert_eq!(json["object"], "chat.completion");
+    assert_eq!(
+        json["choices"][0]["message"]["content"],
+        "hello from responses"
+    );
+    assert_eq!(json["choices"][0]["finish_reason"], "stop");
+    assert_eq!(json["usage"]["input_tokens"], 5);
+    assert_eq!(json["usage"]["output_tokens"], 3);
+}
+
+/// A streaming request against a Responses-only upstream is served from the
+/// non-streamed answer, wrapped into a minimal OpenAI SSE stream.
+#[tokio::test]
+async fn responses_upstream_streams_sse_wrapped_completion() {
+    let mock_port = 19892;
+    let mock_base = format!("http://127.0.0.1:{mock_port}");
+    let _mock = mock_responses_upstream(mock_port, false).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (store, profile_id) = setup_store_kind(&mock_base, ProviderKind::OpenAIResponses);
+    let mut state = test_state(store);
+    state.attempt_timeout = Duration::from_secs(5);
+    let app = create_app(state);
+
+    let mut request = responses_request(true);
+    request.headers_mut().insert(
+        axum::http::header::AUTHORIZATION,
+        format!("Bearer {profile_id}").parse().unwrap(),
+    );
+
+    let response = app.oneshot(request).await.expect("oneshot");
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "text/event-stream"
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("chat.completion.chunk"), "body: {text}");
+    assert!(text.contains("hello from responses"), "body: {text}");
+    assert!(text.contains("finish_reason\":\"stop\""), "body: {text}");
+    assert!(text.contains("data: [DONE]"), "body: {text}");
+}
+
+/// When the Responses-only upstream fails, the router fails over to the next
+/// entry in the chain (an OpenAI-compatible fallback here).
+#[tokio::test]
+async fn responses_upstream_failure_fails_over_to_next_entry() {
+    let responses_port = 19893;
+    let fallback_port = 19894;
+    let responses_base = format!("http://127.0.0.1:{responses_port}");
+    let fallback_base = format!("http://127.0.0.1:{fallback_port}");
+    let _responses = mock_responses_upstream(responses_port, true).await;
+    let _fallback = mock_upstream(fallback_port).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (store, profile_id) = setup_store_kind(&responses_base, ProviderKind::OpenAIResponses);
+    // Second (fallback) provider + entry at lower priority.
+    store
+        .create_provider(
+            &profile_id,
+            agos::storage::NewProvider {
+                name: "fallback".into(),
+                description: None,
+                base_url: fallback_base,
+                auth_token: "sk-fallback".into(),
+                kind: ProviderKind::OpenAICompatible,
+                extra_headers: std::collections::BTreeMap::new(),
+            },
+        )
+        .expect("create fallback provider");
+    let providers = store.list_providers(&profile_id).expect("list providers");
+    let fallback = providers.iter().find(|p| p.name == "fallback").unwrap();
+    let proxy = &store.list_proxies(&profile_id).expect("proxies")[0];
+    let routes = store.list_routes(proxy.id).expect("routes");
+    store
+        .add_route_entry(
+            routes[0].id,
+            fallback.id,
+            "mock-model",
+            2,
+            1.0,
+            RouteCapabilities::default(),
+        )
+        .expect("add fallback entry");
+
+    let mut state = test_state(store);
+    state.attempt_timeout = Duration::from_secs(5);
+    let app = create_app(state);
+
+    let mut request = responses_request(false);
+    request.headers_mut().insert(
+        axum::http::header::AUTHORIZATION,
+        format!("Bearer {profile_id}").parse().unwrap(),
+    );
+
+    let response = app.oneshot(request).await.expect("oneshot");
+    assert_eq!(response.status(), 200);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("parse json");
+    assert_eq!(
+        json["choices"][0]["message"]["content"], "hello from mock",
+        "the fallback entry must have served the request"
+    );
 }
