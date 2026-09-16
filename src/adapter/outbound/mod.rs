@@ -6,7 +6,7 @@
 //! dispatcher that picks the right adapter for a [`Target`] based on its
 //! [`ProviderKind`], so callers never match on provider kinds themselves.
 //!
-//! - [`openai`]: OpenAI-compatible passthrough (also covers `custom` kinds)
+//! - [`openai`]: OpenAI passthrough (also covers `custom` kinds)
 //! - [`anthropic`]: Anthropic `/v1/messages`
 //! - [`google`]: Google `generateContent`
 
@@ -46,7 +46,7 @@ pub struct ProviderError {
 
 /// Check whether a provider kind is supported by the current adapter set.
 pub fn is_supported(_kind: ProviderKind) -> bool {
-    // Custom providers are treated as OpenAI-compatible passthrough,
+    // Custom providers are treated as OpenAI passthrough,
     // so they are supported.
     true
 }
@@ -79,18 +79,18 @@ pub fn build_upstream_request(
             let body = responses::translate_request(chat_req, &target.entry.model_id);
             Ok((url, headers, body))
         }
-        // OpenAI-compatible and custom providers share the passthrough adapter.
-        ProviderKind::OpenAICompatible | ProviderKind::Custom => {
+        // OpenAI and custom providers share the passthrough adapter.
+        ProviderKind::OpenAI | ProviderKind::Custom => {
             openai::build_upstream_request(target, chat_req, stream)
         }
     }
 }
 
-/// Reshape a successful upstream response into OpenAI-compatible JSON bytes.
-/// OpenAI-compatible responses pass through as-is.
+/// Reshape a successful upstream response into OpenAI JSON bytes.
+/// OpenAI responses pass through as-is.
 pub fn translate_response(target: &Target, bytes: &[u8]) -> Result<Vec<u8>> {
     match target.provider.kind {
-        ProviderKind::OpenAICompatible => Ok(bytes.to_vec()),
+        ProviderKind::OpenAI => Ok(bytes.to_vec()),
         ProviderKind::Anthropic => {
             let resp: serde_json::Value =
                 serde_json::from_slice(bytes).context("parsing anthropic response")?;
@@ -150,7 +150,7 @@ pub fn parse_stream_chunk(kind: ProviderKind, payload: &str) -> Option<StreamEve
         ProviderKind::Google => google::parse_stream_chunk(payload),
         // Never reached: Responses upstreams are served non-streamed, but the
         // openai decoder is the safest passthrough if a body ever lands here.
-        ProviderKind::OpenAICompatible | ProviderKind::OpenAIResponses | ProviderKind::Custom => {
+        ProviderKind::OpenAI | ProviderKind::OpenAIResponses | ProviderKind::Custom => {
             openai::parse_stream_chunk(payload)
         }
     }

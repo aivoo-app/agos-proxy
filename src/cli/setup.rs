@@ -378,10 +378,10 @@ fn prompt_capabilities(theme: &ColorfulTheme) -> Result<RouteCapabilities> {
     })
 }
 
-/// Let the user pick which provider kind (OpenAI-compatible, Anthropic, ...).
+/// Let the user pick which provider kind (OpenAI, Anthropic, ...).
 fn pick_kind(theme: &ColorfulTheme) -> Result<ProviderKind> {
     let kinds = [
-        ProviderKind::OpenAICompatible,
+        ProviderKind::OpenAI,
         ProviderKind::Anthropic,
         ProviderKind::Google,
         ProviderKind::Custom,

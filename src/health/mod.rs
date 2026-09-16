@@ -24,7 +24,7 @@ const PROBE_INTERVAL: Duration = Duration::from_secs(30);
 const PING_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Lightweight ping request: ask the upstream for its model list. Cheap, fast,
-/// and works across every OpenAI-compatible provider.
+/// and works across every OpenAI provider.
 const PING_PATH: &str = "/v1/models";
 
 /// Start the background health-probe runner. Returns a JoinHandle so the caller

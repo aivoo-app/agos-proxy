@@ -132,7 +132,7 @@ environment:
     {
       "profile": "ci-agent",
       "providers": [
-        {"name": "mock", "base_url": "http://mock:9999", "auth_token": "sk-mock", "kind": "openai_compatible"}
+        {"name": "mock", "base_url": "http://mock:9999", "auth_token": "sk-mock", "kind": "generic"}
       ],
       "proxies": [
         {"name": "main", "routes": [

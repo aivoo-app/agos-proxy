@@ -1,6 +1,6 @@
-//! OpenAI-compatible outbound adapter.
+//! OpenAI outbound adapter.
 //!
-//! OpenAI-compatible providers (including `custom` kinds, which supply their
+//! OpenAI providers (including `custom` kinds, which supply their
 //! own base URL) pass requests through untouched: the canonical
 //! [`ChatRequest`] *is* the OpenAI wire format, so the outbound side only
 //! stamps the route's model id, auth headers, and strips pipeline-internal
@@ -38,7 +38,7 @@ fn strip_internal_keys(body: &mut serde_json::Value) {
     }
 }
 
-/// Build the upstream request for an OpenAI-compatible chat target.
+/// Build the upstream request for an OpenAI chat target.
 pub fn build_upstream_request(
     target: &Target,
     chat_req: &ChatRequest,
@@ -77,7 +77,7 @@ pub fn build_upstream_request(
 }
 
 /// Coerce a `function.arguments` value into the raw JSON *string* the wire
-/// format specifies. OpenAI sends a string; some compatible providers send an
+/// format specifies. OpenAI sends a string; some non-OpenAI providers send an
 /// already-parsed object, which is re-serialized so downstream code can always
 /// treat the value as a string.
 fn arguments_to_string(value: Option<&serde_json::Value>) -> String {
@@ -254,16 +254,16 @@ pub fn parse_stream_chunk(data: &str) -> Option<StreamEvent> {
     })
 }
 
-/// Build the upstream request for a completions target. OpenAI-compatible
+/// Build the upstream request for a completions target. OpenAI
 /// providers get a straight passthrough with the route entry's model_id;
 /// other provider kinds are rejected because they do not expose an
-/// OpenAI-compatible completions endpoint.
+/// OpenAI completions endpoint.
 pub fn build_completion_upstream_request(
     target: &Target,
     req: &CompletionRequest,
 ) -> Result<(String, BTreeMap<String, String>, serde_json::Value)> {
     match target.provider.kind {
-        ProviderKind::OpenAICompatible | ProviderKind::Custom => {
+        ProviderKind::OpenAI | ProviderKind::Custom => {
             let base = target.provider.base_url.trim_end_matches('/');
             let url = format!("{base}/v1/completions");
             let mut headers = target.provider.extra_headers.clone();
@@ -295,7 +295,7 @@ pub fn build_embedding_upstream_request(
     req: &EmbeddingRequest,
 ) -> Result<(String, BTreeMap<String, String>, serde_json::Value)> {
     match target.provider.kind {
-        ProviderKind::OpenAICompatible | ProviderKind::Custom => {
+        ProviderKind::OpenAI | ProviderKind::Custom => {
             let base = target.provider.base_url.trim_end_matches('/');
             let url = format!("{base}/v1/embeddings");
             let mut headers = target.provider.extra_headers.clone();
@@ -395,7 +395,7 @@ mod tests {
                 description: None,
                 base_url: "https://api.example.com".into(),
                 auth_token: "sk-secret".into(),
-                kind: ProviderKind::OpenAICompatible,
+                kind: ProviderKind::OpenAI,
                 extra_headers: extra,
             },
             entry: RouteEntry {
@@ -492,7 +492,7 @@ mod tests {
 
     #[test]
     fn tool_call_arguments_object_is_coerced_to_a_string() {
-        // Some compatible providers send arguments already parsed; the wire
+        // Some non-OpenAI providers send arguments already parsed; the wire
         // format says string, so it is re-serialized rather than dropped.
         let bytes = serde_json::json!({
             "choices": [{

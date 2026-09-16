@@ -69,7 +69,7 @@ atos-proxy provider add --profile coder1
 # name: deepseek
 # base_url: https://api.deepseek.com
 # auth_token: sk-... (your DeepSeek API key)
-# kind: openai_compatible
+# kind: generic
 ```
 
 Route entry:
@@ -85,7 +85,7 @@ atos-proxy provider add --profile coder1
 # name: openrouter
 # base_url: https://openrouter.ai/api/v1
 # auth_token: sk-or-v1-...
-# kind: openai_compatible
+# kind: generic
 ```
 
 Route entry:
@@ -101,7 +101,7 @@ atos-proxy provider add --profile coder1
 # name: ollama
 # base_url: http://localhost:11434/v1
 # auth_token: (empty if no auth)
-# kind: openai_compatible
+# kind: generic
 ```
 
 Route entry:
@@ -119,7 +119,7 @@ atos-proxy provider add --profile coder1
 # name: openai
 # base_url: https://api.openai.com/v1
 # auth_token: sk-...
-# kind: openai_compatible
+# kind: generic
 ```
 
 Route entry:

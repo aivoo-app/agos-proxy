@@ -28,13 +28,13 @@ agos-proxy profile create --name production
 
 # Add three providers
 agos-proxy provider add --profile production
-# name: openai, base_url: https://api.openai.com/v1, kind: openai_compatible
+# name: openai, base_url: https://api.openai.com/v1, kind: generic
 
 agos-proxy provider add --profile production
-# name: deepseek, base_url: https://api.deepseek.com, kind: openai_compatible
+# name: deepseek, base_url: https://api.deepseek.com, kind: generic
 
 agos-proxy provider add --profile production
-# name: openrouter, base_url: https://openrouter.ai/api/v1, kind: openai_compatible
+# name: openrouter, base_url: https://openrouter.ai/api/v1, kind: generic
 
 # Create proxy + route
 agos-proxy proxy create --profile production
@@ -60,19 +60,19 @@ agos-proxy route create --proxy chat
       "name": "openai",
       "base_url": "https://api.openai.com/v1",
       "auth_token": "sk-...",
-      "kind": "openai_compatible"
+      "kind": "generic"
     },
     {
       "name": "deepseek",
       "base_url": "https://api.deepseek.com",
       "auth_token": "sk-...",
-      "kind": "openai_compatible"
+      "kind": "generic"
     },
     {
       "name": "openrouter",
       "base_url": "https://openrouter.ai/api/v1",
       "auth_token": "sk-or-v1-...",
-      "kind": "openai_compatible"
+      "kind": "generic"
     }
   ],
   "proxies": [
@@ -208,13 +208,13 @@ client.chat.completions.create(model="Programmer/chat", messages=[...])
       "name": "primary",
       "base_url": "https://api.openai.com/v1",
       "auth_token": "sk-...",
-      "kind": "openai_compatible"
+      "kind": "generic"
     },
     {
       "name": "fallback",
       "base_url": "https://openrouter.ai/api/v1",
       "auth_token": "sk-or-v1-...",
-      "kind": "openai_compatible"
+      "kind": "generic"
     }
   ],
   "proxies": [
@@ -248,7 +248,7 @@ agos-proxy provider add --profile dev
 # name: ollama
 # base_url: http://localhost:11434/v1
 # auth_token: (leave empty — Ollama doesn't require auth)
-# kind: openai_compatible
+# kind: generic
 ```
 
 Ollama speaks an OpenAI-compatible API, so no translation is needed. Common Ollama model IDs: `llama3.2`, `codellama`, `mistral`, `qwen2.5`.

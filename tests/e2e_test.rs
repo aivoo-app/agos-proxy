@@ -126,7 +126,7 @@ fn test_state(store: Store) -> AppState {
 }
 
 fn setup_store(base_url: &str) -> (Store, String) {
-    setup_store_kind(base_url, ProviderKind::OpenAICompatible)
+    setup_store_kind(base_url, ProviderKind::OpenAI)
 }
 
 /// Same tree as [`setup_store`], but the provider is created with the given
@@ -605,7 +605,7 @@ async fn economy_routes_cheap_first_caches_and_escalates() {
                 description: None,
                 base_url: "http://127.0.0.1:19884".into(),
                 auth_token: "sk-mock".into(),
-                kind: ProviderKind::OpenAICompatible,
+                kind: ProviderKind::OpenAI,
                 extra_headers: std::collections::BTreeMap::new(),
             },
         )
@@ -852,7 +852,7 @@ async fn responses_upstream_streams_sse_wrapped_completion() {
 }
 
 /// When the Responses-only upstream fails, the router fails over to the next
-/// entry in the chain (an OpenAI-compatible fallback here).
+/// entry in the chain (an OpenAI fallback here).
 #[tokio::test]
 async fn responses_upstream_failure_fails_over_to_next_entry() {
     let responses_port = 19893;
@@ -873,7 +873,7 @@ async fn responses_upstream_failure_fails_over_to_next_entry() {
                 description: None,
                 base_url: fallback_base,
                 auth_token: "sk-fallback".into(),
-                kind: ProviderKind::OpenAICompatible,
+                kind: ProviderKind::OpenAI,
                 extra_headers: std::collections::BTreeMap::new(),
             },
         )

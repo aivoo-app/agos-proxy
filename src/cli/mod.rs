@@ -45,7 +45,7 @@ pub mod util;
 #[command(
     name = "agos-proxy",
     version,
-    about = "Self-hosted OpenAI-compatible AI gateway with multi-provider failover"
+    about = "Self-hosted multi-provider AI gateway with failover"
 )]
 pub struct Cli {
     #[command(subcommand)]

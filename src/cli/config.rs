@@ -348,7 +348,7 @@ mod tests {
                     description: None,
                     base_url: "https://api.example.com".into(),
                     auth_token: "sk-secret".into(),
-                    kind: ProviderKind::OpenAICompatible,
+                    kind: ProviderKind::OpenAI,
                     extra_headers: BTreeMap::new(),
                 },
             )

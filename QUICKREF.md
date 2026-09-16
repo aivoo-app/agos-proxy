@@ -53,7 +53,7 @@ agos-proxy provider edit --profile coder1
 agos-proxy provider delete --profile coder1
 ```
 
-**Provider kinds:** `openai_compatible`, `anthropic`, `google`, `custom`
+**Provider kinds:** `generic`, `anthropic`, `google`, `custom`
 
 ## Proxy
 
@@ -125,7 +125,7 @@ cat setup.json | agos-proxy bootstrap from-file -
       "name": "deepseek",
       "base_url": "https://api.deepseek.com",
       "auth_token": "sk-...",
-      "kind": "openai_compatible"
+      "kind": "generic"
     }
   ],
   "proxies": [

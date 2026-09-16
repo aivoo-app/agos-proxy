@@ -83,7 +83,7 @@ pub struct RequestNeeds {
 }
 
 impl RequestNeeds {
-    /// Infer the needs from a raw OpenAI-compatible request body.
+    /// Infer the needs from a raw OpenAI request body.
     pub fn from_body(body: &serde_json::Value) -> Self {
         let tools = body
             .get("tools")
@@ -364,7 +364,7 @@ mod tests {
                     description: None,
                     base_url: "https://example.com".into(),
                     auth_token: "tok".into(),
-                    kind: ProviderKind::OpenAICompatible,
+                    kind: ProviderKind::OpenAI,
                     extra_headers: BTreeMap::new(),
                 },
             )
@@ -423,7 +423,7 @@ mod tests {
                     description: None,
                     base_url: "https://a.example".into(),
                     auth_token: "tok1".into(),
-                    kind: ProviderKind::OpenAICompatible,
+                    kind: ProviderKind::OpenAI,
                     extra_headers: BTreeMap::new(),
                 },
             )
@@ -436,7 +436,7 @@ mod tests {
                     description: None,
                     base_url: "https://b.example".into(),
                     auth_token: "tok2".into(),
-                    kind: ProviderKind::OpenAICompatible,
+                    kind: ProviderKind::OpenAI,
                     extra_headers: BTreeMap::new(),
                 },
             )
@@ -510,7 +510,7 @@ mod tests {
                     description: None,
                     base_url: "https://a.example".into(),
                     auth_token: "tok".into(),
-                    kind: ProviderKind::OpenAICompatible,
+                    kind: ProviderKind::OpenAI,
                     extra_headers: BTreeMap::new(),
                 },
             )
@@ -523,7 +523,7 @@ mod tests {
                     description: None,
                     base_url: "https://b.example".into(),
                     auth_token: "tok".into(),
-                    kind: ProviderKind::OpenAICompatible,
+                    kind: ProviderKind::OpenAI,
                     extra_headers: BTreeMap::new(),
                 },
             )
@@ -596,7 +596,7 @@ mod tests {
                         description: None,
                         base_url: "https://a.example".into(),
                         auth_token: "tok".into(),
-                        kind: ProviderKind::OpenAICompatible,
+                        kind: ProviderKind::OpenAI,
                         extra_headers: BTreeMap::new(),
                     },
                 )
@@ -779,7 +779,7 @@ mod tests {
                     description: None,
                     base_url: "https://a.example".into(),
                     auth_token: "tok".into(),
-                    kind: ProviderKind::OpenAICompatible,
+                    kind: ProviderKind::OpenAI,
                     extra_headers: BTreeMap::new(),
                 },
             )

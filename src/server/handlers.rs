@@ -1,4 +1,4 @@
-//! HTTP handlers for the OpenAI-compatible surface.
+//! HTTP handlers for the OpenAI surface.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -492,8 +492,8 @@ async fn handle_streaming(
     };
 
     // Find the first working upstream: send the request for real and only
-    // commit once an upstream's body proves itself. Several OpenAI-compatible
-    // OpenAI-compatible free tiers in particular answer HTTP 200 and then
+    // commit once an upstream's body proves itself. Several OpenAI
+    // OpenAI free tiers in particular answer HTTP 200 and then
     // deliver an *in-band* SSE error event (`data: {"error": ...}`), so a 2xx
     // alone is not enough — the first frames must carry real content before
     // the 200 goes out to the client. Failed attempts are logged, the entry is
@@ -905,7 +905,7 @@ fn log_stream_outcome(
 /// - keeps watching for in-band error events and reports them as failed
 ///   attempts instead of successes (Bug 1, post-commit);
 /// - translates Anthropic/Google SSE into OpenAI `chat.completion.chunk`
-///   deltas; OpenAI-compatible streams pass through verbatim (Bug 4);
+///   deltas; OpenAI streams pass through verbatim (Bug 4);
 /// - extracts the upstream usage frames and records exactly one usage row with
 ///   the real status and token counts (Bug 6).
 #[allow(clippy::too_many_arguments)]
@@ -994,7 +994,7 @@ async fn pump_stream(
                     completion_tokens = completion_tokens.or(c);
                 }
                 match kind {
-                    ProviderKind::OpenAICompatible | ProviderKind::Custom => {
+                    ProviderKind::OpenAI | ProviderKind::Custom => {
                         let wire = sse::SseFrame {
                             event: String::new(),
                             data: raw.to_string(),
@@ -1466,12 +1466,12 @@ async fn handle_completion_streaming(
 
     // A working upstream is confirmed: stream its response body to the client.
     // The legacy completions surface is an OpenAI-shaped passthrough, so the
-    // pump runs in OpenAI-compatible mode regardless of the provider kind.
+    // pump runs in OpenAI mode regardless of the provider kind.
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
 
     tokio::spawn(pump_stream(
         target,
-        crate::domain::ProviderKind::OpenAICompatible,
+        crate::domain::ProviderKind::OpenAI,
         outcome,
         completion_req.model.clone(),
         state.stream_idle_timeout,

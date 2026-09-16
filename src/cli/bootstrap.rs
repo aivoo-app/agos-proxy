@@ -72,7 +72,7 @@ pub struct ProviderSpec {
     pub base_url: String,
     /// Upstream API token; stored encrypted at rest.
     pub auth_token: String,
-    /// Defaults to `openai_compatible`.
+    /// Defaults to `openai`.
     #[serde(default)]
     pub kind: Option<String>,
     /// Extra headers sent with every upstream request.
@@ -166,8 +166,8 @@ fn default_capabilities() -> CapabilitiesSpec {
 }
 
 fn parse_kind(raw: Option<&str>) -> Result<ProviderKind> {
-    match raw.unwrap_or("openai_compatible") {
-        "openai_compatible" | "custom" => Ok(ProviderKind::OpenAICompatible),
+    match raw.unwrap_or("openai") {
+        "openai" => Ok(ProviderKind::OpenAI),
         "openai_responses" => Ok(ProviderKind::OpenAIResponses),
         "anthropic" => Ok(ProviderKind::Anthropic),
         "google" => Ok(ProviderKind::Google),
@@ -316,10 +316,7 @@ mod tests {
 
     #[test]
     fn parse_kind_accepts_known_tags_and_rejects_unknown() {
-        assert!(matches!(
-            parse_kind(None),
-            Ok(ProviderKind::OpenAICompatible)
-        ));
+        assert!(matches!(parse_kind(None), Ok(ProviderKind::OpenAI)));
         assert!(matches!(
             parse_kind(Some("anthropic")),
             Ok(ProviderKind::Anthropic)

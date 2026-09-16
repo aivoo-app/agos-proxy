@@ -733,7 +733,7 @@ mod tests {
                     description: None,
                     base_url: base,
                     auth_token: "sk-mock".into(),
-                    kind: ProviderKind::OpenAICompatible,
+                    kind: ProviderKind::OpenAI,
                     extra_headers: BTreeMap::new(),
                 },
             )

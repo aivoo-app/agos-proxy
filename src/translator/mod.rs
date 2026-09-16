@@ -2,7 +2,7 @@
 //!
 //! This module defines the provider-independent data types every adapter
 //! speaks: [`ChatRequest`] on the way in, [`CanonicalResponse`] and
-//! [`StreamEvent`] on the way back, plus the OpenAI-compatible
+//! [`StreamEvent`] on the way back, plus the OpenAI
 //! completions/embeddings payload types used by the passthrough endpoints.
 //!
 //! Tool calling is part of the canonical model: [`CanonicalResponse::tool_calls`]
@@ -16,7 +16,7 @@
 //! per-surface inbound adapters and [`crate::adapter::outbound`] for the
 //! per-provider outbound adapters built on top of these types.
 
-/// An OpenAI-compatible chat completions request.
+/// An OpenAI chat completions request.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ChatRequest {
     pub model: String,
@@ -30,7 +30,7 @@ pub struct ChatRequest {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Message {
     pub role: String,
-    /// The message content, kept as raw JSON so the OpenAI-compatible
+    /// The message content, kept as raw JSON so the OpenAI
     /// passthrough stays lossless. Plain text is a JSON string; multimodal
     /// requests use the OpenAI parts array (text / image_url entries).
     pub content: serde_json::Value,
@@ -170,7 +170,7 @@ pub struct ToolCallDelta {
     pub arguments_delta: Option<String>,
 }
 
-/// An OpenAI-compatible completions request. Kept flexible with `#[serde(flatten)]`
+/// An OpenAI completions request. Kept flexible with `#[serde(flatten)]`
 /// so unknown provider-specific fields pass through untouched.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CompletionRequest {
@@ -226,7 +226,7 @@ pub struct CompletionUsage {
     pub total_tokens: u32,
 }
 
-/// An OpenAI-compatible completions response.
+/// An OpenAI completions response.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CompletionResponse {
     pub id: String,
@@ -237,7 +237,7 @@ pub struct CompletionResponse {
     pub usage: CompletionUsage,
 }
 
-/// An OpenAI-compatible embeddings request.
+/// An OpenAI embeddings request.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EmbeddingRequest {
     pub model: String,
@@ -263,7 +263,7 @@ pub struct EmbeddingUsage {
     pub total_tokens: u32,
 }
 
-/// An OpenAI-compatible embeddings response.
+/// An OpenAI embeddings response.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EmbeddingResponse {
     pub object: String,

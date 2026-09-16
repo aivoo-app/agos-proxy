@@ -31,7 +31,7 @@ use anyhow;
 /// Per-handler body size cap, mirroring the OpenAI handler.
 const BODY_LIMIT: usize = 5 * 1024 * 1024;
 
-/// OpenAI-compatible chat surface mounted under `/openai/v1/chat/completions`.
+/// OpenAI chat surface mounted under `/openai/v1/chat/completions`.
 pub async fn openai_chat(State(state): State<AppState>, req: Request) -> Response {
     native_chat(state, ApiKind::OpenAI, req).await
 }

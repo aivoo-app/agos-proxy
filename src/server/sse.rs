@@ -2,7 +2,7 @@
 //!
 //! The streaming handler probes each upstream with the real request and only
 //! commits to a 2xx response once the body proves itself: several
-//! OpenAI-compatible providers (free tiers in particular) answer
+//! OpenAI providers (free tiers in particular) answer
 //! HTTP 200 and then deliver an *in-band* SSE error event. Both the probe loop
 //! and the pump task share this module's incremental frame parser so bytes are
 //! never lost between probe and pump, plus the per-provider usage extraction
@@ -138,7 +138,7 @@ pub enum Frame<'a> {
 }
 
 impl<'a> Frame<'a> {
-    /// The top-level `error` key is the contract every OpenAI-compatible
+    /// The top-level `error` key is the contract every OpenAI
     /// provider and both native adapters use for in-band errors.
     pub fn classify(data: &'a str) -> Self {
         let trimmed = data.trim();
@@ -166,14 +166,14 @@ impl<'a> Frame<'a> {
 }
 
 /// Extract `(prompt_tokens, completion_tokens)` from a frame's JSON, per
-/// provider shape. OpenAI-compatible chunks carry a `usage` object (sent when
+/// provider shape. OpenAI chunks carry a `usage` object (sent when
 /// `stream_options.include_usage` is set); Anthropic splits it across
 /// `message_start` (input) and `message_delta` (output); Google carries
 /// `usageMetadata` on every chunk.
 pub fn frame_usage(kind: ProviderKind, json: &serde_json::Value) -> (Option<u64>, Option<u64>) {
     let num = |v: &serde_json::Value| v.as_u64().or_else(|| v.as_i64().map(|n| n.max(0) as u64));
     match kind {
-        ProviderKind::OpenAICompatible | ProviderKind::Custom => {
+        ProviderKind::OpenAI | ProviderKind::Custom => {
             let usage = json.get("usage");
             let prompt = usage.and_then(|u| u.get("prompt_tokens")).and_then(num);
             let completion = usage.and_then(|u| u.get("completion_tokens")).and_then(num);
@@ -328,7 +328,7 @@ mod tests {
         let openai: serde_json::Value =
             serde_json::from_str(r#"{"usage":{"prompt_tokens":5,"completion_tokens":7}}"#).unwrap();
         assert_eq!(
-            frame_usage(ProviderKind::OpenAICompatible, &openai),
+            frame_usage(ProviderKind::OpenAI, &openai),
             (Some(5), Some(7))
         );
         let start: serde_json::Value = serde_json::from_str(

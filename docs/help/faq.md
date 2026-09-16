@@ -115,13 +115,13 @@ The exported file is passphrase-sealed. On import, provider tokens are re-encryp
 ### Which providers are supported?
 
 Any provider that speaks one of these protocols:
-- **OpenAI-compatible** — DeepSeek, OpenRouter, Together AI, Ollama, local servers
+- **OpenAI-format** — DeepSeek, OpenRouter, Together AI, Ollama, local servers
 - **Anthropic** — Claude API (native translation)
 - **Google** — Gemini API (native translation)
 
 ### Can I add a custom provider?
 
-If it speaks an OpenAI-compatible API, yes — use kind `openai_compatible`. If it speaks a completely different protocol, you'd need to add a translator module (see [docs/providers.md](docs/providers.md)).
+If it speaks an OpenAI-format API, yes — use kind `generic`. If it speaks a completely different protocol, you'd need to add a translator module (see [docs/providers.md](docs/providers.md)).
 
 ### How do I set up OpenRouter?
 
@@ -130,7 +130,7 @@ agos-proxy provider add --profile myprofile
 # name: openrouter
 # base_url: https://openrouter.ai/api/v1
 # auth_token: sk-or-v1-...
-# kind: openai_compatible
+# kind: generic
 ```
 
 Then in a route entry: `{ "provider": "openrouter", "model": "openai/gpt-4o" }`.
@@ -142,7 +142,7 @@ agos-proxy provider add --profile dev
 # name: ollama
 # base_url: http://localhost:11434/v1
 # auth_token: (leave empty)
-# kind: openai_compatible
+# kind: generic
 ```
 
 ---

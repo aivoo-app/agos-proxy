@@ -1,6 +1,6 @@
 //! Google (Google) native request/response translation.
 //!
-//! Translates between the OpenAI-compatible chat-completions format and
+//! Translates between the OpenAI chat-completions format and
 //! Google's `generateContent` API. Reference:
 //! https://ai.google.dev/api/generate-content
 
@@ -46,7 +46,7 @@ fn google_role(role: &str) -> &'static str {
     }
 }
 
-/// Translate an OpenAI-compatible chat request into a Google generateContent body.
+/// Translate an OpenAI chat request into a Google generateContent body.
 pub fn translate_request(chat_req: &ChatRequest) -> serde_json::Value {
     let mut system_parts: Vec<serde_json::Value> = Vec::new();
     let mut contents = Vec::new();
@@ -92,7 +92,7 @@ pub fn translate_request(chat_req: &ChatRequest) -> serde_json::Value {
     body
 }
 
-/// Translate a Google generateContent response back into OpenAI-compatible format.
+/// Translate a Google generateContent response back into OpenAI format.
 pub fn translate_response(resp: &serde_json::Value, model_id: &str) -> Result<serde_json::Value> {
     let candidates = resp
         .get("candidates")

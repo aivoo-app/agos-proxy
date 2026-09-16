@@ -1,6 +1,6 @@
 //! Anthropic native request/response translation.
 //!
-//! Translates between the OpenAI-compatible chat-completions format and
+//! Translates between the OpenAI chat-completions format and
 //! Anthropic's `/v1/messages` API. Reference:
 //! https://docs.anthropic.com/en/api/messages
 
@@ -30,7 +30,7 @@ pub fn build_headers(target: &Target) -> BTreeMap<String, String> {
     headers
 }
 
-/// Translate an OpenAI-compatible chat request into an Anthropic messages request.
+/// Translate an OpenAI chat request into an Anthropic messages request.
 pub fn translate_request(chat_req: &ChatRequest, model_id: &str) -> serde_json::Value {
     let mut system_text = String::new();
     let mut messages = Vec::new();
@@ -80,7 +80,7 @@ pub fn translate_request(chat_req: &ChatRequest, model_id: &str) -> serde_json::
     body
 }
 
-/// Translate an Anthropic messages response back into OpenAI-compatible format.
+/// Translate an Anthropic messages response back into OpenAI format.
 pub fn translate_response(resp: &serde_json::Value) -> Result<serde_json::Value> {
     let content = resp
         .get("content")

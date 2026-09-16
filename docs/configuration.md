@@ -110,7 +110,7 @@ tree.
   "description": "optional",
   "base_url": "https://api.deepseek.com",
   "auth_token": "sk-...",
-  "kind": "openai_compatible",
+  "kind": "generic",
   "extra_headers": { "X-Custom": "value" }
 }
 ```
@@ -201,7 +201,7 @@ for bootstrap — you can always restrict later with `route model` commands).
       "name": "mock",
       "base_url": "http://mock:9999",
       "auth_token": "sk-mock",
-      "kind": "openai_compatible"
+      "kind": "generic"
     }
   ],
   "proxies": [

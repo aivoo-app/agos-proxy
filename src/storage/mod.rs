@@ -44,7 +44,7 @@ mod schema;
 
 fn provider_kind_tag(k: ProviderKind) -> &'static str {
     match k {
-        ProviderKind::OpenAICompatible => "openai",
+        ProviderKind::OpenAI => "openai",
         ProviderKind::Anthropic => "anthropic",
         ProviderKind::Google => "google",
         ProviderKind::OpenAIResponses => "openai_responses",
@@ -54,7 +54,7 @@ fn provider_kind_tag(k: ProviderKind) -> &'static str {
 
 fn provider_kind_from_tag(tag: &str) -> Result<ProviderKind> {
     match tag {
-        "openai" => Ok(ProviderKind::OpenAICompatible),
+        "openai" => Ok(ProviderKind::OpenAI),
         "anthropic" => Ok(ProviderKind::Anthropic),
         "google" => Ok(ProviderKind::Google),
         "openai_responses" => Ok(ProviderKind::OpenAIResponses),
@@ -1297,7 +1297,7 @@ mod tests {
         let store = Store::open_in_memory()?;
         let profile = store.create_profile("kinds", None, None)?;
         let kinds = [
-            (ProviderKind::OpenAICompatible, "openai"),
+            (ProviderKind::OpenAI, "openai"),
             (ProviderKind::Anthropic, "anthropic"),
             (ProviderKind::Google, "google"),
             (ProviderKind::OpenAIResponses, "openai_responses"),
@@ -1371,7 +1371,7 @@ mod tests {
                 description: None,
                 base_url: "https://api.example.com".to_string(),
                 auth_token: "sk-secret".to_string(),
-                kind: ProviderKind::OpenAICompatible,
+                kind: ProviderKind::OpenAI,
                 extra_headers: headers,
             },
         )?;
@@ -1421,7 +1421,7 @@ mod tests {
                 description: None,
                 base_url: "https://a".to_string(),
                 auth_token: "t1".to_string(),
-                kind: ProviderKind::OpenAICompatible,
+                kind: ProviderKind::OpenAI,
                 extra_headers: std::collections::BTreeMap::new(),
             },
         )?;
@@ -1512,7 +1512,7 @@ mod tests {
                 description: None,
                 base_url: "https://api.example.com".to_string(),
                 auth_token: "a".to_string(),
-                kind: ProviderKind::OpenAICompatible,
+                kind: ProviderKind::OpenAI,
                 extra_headers: std::collections::BTreeMap::new(),
             },
         )?;
@@ -1523,7 +1523,7 @@ mod tests {
                 description: None,
                 base_url: "https://upstream.example".to_string(),
                 auth_token: "b".to_string(),
-                kind: ProviderKind::OpenAICompatible,
+                kind: ProviderKind::OpenAI,
                 extra_headers: std::collections::BTreeMap::new(),
             },
         )?;
@@ -1578,7 +1578,7 @@ mod tests {
                 description: None,
                 base_url: "https://a.example".to_string(),
                 auth_token: "t".to_string(),
-                kind: ProviderKind::OpenAICompatible,
+                kind: ProviderKind::OpenAI,
                 extra_headers: std::collections::BTreeMap::new(),
             },
         )?;

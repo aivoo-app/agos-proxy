@@ -1,6 +1,6 @@
 //! The HTTP surface exposed to callers.
 //!
-//! AGOS Proxy speaks the OpenAI-compatible API - `/v1/chat/completions`,
+//! AGOS Proxy speaks the OpenAI API - `/v1/chat/completions`,
 //! `/v1/completions`, `/v1/embeddings`, `/v1/models` - so an existing OpenAI
 //! SDK client can be pointed at this server unchanged. Requests are
 //! authenticated with the caller profile's bearer token and subject to the
@@ -41,7 +41,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Build a CORS layer based on the AGOS_CORS_ORIGINS environment variable.
 /// When the env var is set, only the specified origins are allowed.
-/// When not set, permissive CORS is used for backward compatibility.
+/// When not set, permissive CORS is used.
 fn build_cors_layer() -> tower_http::cors::CorsLayer {
     let origins: Option<Vec<String>> = std::env::var("AGOS_CORS_ORIGINS")
         .ok()
@@ -89,7 +89,7 @@ pub fn create_app(state: AppState) -> Router {
     let cors_layer = build_cors_layer();
 
     Router::new()
-        // Legacy OpenAI-compatible surface (backward-compatible alias).
+        // Legacy OpenAI surface.
         .route(
             "/v1/chat/completions",
             axum::routing::post(handlers::chat_completions),

@@ -1,4 +1,4 @@
-//! AGOS Proxy — a self-hosted AI gateway with OpenAI-compatible endpoints and
+//! AGOS Proxy — a self-hosted AI gateway with OpenAI endpoints and
 //! automatic multi-provider failover.
 //!
 //! The crate is organised as a small set of coherent modules:

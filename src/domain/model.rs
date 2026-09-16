@@ -30,11 +30,11 @@ pub struct Profile {
 }
 
 /// What wire format a provider speaks. AGOS Proxy uses this to pick a request
-/// and response translator. `OpenAiCompatible` covers most providers; native
+/// and response translator. `OpenAI` covers most providers; native
 /// Anthropic/Google shapes are translated rather than treated as identical.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProviderKind {
-    OpenAICompatible,
+    OpenAI,
     Anthropic,
     Google,
     /// OpenAI *Responses* API (`POST {base}/v1/responses`). Some models only
