@@ -1,6 +1,6 @@
 //! Outbound adapter for the OpenAI *Responses* API (`POST {base}/v1/responses`).
 //!
-//! Some models (notably Zen `muse-*` free tiers) only serve the Responses
+//! Some models (notably free tiers) only serve the Responses
 //! endpoint. Chat-completions traffic is translated on the way out: the
 //! transcript is flattened into a single `input` string, sampling parameters
 //! are passed through, and the reply's `output[]` items are walked to recover
@@ -174,7 +174,7 @@ mod tests {
         let provider = Provider {
             id: 1,
             profile_id: "p".into(),
-            name: "zen".into(),
+            name: "example".into(),
             description: None,
             base_url: base.into(),
             auth_token: "sk-test".into(),
@@ -219,12 +219,12 @@ mod tests {
     #[test]
     fn url_appends_v1_responses_and_strips_trailing_v1() {
         assert_eq!(
-            build_url(&target("https://api.zen.test/", "m/x")),
-            "https://api.zen.test/v1/responses"
+            build_url(&target("https://api.example.test/", "m/x")),
+            "https://api.example.test/v1/responses"
         );
         assert_eq!(
-            build_url(&target("https://api.zen.test/v1/", "m/x")),
-            "https://api.zen.test/v1/responses"
+            build_url(&target("https://api.example.test/v1/", "m/x")),
+            "https://api.example.test/v1/responses"
         );
     }
 
@@ -237,9 +237,9 @@ mod tests {
                 "tools": [{ "type": "function" }],
                 "response_format": { "type": "json_object" },
             })),
-            "muse-x",
+            "responses-model",
         );
-        assert_eq!(body["model"], "muse-x");
+        assert_eq!(body["model"], "responses-model");
         assert_eq!(body["input"], "system: be terse\nuser: hi");
         assert_eq!(body["temperature"], 0.5);
         assert_eq!(body["max_output_tokens"], 128);
@@ -255,7 +255,7 @@ mod tests {
                 "max_tokens": 8,
                 "max_completion_tokens": 64,
             })),
-            "muse-x",
+            "responses-model",
         );
         assert_eq!(body["max_output_tokens"], 64);
     }
@@ -265,7 +265,7 @@ mod tests {
         let resp = serde_json::json!({
             "id": "resp_1",
             "created_at": 1_700_000_000i64,
-            "model": "muse-x",
+            "model": "responses-model",
             "output": [
                 { "type": "reasoning", "summary": [] },
                 {
@@ -277,7 +277,7 @@ mod tests {
                 }
             ]
         });
-        let out = translate_response(&resp, "muse-x").expect("translate");
+        let out = translate_response(&resp, "responses-model").expect("translate");
         assert_eq!(out["object"], "chat.completion");
         assert_eq!(out["choices"][0]["message"]["content"], "hello world");
         assert_eq!(out["choices"][0]["finish_reason"], "stop");

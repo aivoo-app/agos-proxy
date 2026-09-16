@@ -493,7 +493,7 @@ async fn handle_streaming(
 
     // Find the first working upstream: send the request for real and only
     // commit once an upstream's body proves itself. Several OpenAI-compatible
-    // providers (OpenRouter free tiers in particular) answer HTTP 200 and then
+    // OpenAI-compatible free tiers in particular answer HTTP 200 and then
     // deliver an *in-band* SSE error event (`data: {"error": ...}`), so a 2xx
     // alone is not enough — the first frames must carry real content before
     // the 200 goes out to the client. Failed attempts are logged, the entry is
@@ -1354,7 +1354,7 @@ async fn handle_completion_streaming(
         match resp_result {
             Ok(Ok(resp)) if resp.status().is_success() => {
                 // Probe the 2xx body before committing: an in-band SSE error
-                // (OpenRouter-style) must fail over, not reach the client.
+                // must fail over, not reach the client.
                 match probe_stream(state.stream_idle_timeout, resp).await {
                     Probe::Committed {
                         stream,

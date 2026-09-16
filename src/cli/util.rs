@@ -257,7 +257,7 @@ pub fn prompt_model_id(
             }
         }
         let model_id: String = Input::<String>::with_theme(theme)
-            .with_prompt("Model ID (e.g. deepseek/deepseek-v4-flash)")
+            .with_prompt("Model ID (e.g. vendor/model-id)")
             .interact_text()?;
         let model_id = model_id.trim().to_string();
         if model_id.is_empty() {

@@ -28,7 +28,7 @@ use crate::translator::{ChatRequest, StreamEvent};
 /// base URL. The URL builders append their own versioned path
 /// (`/v1/chat/completions`, `/v1/messages`, `/v1beta/models/...`), so a base
 /// URL copied from provider docs that already ends in `/v1` (e.g.
-/// `https://openrouter.ai/api/v1`) would otherwise produce a doubled segment
+/// `https://api.example.com/v1`) would otherwise produce a doubled segment
 /// like `/v1/v1/chat/completions` and 404 on every request and health probe.
 pub fn normalize_base(base_url: &str) -> &str {
     let base = base_url.trim_end_matches('/');
@@ -165,16 +165,16 @@ mod tests {
     #[test]
     fn normalize_base_strips_trailing_v1() {
         assert_eq!(
-            normalize_base("https://openrouter.ai/api/v1"),
-            "https://openrouter.ai/api"
+            normalize_base("https://api.example.com/v1"),
+            "https://api.example.com"
         );
         assert_eq!(
             normalize_base("https://api.openai.com/v1/"),
             "https://api.openai.com"
         );
         assert_eq!(
-            normalize_base("https://api.deepseek.com"),
-            "https://api.deepseek.com"
+            normalize_base("https://api.example.org"),
+            "https://api.example.org"
         );
         assert_eq!(
             normalize_base("http://localhost:11434/v1"),

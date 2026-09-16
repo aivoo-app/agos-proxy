@@ -37,8 +37,8 @@ pub enum ProviderKind {
     OpenAICompatible,
     Anthropic,
     Google,
-    /// OpenAI *Responses* API (`POST {base}/v1/responses`). Some models (e.g.
-    /// Zen muse-*) only serve this endpoint; chat requests are translated on
+    /// OpenAI *Responses* API (`POST {base}/v1/responses`). Some models only
+    /// serve this endpoint; chat requests are translated on
     /// the way out and the reply is reshaped back into chat-completion form.
     OpenAIResponses,
     Custom,
@@ -128,7 +128,7 @@ pub struct RouteEntry {
     pub route_id: i64,
     /// The configured provider used to reach this model.
     pub provider_id: i64,
-    /// The model string the underlying provider expects, e.g. `deepseek-v4-flash`.
+    /// The model string the underlying provider expects, e.g. `my-model-v2`.
     pub model_id: String,
     /// Order in the fallback chain; 1 is tried first.
     pub priority: i32,

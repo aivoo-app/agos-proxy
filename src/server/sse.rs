@@ -2,7 +2,7 @@
 //!
 //! The streaming handler probes each upstream with the real request and only
 //! commits to a 2xx response once the body proves itself: several
-//! OpenAI-compatible providers (OpenRouter free tiers in particular) answer
+//! OpenAI-compatible providers (free tiers in particular) answer
 //! HTTP 200 and then deliver an *in-band* SSE error event. Both the probe loop
 //! and the pump task share this module's incremental frame parser so bytes are
 //! never lost between probe and pump, plus the per-provider usage extraction
@@ -122,7 +122,7 @@ fn parse_frame(raw: &[u8]) -> Option<SseFrame> {
 #[derive(Debug)]
 pub enum Frame<'a> {
     /// The frame carries an upstream error payload (`{"error": {...}}`) —
-    /// OpenRouter-style 200-with-error responses look like this.
+    /// Some providers answer 200 and then deliver an error as the first
     Error {
         code: Option<i64>,
         message: String,
@@ -282,7 +282,7 @@ mod tests {
     #[test]
     fn parser_skips_comments_and_multi_line_data() {
         let mut p = SseParser::new();
-        let frames = p.feed(b": OPENROUTER PROCESSING\n\nevent: delta\ndata: a\ndata: b\n\n");
+        let frames = p.feed(b": PROCESSING\n\nevent: delta\ndata: a\ndata: b\n\n");
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].event, "delta");
         assert_eq!(frames[0].data, "a\nb");

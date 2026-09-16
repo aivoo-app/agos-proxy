@@ -391,9 +391,9 @@ mod tests {
             provider: Provider {
                 id: 1,
                 profile_id: "p1".into(),
-                name: "deepseek".into(),
+                name: "example".into(),
                 description: None,
-                base_url: "https://api.deepseek.com".into(),
+                base_url: "https://api.example.com".into(),
                 auth_token: "sk-secret".into(),
                 kind: ProviderKind::OpenAICompatible,
                 extra_headers: extra,
@@ -402,7 +402,7 @@ mod tests {
                 id: 1,
                 route_id: 1,
                 provider_id: 1,
-                model_id: "deepseek-v4-flash".into(),
+                model_id: "example-model".into(),
                 priority: 1,
                 weight: 1.0,
                 status: ModelStatus::Healthy,
@@ -423,10 +423,10 @@ mod tests {
             extra: serde_json::Value::Null,
         };
         let (url, headers, body) = build_upstream_request(&target, &chat_req, false).unwrap();
-        assert_eq!(url, "https://api.deepseek.com/v1/chat/completions");
+        assert_eq!(url, "https://api.example.com/v1/chat/completions");
         assert_eq!(headers.get("Authorization").unwrap(), "Bearer sk-secret");
         assert_eq!(headers.get("X-Custom").unwrap(), "yes");
-        assert_eq!(body["model"], "deepseek-v4-flash");
+        assert_eq!(body["model"], "example-model");
     }
 
     #[test]
@@ -589,6 +589,6 @@ mod tests {
         assert!(body.get("agos_responses").is_none());
         assert!(body.get("economy_escalate").is_none());
         assert!(body.get("tools").is_some());
-        assert_eq!(body["model"], "deepseek-v4-flash");
+        assert_eq!(body["model"], "example-model");
     }
 }

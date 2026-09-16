@@ -1,11 +1,14 @@
-//! Live integration tests against the real Zen Responses endpoint.
+//! Live integration tests against a real OpenAI Responses upstream.
 //!
-//! Gated behind the `AGOS_LIVE_ZEN_KEY` environment variable: when unset the
-//! tests exit early so normal CI never makes network calls. Set the variable
-//! to a valid Zen API key to exercise them:
+//! Gated behind the `AGOS_LIVE_RESPONSES_KEY` environment variable: when unset
+//! the tests exit early so normal CI never makes network calls. Set the
+//! variables to a valid account to exercise them:
 //!
 //! ```console
-//! $ AGOS_LIVE_ZEN_KEY=sk-... cargo test --test responses_live_test -- --nocapture
+//! $ AGOS_LIVE_RESPONSES_KEY=sk-... \
+//!   AGOS_LIVE_RESPONSES_BASE=https://your-provider.example \
+//!   AGOS_LIVE_RESPONSES_MODEL=your-responses-only-model \
+//!   cargo test --test responses_live_test -- --nocapture
 //! ```
 
 use std::sync::Arc;
@@ -16,28 +19,40 @@ use agos::server::{create_app, AppState};
 use agos::storage::{NewProvider, Store};
 use tower::util::ServiceExt;
 
-fn zen_key() -> Option<String> {
-    std::env::var("AGOS_LIVE_ZEN_KEY")
+fn live_key() -> Option<String> {
+    std::env::var("AGOS_LIVE_RESPONSES_KEY")
         .ok()
         .filter(|k| !k.is_empty())
 }
 
-fn zen_base() -> String {
-    std::env::var("AGOS_LIVE_ZEN_BASE").unwrap_or_else(|_| "https://api.zen.ai".to_string())
+fn live_base() -> String {
+    std::env::var("AGOS_LIVE_RESPONSES_BASE")
+        .ok()
+        .filter(|b| !b.is_empty())
+        .unwrap_or_else(|| "https://api.example.com".to_string())
+}
+
+fn live_model() -> Option<String> {
+    std::env::var("AGOS_LIVE_RESPONSES_MODEL")
+        .ok()
+        .filter(|m| !m.is_empty())
 }
 
 #[tokio::test]
-async fn live_zen_list_models_and_chat() {
-    let Some(key) = zen_key() else {
-        eprintln!("skipping: AGOS_LIVE_ZEN_KEY not set");
+async fn live_responses_list_models_and_chat() {
+    let (Some(key), Some(model)) = (live_key(), live_model()) else {
+        eprintln!(
+            "skipping: set AGOS_LIVE_RESPONSES_KEY and AGOS_LIVE_RESPONSES_MODEL to run this test"
+        );
         return;
     };
-    let base = zen_base();
+    let base = live_base();
+    let trimmed_base = base.trim_end_matches('/');
 
     // 1. Sanity: the key can list models.
     let client = reqwest::Client::new();
     let models = client
-        .get(format!("{}/v1/models", base.trim_end_matches('/')))
+        .get(format!("{trimmed_base}/v1/models"))
         .bearer_auth(&key)
         .timeout(Duration::from_secs(30))
         .send()
@@ -47,10 +62,10 @@ async fn live_zen_list_models_and_chat() {
 
     // 2. One direct Responses call.
     let resp = client
-        .post(format!("{}/v1/responses", base.trim_end_matches('/')))
+        .post(format!("{trimmed_base}/v1/responses"))
         .bearer_auth(&key)
         .json(&serde_json::json!({
-            "model": "muse-spark-1-contributor-free",
+            "model": model,
             "input": "user: Reply with exactly: pong",
         }))
         .timeout(Duration::from_secs(60))
@@ -66,7 +81,7 @@ async fn live_zen_list_models_and_chat() {
         .create_provider(
             &profile.id,
             NewProvider {
-                name: "zen".into(),
+                name: "responses-upstream".into(),
                 description: None,
                 base_url: base.clone(),
                 auth_token: key,
@@ -86,7 +101,7 @@ async fn live_zen_list_models_and_chat() {
         .add_route_entry(
             route.id,
             provider.id,
-            "muse-spark-1-contributor-free",
+            &model,
             1,
             1.0,
             RouteCapabilities::default(),

@@ -161,11 +161,11 @@ fn add_provider(store: &Store, theme: &ColorfulTheme, profile: &Profile) -> Resu
     ensure_password_ok(profile)?;
 
     let name: String = Input::<String>::with_theme(theme)
-        .with_prompt("Provider name (e.g. deepseek)")
+        .with_prompt("Provider name (e.g. upstream)")
         .interact_text()?;
     let base_url: String = Input::<String>::with_theme(theme)
         .with_prompt("Base URL")
-        .default("https://api.deepseek.com".into())
+        .default("https://api.example.com".into())
         .interact_text()?;
     let auth_token = crate::cli::util::prompt_token(theme, "API token (stored encrypted)", false)?;
     let kind = pick_kind(theme)?;

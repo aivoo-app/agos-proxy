@@ -125,7 +125,7 @@ pub fn default_price_for(model_id: &str) -> f64 {
     let m = model_id.to_lowercase();
     // Cheap tier markers.
     for cheap in [
-        "mini", "haiku", "flash", "3.5", "glm", "deepseek", "qwen", "llama", "mistral",
+        "mini", "haiku", "flash", "3.5", "glm", "qwen", "llama", "mistral",
     ] {
         if m.contains(cheap) {
             return 0.4;
@@ -1378,9 +1378,9 @@ mod tests {
         let provider = store.create_provider(
             profile.id.as_str(),
             NewProvider {
-                name: "Deepseek".to_string(),
+                name: "provider-a".to_string(),
                 description: None,
-                base_url: "https://api.deepseek.com".to_string(),
+                base_url: "https://api.example.com".to_string(),
                 auth_token: "sk-secret".to_string(),
                 kind: ProviderKind::OpenAICompatible,
                 extra_headers: headers,
@@ -1516,23 +1516,23 @@ mod tests {
         let store = Store::open_in_memory()?;
         let profile = store.create_profile("coder1", None, None)?;
 
-        let deepseek = store.create_provider(
+        let provider_a = store.create_provider(
             profile.id.as_str(),
             NewProvider {
-                name: "Deepseek".to_string(),
+                name: "provider-a".to_string(),
                 description: None,
-                base_url: "https://api.deepseek.com".to_string(),
+                base_url: "https://api.example.com".to_string(),
                 auth_token: "a".to_string(),
                 kind: ProviderKind::OpenAICompatible,
                 extra_headers: std::collections::BTreeMap::new(),
             },
         )?;
-        let openrouter = store.create_provider(
+        let provider_b = store.create_provider(
             profile.id.as_str(),
             NewProvider {
-                name: "OpenRouter".to_string(),
+                name: "provider-b".to_string(),
                 description: None,
-                base_url: "https://openrouter.ai".to_string(),
+                base_url: "https://upstream.example".to_string(),
                 auth_token: "b".to_string(),
                 kind: ProviderKind::OpenAICompatible,
                 extra_headers: std::collections::BTreeMap::new(),
@@ -1550,7 +1550,7 @@ mod tests {
 
         let second = store.add_route_entry(
             route.id,
-            openrouter.id,
+            provider_b.id,
             "glm-5.3-flash",
             2,
             1.0,
@@ -1558,8 +1558,8 @@ mod tests {
         )?;
         let first = store.add_route_entry(
             route.id,
-            deepseek.id,
-            "deepseek-v4-flash",
+            provider_a.id,
+            "example-model",
             1,
             1.0,
             RouteCapabilities::default(),
@@ -1567,9 +1567,9 @@ mod tests {
 
         let chain = store.route_entries(route.id)?;
         // Insertion order was reversed, but the chain must surface priority order.
-        assert_eq!(chain[0].provider_id, deepseek.id);
+        assert_eq!(chain[0].provider_id, provider_a.id);
         assert_eq!(chain[0].id, first.id);
-        assert_eq!(chain[1].provider_id, openrouter.id);
+        assert_eq!(chain[1].provider_id, provider_b.id);
         assert_eq!(chain[1].id, second.id);
 
         store.set_route_entry_status(first.id, ModelStatus::Unhealthy)?;
