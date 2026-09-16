@@ -1,4 +1,4 @@
-//! Anthropic (Claude) inbound adapter.
+//! Anthropic inbound adapter.
 //!
 //! Serves `/anthropic/v1/messages`. Parses an Anthropic messages request into
 //! the canonical [`ChatRequest`] and renders canonical results back as

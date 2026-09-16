@@ -365,11 +365,11 @@ async fn anthropic_surface_translates_to_anthropic_shape() {
     assert_eq!(json["usage"]["input_tokens"], 0);
 }
 
-/// The Gemini surface is served under `/google/v1beta/models/{model}:generateContent`
+/// The Google surface is served under `/google/v1beta/models/{model}:generateContent`
 /// and authenticated with a `key=` query parameter. As with the other surfaces the
-/// response is translated back into Gemini's native shape.
+/// response is translated back into the native shape.
 #[tokio::test]
-async fn google_surface_translates_to_gemini_shape() {
+async fn google_surface_translates_to_native_shape() {
     let mock_port = 19880;
     let mock_base = format!("http://127.0.0.1:{mock_port}");
     let _mock = mock_upstream(mock_port).await;
@@ -624,7 +624,7 @@ async fn economy_routes_cheap_first_caches_and_escalates() {
         .add_route_entry(
             route.id,
             provider.id,
-            "gpt-4o",
+            "provider-pro",
             1,
             1.0,
             RouteCapabilities::default(),
@@ -634,7 +634,7 @@ async fn economy_routes_cheap_first_caches_and_escalates() {
         .add_route_entry(
             route.id,
             provider.id,
-            "gpt-4o-mini",
+            "provider-mini",
             2,
             1.0,
             RouteCapabilities::default(),
@@ -684,7 +684,7 @@ async fn economy_routes_cheap_first_caches_and_escalates() {
     assert_eq!(status, 200);
     assert_eq!(cache, "MISS");
     assert_eq!(hits.load(Ordering::SeqCst), 1);
-    assert_eq!(seen.lock().unwrap().last().unwrap(), "gpt-4o-mini");
+    assert_eq!(seen.lock().unwrap().last().unwrap(), "provider-mini");
 
     // 2. Exact repeat -> HIT, no new upstream call.
     let resp = app
@@ -712,7 +712,7 @@ async fn economy_routes_cheap_first_caches_and_escalates() {
     let (status, _c, _b) = meta(resp).await;
     assert_eq!(status, 200);
     assert_eq!(hits.load(Ordering::SeqCst), 2);
-    assert_eq!(seen.lock().unwrap().last().unwrap(), "gpt-4o");
+    assert_eq!(seen.lock().unwrap().last().unwrap(), "provider-pro");
 
     // 4. Body-flag escalation -> also hits the flagship.
     let esc = serde_json::json!({"model": "prog/eco",
@@ -722,7 +722,7 @@ async fn economy_routes_cheap_first_caches_and_escalates() {
     let (status, _c, _b) = meta(resp).await;
     assert_eq!(status, 200);
     assert_eq!(hits.load(Ordering::SeqCst), 3);
-    assert_eq!(seen.lock().unwrap().last().unwrap(), "gpt-4o");
+    assert_eq!(seen.lock().unwrap().last().unwrap(), "provider-pro");
 }
 
 // --- OpenAI Responses upstream ------------------------------------------------

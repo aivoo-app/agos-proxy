@@ -1,7 +1,7 @@
-//! Google (Gemini) inbound adapter.
+//! Google (Google) inbound adapter.
 //!
 //! Serves `/google/v1beta/models/{model}:generateContent` and
-//! `:streamGenerateContent`. The Gemini SDK places the model in the URL path;
+//! `:streamGenerateContent`. The Google SDK places the model in the URL path;
 //! the server injects it into the body before calling [`parse_request`] so the
 //! adapter stays focused on request/response shape.
 
@@ -12,7 +12,7 @@ use crate::translator::{CanonicalResponse, ChatRequest, Message, StreamEvent};
 /// The Google native inbound surface.
 pub struct GoogleAdapter;
 
-/// Map a Gemini finish reason onto our canonical finish reason.
+/// Map a Google finish reason onto our canonical finish reason.
 pub fn canonical_finish(reason: &str) -> &'static str {
     match reason {
         "MAX_TOKENS" => "length",
@@ -20,8 +20,8 @@ pub fn canonical_finish(reason: &str) -> &'static str {
     }
 }
 
-/// Map our canonical finish reason back onto a Gemini finish reason.
-pub fn gemini_finish(reason: &str) -> &'static str {
+/// Map our canonical finish reason back onto a Google finish reason.
+pub fn google_finish(reason: &str) -> &'static str {
     match reason {
         "length" => "MAX_TOKENS",
         _ => "STOP",
@@ -114,7 +114,7 @@ impl InboundAdapter for GoogleAdapter {
                     "parts": [{ "text": resp.text }],
                     "role": "model",
                 },
-                "finishReason": gemini_finish(&resp.finish_reason),
+                "finishReason": google_finish(&resp.finish_reason),
                 "index": 0,
             }],
             "usageMetadata": {
@@ -143,7 +143,7 @@ impl InboundAdapter for GoogleAdapter {
         if let Some(reason) = &ev.finish_reason {
             candidate.insert(
                 "finishReason".to_string(),
-                serde_json::Value::String(gemini_finish(reason).to_string()),
+                serde_json::Value::String(google_finish(reason).to_string()),
             );
         }
         let payload = serde_json::json!({ "candidates": [serde_json::Value::Object(candidate)] });

@@ -6,7 +6,7 @@
 //! HTTP 200 and then deliver an *in-band* SSE error event. Both the probe loop
 //! and the pump task share this module's incremental frame parser so bytes are
 //! never lost between probe and pump, plus the per-provider usage extraction
-//! and OpenAI-chunk rendering used to translate Anthropic/Gemini streams.
+//! and OpenAI-chunk rendering used to translate Anthropic/Google streams.
 
 use std::collections::VecDeque;
 
@@ -168,7 +168,7 @@ impl<'a> Frame<'a> {
 /// Extract `(prompt_tokens, completion_tokens)` from a frame's JSON, per
 /// provider shape. OpenAI-compatible chunks carry a `usage` object (sent when
 /// `stream_options.include_usage` is set); Anthropic splits it across
-/// `message_start` (input) and `message_delta` (output); Gemini carries
+/// `message_start` (input) and `message_delta` (output); Google carries
 /// `usageMetadata` on every chunk.
 pub fn frame_usage(kind: ProviderKind, json: &serde_json::Value) -> (Option<u64>, Option<u64>) {
     let num = |v: &serde_json::Value| v.as_u64().or_else(|| v.as_i64().map(|n| n.max(0) as u64));
@@ -200,7 +200,7 @@ pub fn frame_usage(kind: ProviderKind, json: &serde_json::Value) -> (Option<u64>
 
 /// Render a canonical [`StreamEvent`] as an OpenAI `chat.completion.chunk` JSON
 /// string (the `data:` payload, without framing). Used to translate Anthropic
-/// and Gemini streams for OpenAI-format clients.
+/// and Google streams for OpenAI-format clients.
 pub fn render_openai_chunk(
     model: &str,
     id: &str,
@@ -346,12 +346,12 @@ mod tests {
             frame_usage(ProviderKind::Anthropic, &delta),
             (None, Some(3))
         );
-        let gemini: serde_json::Value = serde_json::from_str(
+        let google_usage: serde_json::Value = serde_json::from_str(
             r#"{"usageMetadata":{"promptTokenCount":2,"candidatesTokenCount":4}}"#,
         )
         .unwrap();
         assert_eq!(
-            frame_usage(ProviderKind::Google, &gemini),
+            frame_usage(ProviderKind::Google, &google_usage),
             (Some(2), Some(4))
         );
     }

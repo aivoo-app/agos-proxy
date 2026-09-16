@@ -1,4 +1,4 @@
-//! Anthropic (Claude) native request/response translation.
+//! Anthropic native request/response translation.
 //!
 //! Translates between the OpenAI-compatible chat-completions format and
 //! Anthropic's `/v1/messages` API. Reference:

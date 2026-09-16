@@ -120,7 +120,7 @@ pub struct RouteSpec {
 pub struct ModelSpec {
     /// Provider `name` the entry points at.
     pub provider: String,
-    /// Upstream model identifier, e.g. `gpt-4o-mini`.
+    /// Upstream model identifier, e.g. `provider/model`.
     pub model: String,
     /// Lower wins; defaults to declaration order.
     #[serde(default)]

@@ -82,7 +82,7 @@ pub fn content_text(content: &serde_json::Value) -> String {
 /// A provider-independent single-turn response, produced by the outbound
 /// adapters and consumed by [`crate::adapter::inbound`] inbound adapters so
 /// each can render its own native response shape. This is the seam that lets a
-/// single outbound result feed an OpenAI, Anthropic, or Gemini client
+/// single outbound result feed an OpenAI, Anthropic, or Google client
 /// unchanged.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct CanonicalResponse {

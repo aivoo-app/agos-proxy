@@ -120,28 +120,17 @@ fn now_millis() -> i64 {
 }
 
 /// Heuristic blended price (USD / 1M tokens) so Economy works out of the box.
-/// Cheap flash/mini/haiku ≈ 0.4, flagship gpt-4o/sonnet/opus ≈ 6.0.
+/// Cheap flash/mini/micro/nano ≈ 0.4, pro/max/ultra ≈ 6.0.
 pub fn default_price_for(model_id: &str) -> f64 {
     let m = model_id.to_lowercase();
     // Cheap tier markers.
-    for cheap in [
-        "mini", "haiku", "flash", "3.5", "glm", "qwen", "llama", "mistral",
-    ] {
+    for cheap in ["mini", "micro", "flash", "nano"] {
         if m.contains(cheap) {
             return 0.4;
         }
     }
     // Flagship markers.
-    for expensive in [
-        "gpt-4o",
-        "gpt-4",
-        "sonnet",
-        "opus",
-        "o1",
-        "o3",
-        "gemini-1.5-pro",
-        "gemini-2",
-    ] {
+    for expensive in ["pro", "max", "ultra"] {
         if m.contains(expensive) {
             return 6.0;
         }
@@ -1551,7 +1540,7 @@ mod tests {
         let second = store.add_route_entry(
             route.id,
             provider_b.id,
-            "glm-5.3-flash",
+            "provider-flash",
             2,
             1.0,
             RouteCapabilities::default(),
@@ -1603,7 +1592,7 @@ mod tests {
         let entry = store.add_route_entry(
             route.id,
             provider.id,
-            "gpt-4o-mini",
+            "provider-mini",
             1,
             1.0,
             RouteCapabilities::default(),
@@ -1635,9 +1624,9 @@ mod tests {
 
     #[test]
     fn default_price_heuristics() {
-        assert!(crate::storage::default_price_for("gpt-4o-mini") < 1.0);
-        assert!(crate::storage::default_price_for("claude-haiku") < 1.0);
-        assert!(crate::storage::default_price_for("gpt-4o") > 5.0);
-        assert!(crate::storage::default_price_for("gemini-flash") < 1.0);
+        assert!(crate::storage::default_price_for("provider-mini") < 1.0);
+        assert!(crate::storage::default_price_for("provider-micro") < 1.0);
+        assert!(crate::storage::default_price_for("provider-pro") > 5.0);
+        assert!(crate::storage::default_price_for("provider-flash") < 1.0);
     }
 }

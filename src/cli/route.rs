@@ -77,7 +77,7 @@ pub enum ModelArgs {
         /// Provider name (skips the provider picker).
         #[arg(long)]
         provider: Option<String>,
-        /// Model ID (e.g. `openai/gpt-4o-mini`; skips the model prompt).
+        /// Model ID (e.g. `openai/provider-model`; skips the model prompt).
         #[arg(long = "model")]
         model_id: Option<String>,
         /// Weighted-strategy share; defaults to 1.0.

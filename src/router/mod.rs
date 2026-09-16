@@ -615,7 +615,7 @@ mod tests {
             .add_route_entry(
                 route.id,
                 flagship_p.id,
-                "gpt-4o",
+                "provider-pro",
                 1,
                 1.0,
                 Default::default(),
@@ -625,7 +625,7 @@ mod tests {
             .add_route_entry(
                 route.id,
                 cheap_p.id,
-                "gpt-4o-mini",
+                "provider-mini",
                 2,
                 1.0,
                 Default::default(),
@@ -644,8 +644,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(targets.len(), 2);
-        assert_eq!(targets[0].entry.model_id, "gpt-4o-mini");
-        assert_eq!(targets[1].entry.model_id, "gpt-4o");
+        assert_eq!(targets[0].entry.model_id, "provider-mini");
+        assert_eq!(targets[1].entry.model_id, "provider-pro");
     }
 
     #[test]

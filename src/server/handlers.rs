@@ -904,7 +904,7 @@ fn log_stream_outcome(
 ///   after the headers cannot hang the client forever (Bug 2);
 /// - keeps watching for in-band error events and reports them as failed
 ///   attempts instead of successes (Bug 1, post-commit);
-/// - translates Anthropic/Gemini SSE into OpenAI `chat.completion.chunk`
+/// - translates Anthropic/Google SSE into OpenAI `chat.completion.chunk`
 ///   deltas; OpenAI-compatible streams pass through verbatim (Bug 4);
 /// - extracts the upstream usage frames and records exactly one usage row with
 ///   the real status and token counts (Bug 6).

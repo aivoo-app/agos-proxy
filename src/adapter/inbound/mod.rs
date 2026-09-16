@@ -1,7 +1,7 @@
 //! Inbound adapters.
 //!
 //! Each adapter implements one native client surface on top of the canonical
-//! request/response model, so a caller can point an OpenAI, Anthropic, Gemini,
+//! request/response model, so a caller can point an OpenAI, Anthropic, Google,
 //! or Codex (Responses API) client at AGOS Proxy and speak its own native
 //! dialect.
 

@@ -8,7 +8,7 @@
 //!
 //! - [`openai`]: OpenAI-compatible passthrough (also covers `custom` kinds)
 //! - [`anthropic`]: Anthropic `/v1/messages`
-//! - [`google`]: Gemini `generateContent`
+//! - [`google`]: Google `generateContent`
 
 pub mod anthropic;
 pub mod google;
@@ -99,7 +99,7 @@ pub fn translate_response(target: &Target, bytes: &[u8]) -> Result<Vec<u8>> {
         }
         ProviderKind::Google => {
             let resp: serde_json::Value =
-                serde_json::from_slice(bytes).context("parsing gemini response")?;
+                serde_json::from_slice(bytes).context("parsing google response")?;
             let out = google::translate_response(&resp, &target.entry.model_id)?;
             serde_json::to_vec(&out).context("serializing translated response")
         }
