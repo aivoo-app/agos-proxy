@@ -60,6 +60,21 @@ Anthropic, OpenAI Responses (Codex), and Gemini native endpoints.
   overview, command summary, request lifecycle, health model, routing strategies,
   security model, tech stack, and documentation index.
 
+### Fixed
+
+- Provider-kind examples in the documentation, README, quick reference and the
+  docker-compose seed used `generic`, a tag the CLI has never accepted; the
+  binary's canonical tag is `openai`. Every example now matches the code, and
+  the stale `openai_compatible` references in `docs/configuration.md` and
+  `docs/providers.md` were corrected too. Before this fix, seeding the compose
+  stack failed with `unknown provider kind "generic"`.
+- `bootstrap` setup documents accept `"kind": "custom"` again (the alias
+  `provider add --kind custom` always accepted); it regressed out of the
+  bootstrap parser during the provider-kind rename.
+- New regression test asserts the provider kinds embedded in
+  `docker-compose.yml` are tags the CLI actually parses, so docs/config and
+  code cannot silently drift apart again.
+
 ## [0.1.1] - 2026-09-14
 
 ### Fixed

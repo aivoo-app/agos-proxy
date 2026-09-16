@@ -110,7 +110,7 @@ tree.
   "description": "optional",
   "base_url": "https://api.deepseek.com",
   "auth_token": "sk-...",
-  "kind": "generic",
+  "kind": "openai",
   "extra_headers": { "X-Custom": "value" }
 }
 ```
@@ -121,10 +121,10 @@ tree.
 | `description`  | no       | string    | Free-text.                                               |
 | `base_url`     | yes      | string    | Upstream base URL.                                       |
 | `auth_token`   | yes      | string    | Upstream API token; stored encrypted at rest.           |
-| `kind`         | no       | string    | One of `openai_compatible`, `openai_responses`, `anthropic`, `google`. |
+| `kind`         | no       | string    | One of `openai`, `openai_responses`, `anthropic`, `google`, `custom`. |
 | `extra_headers`| no       | object    | Extra headers sent with every upstream request.         |
 
-Defaults: `kind` = `openai_compatible`; `extra_headers` = `{}`.
+Defaults: `kind` = `openai`; `extra_headers` = `{}`.
 
 ### Proxy
 
@@ -201,7 +201,7 @@ for bootstrap — you can always restrict later with `route model` commands).
       "name": "mock",
       "base_url": "http://mock:9999",
       "auth_token": "sk-mock",
-      "kind": "generic"
+      "kind": "openai"
     }
   ],
   "proxies": [

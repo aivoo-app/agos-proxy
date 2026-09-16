@@ -69,7 +69,7 @@ atos-proxy provider add --profile coder1
 # name: deepseek
 # base_url: https://api.deepseek.com
 # auth_token: sk-... (your DeepSeek API key)
-# kind: generic
+# kind: openai
 ```
 
 Route entry:
@@ -85,7 +85,7 @@ atos-proxy provider add --profile coder1
 # name: openrouter
 # base_url: https://openrouter.ai/api/v1
 # auth_token: sk-or-v1-...
-# kind: generic
+# kind: openai
 ```
 
 Route entry:
@@ -101,7 +101,7 @@ atos-proxy provider add --profile coder1
 # name: ollama
 # base_url: http://localhost:11434/v1
 # auth_token: (empty if no auth)
-# kind: generic
+# kind: openai
 ```
 
 Route entry:
@@ -119,7 +119,7 @@ atos-proxy provider add --profile coder1
 # name: openai
 # base_url: https://api.openai.com/v1
 # auth_token: sk-...
-# kind: generic
+# kind: openai
 ```
 
 Route entry:
@@ -219,7 +219,7 @@ Some models — notably the Zen `muse-*` free tiers — only serve the OpenAI
 *Responses* endpoint (`POST {base}/v1/responses`) and reject
 `/v1/chat/completions`. Create the provider with
 `provider add --kind openai_responses` (same base URL, Bearer token and
-repeatable `--header` support as `openai_compatible`).
+repeatable `--header` support as `openai`).
 
 How a chat request is served:
 

@@ -34,7 +34,7 @@ cargo build --release
 # name: openai
 # base_url: https://api.openai.com/v1
 # auth_token: sk-...
-# kind: generic
+# kind: openai
 
 # 4. Create a proxy + route
 ./target/release/agos-proxy proxy create --profile coder1
@@ -343,13 +343,13 @@ This is the intended way to give an agent or a provisioning script its own self-
       "name": "primary",
       "base_url": "https://api.openai.com/v1",
       "auth_token": "sk-...",
-      "kind": "generic"
+      "kind": "openai"
     },
     {
       "name": "fallback",
       "base_url": "https://openrouter.ai/api/v1",
       "auth_token": "sk-or-v1-...",
-      "kind": "generic"
+      "kind": "openai"
     }
   ],
   "proxies": [

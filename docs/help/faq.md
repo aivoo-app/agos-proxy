@@ -121,7 +121,7 @@ Any provider that speaks one of these protocols:
 
 ### Can I add a custom provider?
 
-If it speaks an OpenAI-format API, yes — use kind `generic`. If it speaks a completely different protocol, you'd need to add a translator module (see [docs/providers.md](docs/providers.md)).
+If it speaks an OpenAI-format API, yes — use kind `openai`. If it speaks a completely different protocol, you'd need to add a translator module (see [docs/providers.md](docs/providers.md)).
 
 ### How do I set up OpenRouter?
 
@@ -130,7 +130,7 @@ agos-proxy provider add --profile myprofile
 # name: openrouter
 # base_url: https://openrouter.ai/api/v1
 # auth_token: sk-or-v1-...
-# kind: generic
+# kind: openai
 ```
 
 Then in a route entry: `{ "provider": "openrouter", "model": "openai/gpt-4o" }`.
@@ -142,7 +142,7 @@ agos-proxy provider add --profile dev
 # name: ollama
 # base_url: http://localhost:11434/v1
 # auth_token: (leave empty)
-# kind: generic
+# kind: openai
 ```
 
 ---
