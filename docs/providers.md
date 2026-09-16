@@ -168,6 +168,10 @@ Route entry:
   Anthropic.
 - Tool/function calling is supported through the translator where the provider
   supports it.
+- **Vision:** image parts in message content are forwarded as Anthropic `image`
+  blocks — `source.type = "url"` for `http(s)` references and
+  `source.type = "base64"` for `data:` URLs. Images inside `system` prompts are
+  dropped (Anthropic system prompts are text-only).
 
 ## Google Gemini
 
@@ -203,6 +207,11 @@ Route entry:
   when the base URL and provider kind indicate Google.
 - Streaming is supported through the Gemini streaming endpoint.
 - Token usage is reported as Google returns it.
+- **Vision:** image parts in message content are forwarded as Gemini parts —
+  `fileData` (`fileUri` + MIME type inferred from the URL's file extension,
+  `image/jpeg` default) for `http(s)` references and `inlineData` for `data:`
+  URLs. Images inside `systemInstruction` are dropped (Gemini system
+  instructions are text-only).
 
 ## OpenAI Responses upstreams
 

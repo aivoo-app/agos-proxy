@@ -31,6 +31,18 @@ Anthropic, OpenAI Responses (Codex), and Gemini native endpoints.
 
 ### Added
 
+- **Vision passthrough:** multimodal chat requests (OpenAI parts arrays with
+  `text` + `image_url` entries) now keep their images end to end. The
+  Anthropic outbound adapter maps image parts to `image` blocks (`url` and
+  `base64` sources), the Google adapter maps them to Gemini `fileData` /
+  `inlineData` parts, and the Anthropic and Gemini inbound surfaces accept
+  their native image shapes and normalize them into the canonical parts array.
+  OpenAI/custom upstreams were already lossless and are unchanged; text-only
+  requests serialize byte-identically to before.
+- Failover for image-rejecting upstreams: a 4xx whose error body names
+  images/vision marks the route entry Unhealthy so the next chain entry is
+  tried, instead of surfacing the rejection to the caller. Other 4xx keep the
+  existing no-demotion behavior.
 - Comprehensive documentation tree: README, architecture, configuration,
   security, API, providers, failover, development, deployment, workflow,
   contributing guide, and security policy.
