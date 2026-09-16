@@ -42,7 +42,7 @@ fn strip_internal_keys(body: &mut serde_json::Value) {
 pub fn build_upstream_request(
     target: &Target,
     chat_req: &ChatRequest,
-    _stream: bool,
+    stream: bool,
 ) -> Result<(String, BTreeMap<String, String>, serde_json::Value)> {
     let base = normalize_base(&target.provider.base_url);
     let url = format!("{base}/v1/chat/completions");
@@ -63,6 +63,15 @@ pub fn build_upstream_request(
             "model".to_string(),
             serde_json::Value::String(target.entry.model_id.clone()),
         );
+        // Ask streaming upstreams for the usage frame so streamed traffic gets
+        // real token counts in the usage log. Providers that don't support the
+        // field fail the attempt and fail over, same as any other 4xx.
+        if stream && !obj.contains_key("stream_options") {
+            obj.insert(
+                "stream_options".to_string(),
+                serde_json::json!({ "include_usage": true }),
+            );
+        }
     }
     Ok((url, headers, body))
 }

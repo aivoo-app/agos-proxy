@@ -164,6 +164,15 @@ pub fn parse_stream_chunk(data: &str) -> Option<crate::translator::StreamEvent> 
                 ..Default::default()
             })
         }
+        "message_start" => {
+            // The input token count arrives once, on the opening event.
+            Some(crate::translator::StreamEvent {
+                prompt_tokens: v
+                    .pointer("/message/usage/input_tokens")
+                    .and_then(|t| t.as_u64()),
+                ..Default::default()
+            })
+        }
         "message_delta" => {
             let stop_reason = v
                 .pointer("/delta/stop_reason")

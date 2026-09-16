@@ -116,6 +116,7 @@ fn test_state(store: Store) -> AppState {
     AppState {
         store: Arc::new(store),
         attempt_timeout: Duration::from_secs(5),
+        stream_idle_timeout: Duration::from_secs(5),
         http_client: reqwest::Client::new(),
         routing_state: agos::router::RoutingState::default(),
         rate_limiter: Arc::new(agos::server::ratelimit::RateLimiter::new()),
@@ -188,6 +189,7 @@ async fn chat_completions_routes_through_mock_upstream() {
     let state = AppState {
         store: Arc::new(store),
         attempt_timeout: Duration::from_secs(5),
+        stream_idle_timeout: Duration::from_secs(5),
         http_client,
         routing_state: agos::router::RoutingState::default(),
         rate_limiter: Arc::new(agos::server::ratelimit::RateLimiter::new()),
@@ -234,6 +236,7 @@ async fn chat_completions_rejects_missing_auth() {
     let state = AppState {
         store: Arc::new(store),
         attempt_timeout: Duration::from_secs(5),
+        stream_idle_timeout: Duration::from_secs(5),
         http_client,
         routing_state: agos::router::RoutingState::default(),
         rate_limiter: Arc::new(agos::server::ratelimit::RateLimiter::new()),
@@ -274,6 +277,7 @@ async fn list_models_returns_caller_routes() {
     let state = AppState {
         store: Arc::new(store),
         attempt_timeout: Duration::from_secs(5),
+        stream_idle_timeout: Duration::from_secs(5),
         http_client,
         routing_state: agos::router::RoutingState::default(),
         rate_limiter: Arc::new(agos::server::ratelimit::RateLimiter::new()),
@@ -316,6 +320,7 @@ async fn anthropic_surface_translates_to_anthropic_shape() {
     let state = AppState {
         store: Arc::new(store),
         attempt_timeout: Duration::from_secs(5),
+        stream_idle_timeout: Duration::from_secs(5),
         http_client,
         routing_state: agos::router::RoutingState::default(),
         rate_limiter: Arc::new(agos::server::ratelimit::RateLimiter::new()),
@@ -369,6 +374,7 @@ async fn google_surface_translates_to_gemini_shape() {
     let state = AppState {
         store: Arc::new(store),
         attempt_timeout: Duration::from_secs(5),
+        stream_idle_timeout: Duration::from_secs(5),
         http_client,
         routing_state: agos::router::RoutingState::default(),
         rate_limiter: Arc::new(agos::server::ratelimit::RateLimiter::new()),

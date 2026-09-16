@@ -283,11 +283,18 @@ where
     }
 
     let mut last_error = None;
+    // (target, upstream status code if the attempt carried one). The status
+    // drives the demotion classification below.
+    let mut failures: Vec<(Target, Option<i64>)> = Vec::new();
     for target in &targets {
         match timeout(attempt_timeout, attempt_fn(target.clone())).await {
             Ok(Ok(bytes)) => return Ok(bytes),
             Ok(Err(e)) => {
+                let status = e
+                    .downcast_ref::<crate::adapter::outbound::ProviderError>()
+                    .map(|pe| pe.status.as_u16() as i64);
                 last_error = Some(e);
+                failures.push((target.clone(), status));
                 tracing::warn!(
                     provider = %target.provider.name,
                     model = %target.entry.model_id,
@@ -298,6 +305,7 @@ where
                 last_error = Some(anyhow::anyhow!(
                     "attempt timed out after {attempt_timeout:?}"
                 ));
+                failures.push((target.clone(), None));
                 tracing::warn!(
                     provider = %target.provider.name,
                     model = %target.entry.model_id,
@@ -307,13 +315,33 @@ where
         }
     }
 
-    for target in &targets {
-        let _ = store.set_route_entry_status(target.entry.id, ModelStatus::Unhealthy);
+    // Demote per failure classification (see [`demote_status_for`]): only
+    // provider-side failures (5xx, transport errors, timeouts, 429 as
+    // Degraded) take an entry out of rotation. Client-side 4xx that originate
+    // from the translated request body would otherwise take a perfectly
+    // healthy chain dark on a single malformed request.
+    for (target, status_code) in &failures {
+        if let Some(status) = demote_status_for(*status_code) {
+            let _ = store.set_route_entry_status(target.entry.id, status);
+        }
     }
 
     match last_error {
         Some(e) => Err(e),
         None => bail!("all targets failed"),
+    }
+}
+
+/// Classify a failure status into a demotion decision. Provider-side failures
+/// demote the entry (429 only Degraded, everything else Unhealthy); client-side
+/// 4xx that originates from the translated request body itself never demotes.
+/// Failures without a known status (transport errors, timeouts) are treated as
+/// provider-side.
+fn demote_status_for(status_code: Option<i64>) -> Option<ModelStatus> {
+    match status_code {
+        Some(429) => Some(ModelStatus::Degraded),
+        Some(c) if (400..500).contains(&c) => None,
+        _ => Some(ModelStatus::Unhealthy),
     }
 }
 

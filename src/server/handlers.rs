@@ -8,6 +8,7 @@ use axum::extract::{Request, State};
 use axum::response::Response;
 use futures::StreamExt;
 
+use super::sse;
 use crate::adapter::outbound;
 use crate::adapter::Registry;
 use crate::router::{execute_with_failover, resolve_targets_with_strategy, RoutingState};
@@ -23,6 +24,9 @@ const HANDLER_BODY_LIMIT: usize = 5 * 1024 * 1024;
 pub struct AppState {
     pub store: Arc<Store>,
     pub attempt_timeout: Duration,
+    /// Max gap between upstream stream chunks once committed; a provider that
+    /// stalls longer than this fails the stream instead of hanging the client.
+    pub stream_idle_timeout: Duration,
     pub http_client: reqwest::Client,
     pub routing_state: RoutingState,
     pub rate_limiter: Arc<crate::server::ratelimit::RateLimiter>,
@@ -460,6 +464,7 @@ async fn handle_streaming(
     let model = chat_req.model.clone();
     let store = state.store.clone();
     let attempt_timeout = state.attempt_timeout;
+    let stream_idle_timeout = state.stream_idle_timeout;
     let client = state.http_client.clone();
 
     // Try each upstream in sequence to establish a successful HTTP connection
@@ -487,10 +492,13 @@ async fn handle_streaming(
     };
 
     // Find the first working upstream: send the request for real and only
-    // commit to the 200 SSE response once an upstream answers 2xx. Failed
-    // attempts are logged and the next target is tried, so the client never
-    // receives a 200 that carries no data.
-    let mut working: Option<(crate::router::Target, reqwest::Response, std::time::Instant)> = None;
+    // commit once an upstream's body proves itself. Several OpenAI-compatible
+    // providers (OpenRouter free tiers in particular) answer HTTP 200 and then
+    // deliver an *in-band* SSE error event (`data: {"error": ...}`), so a 2xx
+    // alone is not enough — the first frames must carry real content before
+    // the 200 goes out to the client. Failed attempts are logged, the entry is
+    // demoted per the failure classification, and the next target is tried.
+    let mut working: Option<(crate::router::Target, ProbeOutcome)> = None;
 
     for target in targets {
         let started_at = std::time::Instant::now();
@@ -502,56 +510,125 @@ async fn handle_streaming(
             }
         };
 
-        match tokio::time::timeout(attempt_timeout, client.execute(req)).await {
-            Ok(Ok(resp)) if resp.status().is_success() => {
-                // Found a working upstream; keep the response and stream it.
-                working = Some((target, resp, started_at));
-                break;
-            }
+        let resp = match tokio::time::timeout(attempt_timeout, client.execute(req)).await {
+            Ok(Ok(resp)) if resp.status().is_success() => resp,
             Ok(Ok(resp)) => {
                 // Non-success status, log and try the next target.
                 let status = resp.status();
                 let bytes = resp.bytes().await.unwrap_or_default();
-                log_attempt(
+                fail_stream_attempt(
                     &store,
                     &profile_id,
                     &target,
-                    true,
-                    &Err(anyhow::anyhow!(
-                        "provider returned {}: {}",
-                        status,
+                    Some(status.as_u16() as i32),
+                    format!(
+                        "provider returned {status}: {}",
                         String::from_utf8_lossy(&bytes)
-                    )),
+                    ),
                     started_at.elapsed().as_millis() as i64,
                 );
+                continue;
             }
             Ok(Err(e)) => {
                 // Upstream connection failed.
-                log_attempt(
+                fail_stream_attempt(
                     &store,
                     &profile_id,
                     &target,
-                    true,
-                    &Err(anyhow::anyhow!("upstream failed: {e}")),
+                    None,
+                    format!("upstream failed: {e}"),
                     started_at.elapsed().as_millis() as i64,
                 );
+                continue;
             }
             Err(_) => {
-                // Upstream timed out.
-                log_attempt(
+                // Upstream timed out before sending headers.
+                fail_stream_attempt(
                     &store,
                     &profile_id,
                     &target,
-                    true,
-                    &Err(anyhow::anyhow!("upstream timeout")),
+                    None,
+                    "upstream timeout".to_string(),
                     started_at.elapsed().as_millis() as i64,
                 );
+                continue;
+            }
+        };
+
+        // Probe the 2xx body: read frames until the stream proves it is a real
+        // completion (commit) or reveals an in-band error (fail over).
+        match probe_stream(stream_idle_timeout, resp).await {
+            Probe::Committed {
+                stream,
+                parser,
+                pending,
+            } => {
+                working = Some((
+                    target,
+                    ProbeOutcome {
+                        stream,
+                        parser,
+                        pending,
+                        started_at,
+                    },
+                ));
+                break;
+            }
+            Probe::InBandError { code, message } => {
+                tracing::warn!(
+                    provider = %target.provider.name,
+                    model = %target.entry.model_id,
+                    code = ?code,
+                    "upstream answered 2xx with an in-band SSE error, failing over"
+                );
+                fail_stream_attempt(
+                    &store,
+                    &profile_id,
+                    &target,
+                    Some(code.unwrap_or(502) as i32),
+                    format!("upstream in-band error: {message}"),
+                    started_at.elapsed().as_millis() as i64,
+                );
+                continue;
+            }
+            Probe::Failed(msg) => {
+                fail_stream_attempt(
+                    &store,
+                    &profile_id,
+                    &target,
+                    None,
+                    msg,
+                    started_at.elapsed().as_millis() as i64,
+                );
+                continue;
+            }
+            Probe::Timeout => {
+                fail_stream_attempt(
+                    &store,
+                    &profile_id,
+                    &target,
+                    Some(504),
+                    "upstream stalled before sending any stream data".to_string(),
+                    started_at.elapsed().as_millis() as i64,
+                );
+                continue;
+            }
+            Probe::Transport(e) => {
+                fail_stream_attempt(
+                    &store,
+                    &profile_id,
+                    &target,
+                    None,
+                    format!("stream error: {e}"),
+                    started_at.elapsed().as_millis() as i64,
+                );
+                continue;
             }
         }
     }
 
     // If no working upstream was found, fail before any 200 is sent.
-    let Some((target, resp, started)) = working else {
+    let Some((target, outcome)) = working else {
         let error_response = serde_json::json!({
             "error": {
                 "message": "All upstream providers failed",
@@ -568,44 +645,17 @@ async fn handle_streaming(
 
     // A working upstream is confirmed: stream its response body to the client.
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(16);
-    let store_clone = store.clone();
-    let profile_id_clone = profile_id.clone();
 
-    tokio::spawn(async move {
-        let mut stream = resp.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            match chunk {
-                Ok(bytes) => {
-                    if tx.send(Ok(bytes)).await.is_err() {
-                        return;
-                    }
-                }
-                Err(e) => {
-                    let _ = tx
-                        .send(Err(std::io::Error::other(format!("stream error: {e}"))))
-                        .await;
-                    log_attempt(
-                        &store_clone,
-                        &profile_id_clone,
-                        &target,
-                        true,
-                        &Err(anyhow::anyhow!("stream error: {e}")),
-                        started.elapsed().as_millis() as i64,
-                    );
-                    return;
-                }
-            }
-        }
-
-        log_attempt(
-            &store_clone,
-            &profile_id_clone,
-            &target,
-            true,
-            &Ok(Vec::new()),
-            started.elapsed().as_millis() as i64,
-        );
-    });
+    tokio::spawn(pump_stream(
+        target.clone(),
+        target.provider.kind,
+        outcome,
+        model,
+        stream_idle_timeout,
+        tx,
+        store.clone(),
+        profile_id,
+    ));
 
     let body = axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
     Response::builder()
@@ -614,6 +664,366 @@ async fn handle_streaming(
         .header("Cache-Control", "no-cache")
         .body(body)
         .unwrap()
+}
+
+/// The state a committed upstream stream carries from the probe into the pump:
+/// the partially-consumed body stream, the parser holding any half-received
+/// frame bytes, and frames that were decoded after the commit decision.
+struct ProbeOutcome {
+    stream: futures::stream::BoxStream<'static, reqwest::Result<Bytes>>,
+    parser: sse::SseParser,
+    pending: sse::PendingFrames,
+    started_at: std::time::Instant,
+}
+
+/// Result of probing an upstream 2xx body before committing to it.
+enum Probe {
+    /// The body carries a real completion stream; hand the remnants to the pump.
+    Committed {
+        stream: futures::stream::BoxStream<'static, reqwest::Result<Bytes>>,
+        parser: sse::SseParser,
+        pending: sse::PendingFrames,
+    },
+    /// The stream delivered an in-band error event before any content.
+    InBandError { code: Option<i64>, message: String },
+    /// The stream ended without ever carrying content.
+    Failed(String),
+    /// No frame arrived within the idle timeout.
+    Timeout,
+    /// The body stream errored at the transport level.
+    Transport(String),
+}
+
+/// Outcome of awaiting the next upstream chunk under the idle guard.
+enum NextChunk {
+    /// A body chunk arrived.
+    Chunk(Bytes),
+    /// The upstream closed the stream cleanly.
+    End,
+    /// Nothing arrived within the idle window.
+    Idle,
+    /// The transport failed mid-stream.
+    Transport(String),
+}
+
+/// Await the next chunk from a committed upstream stream, applying the idle
+/// timeout. A zero window disables the guard entirely, which lets operators opt
+/// out via `AGOS_STREAM_IDLE_TIMEOUT_SECS=0` when a provider is legitimately
+/// slow between chunks.
+async fn next_chunk(
+    stream: &mut futures::stream::BoxStream<'static, reqwest::Result<Bytes>>,
+    idle_timeout: Duration,
+) -> NextChunk {
+    let awaited = async {
+        match stream.next().await {
+            Some(Ok(bytes)) => NextChunk::Chunk(bytes),
+            Some(Err(e)) => NextChunk::Transport(e.to_string()),
+            None => NextChunk::End,
+        }
+    };
+    if idle_timeout.is_zero() {
+        return awaited.await;
+    }
+    match tokio::time::timeout(idle_timeout, awaited).await {
+        Ok(outcome) => outcome,
+        Err(_) => NextChunk::Idle,
+    }
+}
+
+/// Read frames from a 2xx streaming response until the body proves it is a
+/// real completion. The very first frames decide: an in-band `{"error": ...}`
+/// payload means the attempt failed (fail over), anything else commits — the
+/// already-decoded frames travel to the pump so no bytes are lost.
+async fn probe_stream(idle_timeout: Duration, resp: reqwest::Response) -> Probe {
+    let mut parser = sse::SseParser::new();
+    let mut pending = sse::PendingFrames::new();
+    let mut stream: futures::stream::BoxStream<'static, reqwest::Result<Bytes>> =
+        Box::pin(resp.bytes_stream());
+
+    loop {
+        if let Some(frame) = pending.pop_front() {
+            match sse::Frame::classify(&frame.data) {
+                sse::Frame::Error { code, message, .. } => {
+                    return Probe::InBandError { code, message };
+                }
+                sse::Frame::Done => {
+                    if pending.is_empty() && parser.buf_is_empty() {
+                        // `data: [DONE]` with zero content is the empty-200
+                        // failure mode, not a success.
+                        return Probe::Failed(
+                            "upstream returned an empty stream (only [DONE])".to_string(),
+                        );
+                    }
+                    // Content already seen in this chunk: commit, the pump
+                    // forwards the sentinel.
+                    pending.push_front(frame);
+                    return Probe::Committed {
+                        stream,
+                        parser,
+                        pending,
+                    };
+                }
+                sse::Frame::Other { .. } => {
+                    // Real content: commit. This frame and everything decoded
+                    // after it is replayed by the pump.
+                    pending.push_front(frame);
+                    return Probe::Committed {
+                        stream,
+                        parser,
+                        pending,
+                    };
+                }
+            }
+        }
+
+        match next_chunk(&mut stream, idle_timeout).await {
+            NextChunk::Idle => return Probe::Timeout,
+            NextChunk::End => {
+                pending.extend(parser.finish());
+                if pending.is_empty() {
+                    return Probe::Failed(
+                        "upstream closed the stream without sending data".to_string(),
+                    );
+                }
+            }
+            NextChunk::Transport(e) => return Probe::Transport(e),
+            NextChunk::Chunk(bytes) => {
+                pending.extend(parser.feed(&bytes));
+            }
+        }
+    }
+}
+
+/// Classify a failure status into a demotion decision. Provider-side failures
+/// demote the entry (429 only Degraded, everything else Unhealthy); client-side
+/// 4xx that originates from the translated request body itself never demotes.
+fn demote_status_for(code: Option<i64>) -> Option<crate::domain::ModelStatus> {
+    match code {
+        Some(429) => Some(crate::domain::ModelStatus::Degraded),
+        Some(c) if (400..500).contains(&c) => None,
+        _ => Some(crate::domain::ModelStatus::Unhealthy),
+    }
+}
+
+/// Log one failed streaming attempt and demote the entry per the failure
+/// classification.
+fn fail_stream_attempt(
+    store: &Arc<Store>,
+    profile_id: &str,
+    target: &crate::router::Target,
+    status_code: Option<i32>,
+    message: String,
+    latency_ms: i64,
+) {
+    log_stream_outcome(
+        store,
+        profile_id,
+        target,
+        false,
+        status_code,
+        Some(message),
+        latency_ms,
+        None,
+        None,
+    );
+    if let Some(status) = demote_status_for(status_code.map(|c| c as i64)) {
+        let _ = store.set_route_entry_status(target.entry.id, status);
+    }
+}
+
+/// Record exactly one usage row for a streaming attempt with real status and
+/// token counts (unlike [`log_attempt`], which parses a full response body).
+#[allow(clippy::too_many_arguments)]
+fn log_stream_outcome(
+    store: &Arc<Store>,
+    profile_id: &str,
+    target: &crate::router::Target,
+    success: bool,
+    status_code: Option<i32>,
+    error_message: Option<String>,
+    latency_ms: i64,
+    prompt_tokens: Option<i64>,
+    completion_tokens: Option<i64>,
+) {
+    let _ = store.record_usage(crate::storage::NewUsage {
+        profile_id: profile_id.to_string(),
+        route_entry_id: target.entry.id,
+        model_id: target.entry.model_id.clone(),
+        streamed: true,
+        success,
+        status_code,
+        error_message,
+        latency_ms,
+        prompt_tokens,
+        completion_tokens,
+    });
+}
+
+/// Stream a committed upstream response to the client.
+///
+/// - wraps every chunk read in the idle timeout, so a provider that stalls
+///   after the headers cannot hang the client forever (Bug 2);
+/// - keeps watching for in-band error events and reports them as failed
+///   attempts instead of successes (Bug 1, post-commit);
+/// - translates Anthropic/Gemini SSE into OpenAI `chat.completion.chunk`
+///   deltas; OpenAI-compatible streams pass through verbatim (Bug 4);
+/// - extracts the upstream usage frames and records exactly one usage row with
+///   the real status and token counts (Bug 6).
+#[allow(clippy::too_many_arguments)]
+async fn pump_stream(
+    target: crate::router::Target,
+    kind: crate::domain::ProviderKind,
+    outcome: ProbeOutcome,
+    model: String,
+    idle_timeout: Duration,
+    tx: tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    store: Arc<Store>,
+    profile_id: String,
+) {
+    use crate::domain::ProviderKind;
+
+    let ProbeOutcome {
+        mut stream,
+        mut parser,
+        mut pending,
+        started_at,
+    } = outcome;
+    let completion_id = format!(
+        "chatcmpl-{}-{}",
+        target.entry.id,
+        chrono::Utc::now().timestamp_millis()
+    );
+
+    let mut prompt_tokens: Option<u64> = None;
+    let mut completion_tokens: Option<u64> = None;
+    let mut first_chunk = true;
+    let mut failure: Option<(Option<i32>, String)> = None;
+
+    'read: loop {
+        let frame = if let Some(f) = pending.pop_front() {
+            f
+        } else {
+            match next_chunk(&mut stream, idle_timeout).await {
+                NextChunk::Idle => {
+                    failure = Some((
+                        Some(504),
+                        format!("stream idle timeout after {idle_timeout:?}"),
+                    ));
+                    break 'read;
+                }
+                NextChunk::End => {
+                    pending.extend(parser.finish());
+                    match pending.pop_front() {
+                        Some(f) => f,
+                        None => break 'read,
+                    }
+                }
+                NextChunk::Transport(e) => {
+                    let _ = tx
+                        .send(Err(std::io::Error::other(format!("stream error: {e}"))))
+                        .await;
+                    failure = Some((None, format!("stream error: {e}")));
+                    break 'read;
+                }
+                NextChunk::Chunk(bytes) => {
+                    pending.extend(parser.feed(&bytes));
+                    continue 'read;
+                }
+            }
+        };
+
+        match sse::Frame::classify(&frame.data) {
+            sse::Frame::Done => {
+                let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+                break 'read;
+            }
+            sse::Frame::Error { code, message, raw } => {
+                // The upstream broke the stream mid-flight. Forward the error
+                // so OpenAI SDKs surface it, and record the attempt as failed
+                // instead of a phantom 200.
+                let _ = tx.send(Ok(Bytes::from(format!("data: {raw}\n\n")))).await;
+                failure = Some((
+                    Some(code.unwrap_or(502) as i32),
+                    format!("upstream in-band error: {message}"),
+                ));
+                break 'read;
+            }
+            sse::Frame::Other { json, raw } => {
+                if let Some(j) = &json {
+                    let (p, c) = sse::frame_usage(kind, j);
+                    prompt_tokens = prompt_tokens.or(p);
+                    completion_tokens = completion_tokens.or(c);
+                }
+                match kind {
+                    ProviderKind::OpenAICompatible | ProviderKind::Custom => {
+                        let wire = sse::SseFrame {
+                            event: String::new(),
+                            data: raw.to_string(),
+                        }
+                        .to_wire();
+                        if tx.send(Ok(Bytes::from(wire))).await.is_err() {
+                            return; // client disconnected; stream is over
+                        }
+                        // The upstream already framed its own first chunk
+                        // (including the role delta), so there is nothing left
+                        // for us to inject.
+                        first_chunk = false;
+                    }
+                    ProviderKind::Anthropic | ProviderKind::Google => {
+                        if let Some(ev) = crate::adapter::outbound::parse_stream_chunk(kind, raw) {
+                            if let Some(chunk) =
+                                sse::render_openai_chunk(&model, &completion_id, &ev, first_chunk)
+                            {
+                                if tx
+                                    .send(Ok(Bytes::from(format!("data: {chunk}\n\n"))))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                                // Only now has the role-bearing chunk gone out.
+                                // Bookkeeping-only events (`message_start`, a bare
+                                // usage frame) render nothing and must not consume
+                                // the role, or OpenAI clients never see it.
+                                first_chunk = false;
+                            }
+                            if ev.done {
+                                let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+                                break 'read;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let latency_ms = started_at.elapsed().as_millis() as i64;
+    match failure {
+        Some((status_code, message)) => {
+            fail_stream_attempt(
+                &store,
+                &profile_id,
+                &target,
+                status_code,
+                message,
+                latency_ms,
+            );
+        }
+        None => {
+            log_stream_outcome(
+                &store,
+                &profile_id,
+                &target,
+                true,
+                Some(200),
+                None,
+                latency_ms,
+                prompt_tokens.map(|t| t as i64),
+                completion_tokens.map(|t| t as i64),
+            );
+        }
+    }
 }
 
 /// Translate and prepare the streaming request for a target.
@@ -700,10 +1110,11 @@ async fn handle_completion(
                     .await
                     .map_err(|e| anyhow::anyhow!("failed to read response: {e}"))?;
                 if !status.is_success() {
-                    return Err(anyhow::anyhow!(
-                        "provider returned {}: {}",
-                        status,
-                        String::from_utf8_lossy(&bytes)
+                    return Err(anyhow::Error::new(
+                        crate::adapter::outbound::ProviderError {
+                            status,
+                            body: String::from_utf8_lossy(&bytes).into_owned(),
+                        },
                     ));
                 }
                 let outcome: Result<Vec<u8>, anyhow::Error> = Ok(bytes.to_vec());
@@ -767,7 +1178,7 @@ async fn handle_completion_streaming(
 
     // Find the first working upstream: send the request for real and only
     // commit to the 200 SSE response once an upstream answers 2xx.
-    let mut working: Option<(crate::router::Target, reqwest::Response, std::time::Instant)> = None;
+    let mut working: Option<(crate::router::Target, ProbeOutcome)> = None;
 
     for target in targets {
         let started_at = std::time::Instant::now();
@@ -804,46 +1215,95 @@ async fn handle_completion_streaming(
 
         match resp_result {
             Ok(Ok(resp)) if resp.status().is_success() => {
-                // Found a working upstream; keep the response and stream it.
-                working = Some((target, resp, started_at));
-                break;
+                // Probe the 2xx body before committing: an in-band SSE error
+                // (OpenRouter-style) must fail over, not reach the client.
+                match probe_stream(state.stream_idle_timeout, resp).await {
+                    Probe::Committed {
+                        stream,
+                        parser,
+                        pending,
+                    } => {
+                        working = Some((
+                            target,
+                            ProbeOutcome {
+                                stream,
+                                parser,
+                                pending,
+                                started_at,
+                            },
+                        ));
+                        break;
+                    }
+                    Probe::InBandError { code, message } => {
+                        fail_stream_attempt(
+                            &store,
+                            &profile_id,
+                            &target,
+                            Some(code.unwrap_or(502) as i32),
+                            format!("upstream in-band error: {message}"),
+                            started_at.elapsed().as_millis() as i64,
+                        );
+                        continue;
+                    }
+                    Probe::Failed(msg) | Probe::Transport(msg) => {
+                        fail_stream_attempt(
+                            &store,
+                            &profile_id,
+                            &target,
+                            None,
+                            msg,
+                            started_at.elapsed().as_millis() as i64,
+                        );
+                        continue;
+                    }
+                    Probe::Timeout => {
+                        fail_stream_attempt(
+                            &store,
+                            &profile_id,
+                            &target,
+                            Some(504),
+                            "upstream stalled before sending any stream data".to_string(),
+                            started_at.elapsed().as_millis() as i64,
+                        );
+                        continue;
+                    }
+                }
             }
             Ok(Ok(resp)) => {
-                // Non-success status, log and try the next target.
+                // Non-success status, log, demote (provider-side), try next.
                 let status = resp.status();
                 let bytes = resp.bytes().await.unwrap_or_default();
-                log_attempt(
+                fail_stream_attempt(
                     &store,
                     &profile_id,
                     &target,
-                    true,
-                    &Err(anyhow::anyhow!(
-                        "provider returned {}: {}",
-                        status,
+                    Some(status.as_u16() as i32),
+                    format!(
+                        "provider returned {status}: {}",
                         String::from_utf8_lossy(&bytes)
-                    )),
+                    ),
                     started_at.elapsed().as_millis() as i64,
                 );
             }
             Ok(Err(e)) => {
                 // Upstream connection failed.
-                log_attempt(
+                fail_stream_attempt(
                     &store,
                     &profile_id,
                     &target,
-                    true,
-                    &Err(anyhow::anyhow!("upstream failed: {e}")),
+                    None,
+                    format!("upstream failed: {e}"),
                     started_at.elapsed().as_millis() as i64,
                 );
             }
             Err(_) => {
-                // Upstream timed out.
-                log_attempt(
+                // Upstream timed out before sending headers.
+                fail_stream_attempt(
                     &store,
                     &profile_id,
                     &target,
-                    true,
-                    &Err(anyhow::anyhow!("upstream timeout")),
+                    None,
+                    "upstream timeout".to_string(),
                     started_at.elapsed().as_millis() as i64,
                 );
             }
@@ -851,7 +1311,7 @@ async fn handle_completion_streaming(
     }
 
     // If no working upstream was found, fail before any 200 is sent.
-    let Some((target, resp, started)) = working else {
+    let Some((target, outcome)) = working else {
         let error_response = serde_json::json!({
             "error": {
                 "message": "All upstream providers failed",
@@ -867,45 +1327,20 @@ async fn handle_completion_streaming(
     };
 
     // A working upstream is confirmed: stream its response body to the client.
+    // The legacy completions surface is an OpenAI-shaped passthrough, so the
+    // pump runs in OpenAI-compatible mode regardless of the provider kind.
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
-    let store_clone = store.clone();
-    let profile_id_clone = profile_id.clone();
 
-    tokio::spawn(async move {
-        let mut stream = resp.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            match chunk {
-                Ok(bytes) => {
-                    if tx.send(Ok(bytes)).await.is_err() {
-                        return;
-                    }
-                }
-                Err(e) => {
-                    let _ = tx
-                        .send(Err(std::io::Error::other(format!("stream error: {e}"))))
-                        .await;
-                    log_attempt(
-                        &store_clone,
-                        &profile_id_clone,
-                        &target,
-                        true,
-                        &Err(anyhow::anyhow!("stream error: {e}")),
-                        started.elapsed().as_millis() as i64,
-                    );
-                    return;
-                }
-            }
-        }
-
-        log_attempt(
-            &store_clone,
-            &profile_id_clone,
-            &target,
-            true,
-            &Ok(Vec::new()),
-            started.elapsed().as_millis() as i64,
-        );
-    });
+    tokio::spawn(pump_stream(
+        target,
+        crate::domain::ProviderKind::OpenAICompatible,
+        outcome,
+        completion_req.model.clone(),
+        state.stream_idle_timeout,
+        tx,
+        store,
+        profile_id,
+    ));
 
     let body = axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
     Response::builder()
@@ -983,10 +1418,11 @@ async fn handle_embeddings(
                     .await
                     .map_err(|e| anyhow::anyhow!("failed to read response: {e}"))?;
                 if !status.is_success() {
-                    return Err(anyhow::anyhow!(
-                        "provider returned {}: {}",
-                        status,
-                        String::from_utf8_lossy(&bytes)
+                    return Err(anyhow::Error::new(
+                        crate::adapter::outbound::ProviderError {
+                            status,
+                            body: String::from_utf8_lossy(&bytes).into_owned(),
+                        },
                     ));
                 }
                 let outcome: Result<Vec<u8>, anyhow::Error> = Ok(bytes.to_vec());

@@ -27,6 +27,7 @@ mod handlers;
 pub mod middleware;
 mod native;
 pub mod ratelimit;
+pub mod sse;
 
 pub use handlers::{chat_completions, list_models, AppState};
 
@@ -191,7 +192,11 @@ async fn readiness_check(State(state): State<AppState>) -> axum::response::Respo
     }
 }
 
-pub async fn serve(bind_addr: &str, cli_attempt_timeout: Option<Duration>) -> Result<()> {
+pub async fn serve(
+    bind_addr: &str,
+    cli_attempt_timeout: Option<Duration>,
+    cli_stream_idle_timeout: Option<Duration>,
+) -> Result<()> {
     if std::env::var("RUST_LOG").unwrap_or_default() != "off" {
         tracing_subscriber::fmt()
             .with_env_filter(
@@ -222,9 +227,22 @@ pub async fn serve(bind_addr: &str, cli_attempt_timeout: Option<Duration>) -> Re
                 .map(Duration::from_secs)
         })
         .unwrap_or(Duration::from_secs(10));
+    // Idle-chunk timeout for committed streams: how long the upstream may stay
+    // silent between body chunks before the stream is failed. Configurable via
+    // `--stream-idle-timeout` or `AGOS_STREAM_IDLE_TIMEOUT_SECS`. Precedence:
+    // flag > env > 60s.
+    let stream_idle_timeout = cli_stream_idle_timeout
+        .or_else(|| {
+            std::env::var("AGOS_STREAM_IDLE_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .map(Duration::from_secs)
+        })
+        .unwrap_or(Duration::from_secs(60));
     let state = AppState {
         store: store.clone(),
         attempt_timeout,
+        stream_idle_timeout,
         http_client: http_client.clone(),
         routing_state: RoutingState::default(),
         rate_limiter: rate_limiter.clone(),

@@ -64,6 +64,11 @@ pub enum Command {
         /// the router fails over to the next entry in the chain.
         #[arg(long)]
         attempt_timeout: Option<u64>,
+        /// Idle timeout in seconds for committed streams: how long the
+        /// upstream may stay silent between body chunks before the stream is
+        /// failed instead of hanging the client.
+        #[arg(long)]
+        stream_idle_timeout: Option<u64>,
     },
     /// Manage profiles (tenants) and their API tokens.
     #[command(subcommand)]
@@ -120,7 +125,8 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Serve {
             bind,
             attempt_timeout,
-        } => server_command(&bind, attempt_timeout),
+            stream_idle_timeout,
+        } => server_command(&bind, attempt_timeout, stream_idle_timeout),
         Command::Profile(args) => profile::run(args),
         Command::Provider(args) => provider::run(args),
         Command::Proxy(args) => proxy::run(args),
@@ -134,7 +140,11 @@ pub fn run(cli: Cli) -> Result<()> {
     }
 }
 
-fn server_command(bind: &str, attempt_timeout_secs: Option<u64>) -> Result<()> {
+fn server_command(
+    bind: &str,
+    attempt_timeout_secs: Option<u64>,
+    stream_idle_timeout_secs: Option<u64>,
+) -> Result<()> {
     let worker_threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(2)
@@ -148,6 +158,7 @@ fn server_command(bind: &str, attempt_timeout_secs: Option<u64>) -> Result<()> {
         crate::server::serve(
             &addr,
             attempt_timeout_secs.map(std::time::Duration::from_secs),
+            stream_idle_timeout_secs.map(std::time::Duration::from_secs),
         )
         .await
     })?;
