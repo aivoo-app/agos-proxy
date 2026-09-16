@@ -343,10 +343,10 @@ where
 /// Classify a failure status into a demotion decision. Provider-side failures
 /// demote the entry (429 only Degraded, everything else Unhealthy); client-side
 /// 4xx that originates from the translated request body itself never demotes —
-/// except a 4xx whose error message names images/vision, meaning the upstream
+/// except a 4xx whose error message refuses images/vision, meaning the upstream
 /// cannot serve image requests at all. Failures without a known status
 /// (transport errors, timeouts) are treated as provider-side.
-fn demote_status_for(status_code: Option<i64>, message: &str) -> Option<ModelStatus> {
+pub(crate) fn demote_status_for(status_code: Option<i64>, message: &str) -> Option<ModelStatus> {
     match status_code {
         Some(429) => Some(ModelStatus::Degraded),
         Some(c) if (400..500).contains(&c) => {
@@ -360,12 +360,60 @@ fn demote_status_for(status_code: Option<i64>, message: &str) -> Option<ModelSta
     }
 }
 
-/// Whether an upstream error message reads like an image/vision rejection
-/// (e.g. "image input not supported by this model"). Matched ASCII-
-/// case-insensitively so "Image", "IMAGE" and "image" all hit.
+/// Recognize explicit capability refusals, not arbitrary mentions of images.
+/// For JSON envelopes, inspect only the error message, never request echoes.
 fn image_rejection(message: &str) -> bool {
+    let parsed = serde_json::from_str::<serde_json::Value>(message).ok();
+    let message = match parsed.as_ref() {
+        Some(value) => value
+            .pointer("/error/message")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| value.get("error").and_then(serde_json::Value::as_str))
+            .or_else(|| value.get("message").and_then(serde_json::Value::as_str))
+            .unwrap_or(""),
+        None => message,
+    };
     let lower = message.to_ascii_lowercase();
-    lower.contains("image") || lower.contains("vision")
+    let normalized = lower.split_whitespace().collect::<Vec<_>>().join(" ");
+    const REFUSALS: [&str; 5] = [
+        "does not support",
+        "do not support",
+        "doesn't support",
+        "does not accept",
+        "doesn't accept",
+    ];
+    const MODALITIES: [&str; 7] = [
+        "image",
+        "images",
+        "image input",
+        "image inputs",
+        "vision",
+        "vision input",
+        "multimodal input",
+    ];
+    MODALITIES.iter().any(|modality| {
+        REFUSALS
+            .iter()
+            .any(|refusal| contains_phrase(&normalized, &format!("{refusal} {modality}")))
+            || [
+                "not supported",
+                "is not supported",
+                "are not supported",
+                "is unsupported",
+                "are unsupported",
+            ]
+            .iter()
+            .any(|suffix| contains_phrase(&normalized, &format!("{modality} {suffix}")))
+    })
+}
+
+/// Do not match modality words inside model names or request-field names.
+fn contains_phrase(message: &str, phrase: &str) -> bool {
+    let is_word = |c: char| c.is_alphanumeric() || matches!(c, '_' | '-');
+    message.match_indices(phrase).any(|(start, _)| {
+        !message[..start].ends_with(is_word)
+            && !message[start + phrase.len()..].starts_with(is_word)
+    })
 }
 
 #[cfg(test)]
@@ -773,9 +821,53 @@ mod tests {
     }
 
     #[test]
+    fn image_rejection_ignores_unrelated_errors_and_echoes() {
+        for message in [
+            "unsupported parameter max_tokens; image_url=x",
+            "cannot decode image: corrupt data",
+            "unable to download image URL",
+            "unsupported image format: use PNG",
+            "model vision-pro was not found",
+            "this model does not support image_url.detail",
+            "this model does not support vision-pro",
+            "revision is not supported",
+            "錯誤： image too large",
+            r#"{"error":{"message":"unsupported parameter"},"request":{"text":"image input not supported","image_url":"x"}}"#,
+            r#"{"request":{"message":"image input not supported"}}"#,
+            r#"{"error":{"message":null},"request":"image input not supported"}"#,
+            "",
+        ] {
+            assert_eq!(demote_status_for(Some(400), message), None, "{message}");
+            assert_eq!(demote_status_for(Some(422), message), None, "{message}");
+        }
+    }
+
+    #[test]
+    fn image_rejection_recognizes_explicit_capability_refusals() {
+        for message in [
+            "image input not supported",
+            "Images are not supported by this model.",
+            "This model does not support IMAGE input.",
+            "This model doesn't accept images.",
+            "vision is unsupported",
+            "multimodal input is not supported",
+            "錯誤： images are not supported",
+            "image  input\nnot supported",
+            r#"{"error":{"message":"image input not supported"}}"#,
+            r#"{"error":"This model does not accept images"}"#,
+            r#"{"message":"vision is not supported"}"#,
+        ] {
+            assert_eq!(
+                demote_status_for(Some(400), message),
+                Some(ModelStatus::Unhealthy),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
     fn image_rejecting_4xx_demotes_but_plain_4xx_does_not() {
-        // An upstream that names images in its rejection cannot serve vision
-        // requests, so the entry is taken out of rotation for them.
+        // Explicit capability refusals still demote the whole route entry.
         assert_eq!(
             demote_status_for(
                 Some(400),
@@ -785,13 +877,40 @@ mod tests {
         );
         assert_eq!(
             demote_status_for(Some(415), "unsupported media type for vision input"),
-            Some(ModelStatus::Unhealthy)
+            None
         );
         // Matching is ASCII-case-insensitive.
         assert_eq!(
             demote_status_for(Some(404), "Model does not support IMAGE input"),
             Some(ModelStatus::Unhealthy)
         );
+        // A refusal phrase and the image term must actually pair up: a 4xx that
+        // echoes the request payload (whose parts carry `image_url` keys) next
+        // to an unrelated error must not demote a healthy upstream.
+        assert_eq!(
+            demote_status_for(Some(400), "invalid parameter: max_tokens"),
+            None
+        );
+        assert_eq!(
+            demote_status_for(Some(422), "request body exceeds the context window"),
+            None
+        );
+        // A request echo is not a capability rejection.
+        assert_eq!(
+            demote_status_for(
+                Some(400),
+                "cannot process the request: the upstream rejected it. request echo: \
+                 {\"messages\":[{\"content\":[{\"type\":\"image_url\"}]}]}"
+            ),
+            None
+        );
+        // A mere mention without a refusal phrase is not a rejection either.
+        assert_eq!(
+            demote_status_for(Some(404), "model vision-pro was not found"),
+            None
+        );
+        // A processing failure does not prove missing modality support.
+        assert_eq!(demote_status_for(Some(400), "cannot process images"), None);
 
         // Everything else about the old classification is unchanged.
         assert_eq!(demote_status_for(Some(400), "invalid temperature"), None);

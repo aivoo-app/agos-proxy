@@ -39,12 +39,15 @@ An entry is marked unhealthy when a live request hits any of:
   the chain can move on; the entry may recover on the next probe cycle).
 - A response that fails schema validation (the upstream returned something the
   translator could not parse).
-- An HTTP 4xx whose error body names images/vision (e.g. "image input not
-  supported") when the request carried image parts — the upstream cannot serve
-  vision requests at all, so it is skipped for them and the next entry is
-  tried. Other 4xx never demote: they usually mean the request itself was
-  malformed, and failing over a healthy chain on one bad request would be
-  worse than the error.
+- An HTTP 4xx whose error message explicitly refuses image/vision capability
+  (e.g. "image input not supported" or "this model does not support images").
+  Streaming and non-streaming requests use the same classifier. JSON errors
+  are checked only in `error.message`, a string `error`, or `message`, not in
+  echoed request fields. Image decoding/download errors, unsupported image
+  formats, and unrelated errors mentioning `image_url` do not demote entries.
+  Matching is conservative; unfamiliar rejection wording may not demote.
+  A confirmed capability rejection marks the **whole entry** Unhealthy (not
+  just its vision capability) until recovery. Other 4xx never demote.
 
 ## Health and the background probe loop
 

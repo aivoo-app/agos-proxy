@@ -39,10 +39,9 @@ Anthropic, OpenAI Responses (Codex), and Gemini native endpoints.
   their native image shapes and normalize them into the canonical parts array.
   OpenAI/custom upstreams were already lossless and are unchanged; text-only
   requests serialize byte-identically to before.
-- Failover for image-rejecting upstreams: a 4xx whose error body names
-  images/vision marks the route entry Unhealthy so the next chain entry is
-  tried, instead of surfacing the rejection to the caller. Other 4xx keep the
-  existing no-demotion behavior.
+- Failover for image-rejecting upstreams: a 4xx whose error message explicitly
+  refuses image/vision capability marks the route entry Unhealthy so the next
+  chain entry is tried. Other 4xx keep the existing no-demotion behavior.
 - Comprehensive documentation tree: README, architecture, configuration,
   security, API, providers, failover, development, deployment, workflow,
   contributing guide, and security policy.
@@ -62,6 +61,12 @@ Anthropic, OpenAI Responses (Codex), and Gemini native endpoints.
 
 ### Fixed
 
+- Image-error classification no longer demotes healthy entries merely because
+  an unrelated 4xx mentions images or echoes image fields. Both request paths
+  now share a conservative capability-refusal classifier that inspects JSON
+  error messages rather than entire response bodies. Regression tests cover
+  request echoes, corrupt images, model names, Unicode, and streaming health
+  persistence; rate-limit and server-error classifications are unchanged.
 - Provider-kind examples in the documentation, README, quick reference and the
   docker-compose seed used `generic`, a tag the CLI has never accepted; the
   binary's canonical tag is `openai`. Every example now matches the code, and

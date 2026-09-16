@@ -839,34 +839,6 @@ async fn probe_stream(idle_timeout: Duration, resp: reqwest::Response) -> Probe 
     }
 }
 
-/// Classify a failure status into a demotion decision. Provider-side failures
-/// demote the entry (429 only Degraded, everything else Unhealthy); client-side
-/// 4xx that originates from the translated request body itself never demotes —
-/// except a 4xx whose error message names images/vision, meaning the upstream
-/// cannot serve image requests at all. Failures without a known status
-/// (transport errors, timeouts) are treated as provider-side.
-fn demote_status_for(code: Option<i64>, message: &str) -> Option<crate::domain::ModelStatus> {
-    match code {
-        Some(429) => Some(crate::domain::ModelStatus::Degraded),
-        Some(c) if (400..500).contains(&c) => {
-            if image_rejection(message) {
-                Some(crate::domain::ModelStatus::Unhealthy)
-            } else {
-                None
-            }
-        }
-        _ => Some(crate::domain::ModelStatus::Unhealthy),
-    }
-}
-
-/// Whether an upstream error message reads like an image/vision rejection
-/// (e.g. "image input not supported by this model"). Matched ASCII-
-/// case-insensitively so "Image", "IMAGE" and "image" all hit.
-fn image_rejection(message: &str) -> bool {
-    let lower = message.to_ascii_lowercase();
-    lower.contains("image") || lower.contains("vision")
-}
-
 /// Log one failed streaming attempt and demote the entry per the failure
 /// classification.
 fn fail_stream_attempt(
@@ -888,7 +860,8 @@ fn fail_stream_attempt(
         None,
         None,
     );
-    if let Some(status) = demote_status_for(status_code.map(|c| c as i64), &message) {
+    if let Some(status) = crate::router::demote_status_for(status_code.map(|c| c as i64), &message)
+    {
         let _ = store.set_route_entry_status(target.entry.id, status);
     }
 }
@@ -1737,30 +1710,61 @@ mod economy_tests {
 
     #[test]
     fn image_rejecting_4xx_demotes_the_streaming_entry() {
-        use crate::domain::ModelStatus;
+        use crate::domain::{ModelStatus, ProviderKind, RoutingStrategy};
+        use crate::storage::NewProvider;
 
-        // An upstream that names images in its rejection cannot serve vision
-        // requests, so the entry is taken out of rotation for them.
-        assert_eq!(
-            demote_status_for(
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let profile = store.create_profile("stream-test", None, None).unwrap();
+        let provider = store
+            .create_provider(
+                &profile.id,
+                NewProvider {
+                    name: "mock".into(),
+                    description: None,
+                    base_url: "http://unused.invalid".into(),
+                    auth_token: "unused".into(),
+                    kind: ProviderKind::OpenAI,
+                    extra_headers: Default::default(),
+                },
+            )
+            .unwrap();
+        let proxy = store.create_proxy(&profile.id, "proxy", None).unwrap();
+        let route = store
+            .create_route(proxy.id, "route", None, RoutingStrategy::Priority, None)
+            .unwrap();
+        store
+            .add_route_entry(route.id, provider.id, "model", 1, 1.0, Default::default())
+            .unwrap();
+        let target = crate::router::resolve_targets(&store, &profile.id, "proxy/route")
+            .unwrap()
+            .remove(0);
+
+        for (code, message, expected) in [
+            (
                 Some(400),
-                r#"{"error":{"message":"image input not supported"}}"#
+                r#"{"error":{"message":"unsupported parameter"},"request":{"image_url":"x"}}"#,
+                ModelStatus::Healthy,
             ),
-            Some(ModelStatus::Unhealthy)
-        );
-        // Everything else about the old classification is unchanged.
-        assert_eq!(demote_status_for(Some(400), "invalid temperature"), None);
-        assert_eq!(
-            demote_status_for(Some(429), "rate limited"),
-            Some(ModelStatus::Degraded)
-        );
-        assert_eq!(
-            demote_status_for(Some(503), "overloaded"),
-            Some(ModelStatus::Unhealthy)
-        );
-        assert_eq!(
-            demote_status_for(None, "upstream timeout"),
-            Some(ModelStatus::Unhealthy)
-        );
+            (
+                Some(422),
+                "cannot decode image: corrupt data",
+                ModelStatus::Healthy,
+            ),
+            (
+                Some(400),
+                r#"{"error":{"message":"image input not supported"}}"#,
+                ModelStatus::Unhealthy,
+            ),
+            (Some(429), "rate limited", ModelStatus::Degraded),
+            (Some(503), "overloaded", ModelStatus::Unhealthy),
+            (None, "upstream timeout", ModelStatus::Unhealthy),
+        ] {
+            store
+                .set_route_entry_status(target.entry.id, ModelStatus::Healthy)
+                .unwrap();
+            fail_stream_attempt(&store, &profile.id, &target, code, message.into(), 1);
+            let entries = store.route_entries(route.id).unwrap();
+            assert_eq!(entries[0].status, expected, "{message}");
+        }
     }
 }
