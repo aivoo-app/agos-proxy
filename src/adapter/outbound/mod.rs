@@ -76,7 +76,7 @@ pub fn build_upstream_request(
         ProviderKind::OpenAIResponses => {
             let url = responses::build_url(target);
             let headers = responses::build_headers(target);
-            let body = responses::translate_request(chat_req, &target.entry.model_id);
+            let body = responses::translate_request(chat_req, &target.entry.model_id)?;
             Ok((url, headers, body))
         }
         // OpenAI and custom providers share the passthrough adapter.

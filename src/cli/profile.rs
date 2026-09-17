@@ -27,6 +27,8 @@ pub enum ProfileArgs {
     #[command(subcommand)]
     Token(TokenArgs),
     /// View or change a profile's requests-per-minute limit (0 = unlimited).
+    /// Note: rate limiting is per-process; multiple proxy instances each enforce
+    /// their own limit independently.
     Limit {
         /// Name of the profile.
         name: String,

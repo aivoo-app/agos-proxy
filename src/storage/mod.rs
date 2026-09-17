@@ -1281,6 +1281,16 @@ impl Store {
             .execute("DELETE FROM usage_log WHERE created_at < ?1", (cutoff,))?;
         Ok(deleted)
     }
+
+    /// Remove expired response cache entries. Returns the number of rows deleted.
+    /// Called periodically to prevent unbounded cache growth.
+    pub fn prune_response_cache(&self) -> Result<usize> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let deleted = self
+            .conn()
+            .execute("DELETE FROM response_cache WHERE expires_at <= ?1", (now,))?;
+        Ok(deleted)
+    }
 }
 
 /// Cached response body plus its recorded upstream token counts.
