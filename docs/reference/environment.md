@@ -111,6 +111,27 @@ variable, which in turn takes precedence over the built-in default.
 
 ---
 
+### `AGOS_RATE_LIMIT_COOLDOWN_SECS`
+
+| | |
+|---|---|
+| **Purpose** | How long a route entry is skipped after the upstream answers `429 Too Many Requests`, when the upstream does not send a usable `Retry-After` header |
+| **Default** | `60` seconds |
+| **Used by** | `agos-proxy serve` only |
+| **Example** | `AGOS_RATE_LIMIT_COOLDOWN_SECS=120 agos-proxy serve` |
+
+When the router's failover loop demotes an entry for a 429, the entry gets a
+`cooldown_until` timestamp. Resolution skips cooling entries (falling back to
+the soonest-expiring one if everything is cooling, so a request never
+hard-fails). If the upstream honors `Retry-After` or exposes a rate-limit
+reset header, that value wins over this constant.
+
+Cooldowns are deliberately independent of `ModelStatus`: a health probe may
+report a key as `Healthy` again, but `cooldown_until` still blocks it until
+the window expires — a green ping cannot cancel an upstream rate-limit window.
+
+---
+
 ## Docker / Bootstrap
 
 ### `AGOS_SETUP`
