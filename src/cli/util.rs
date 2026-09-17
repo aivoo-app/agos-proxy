@@ -186,9 +186,21 @@ pub fn fetch_provider_models(provider: &crate::domain::Provider) -> Result<Vec<S
             .timeout(std::time::Duration::from_secs(20))
             .build()
             .context("building the HTTP client")?;
-        let mut req = client.get(format!("{base}/models"));
+        let mut url = format!("{base}/models");
+        let mut headers: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
         if !provider.auth_token.is_empty() {
-            req = req.bearer_auth(&provider.auth_token);
+            headers.insert(
+                "Authorization".to_string(),
+                format!("Bearer {}", provider.auth_token),
+            );
+        }
+        // Reach the provider the same way live traffic does, so the catalogue
+        // lookup works for keys that are only reachable through their mask.
+        crate::mask::apply_request(provider.masking_server.as_ref(), &mut url, &mut headers, 0)?;
+        let mut req = client.get(&url);
+        for (k, v) in &headers {
+            req = req.header(k, v);
         }
         let resp = req.send().await.context("reaching the provider")?;
         let status = resp.status();

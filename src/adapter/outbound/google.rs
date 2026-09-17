@@ -260,6 +260,8 @@ mod tests {
                 auth_token: "g-key".into(),
                 kind: ProviderKind::Google,
                 extra_headers: BTreeMap::new(),
+                masking_server_id: None,
+                masking_server: None,
             },
             entry: RouteEntry {
                 id: 1,
@@ -271,6 +273,7 @@ mod tests {
                 status: ModelStatus::Healthy,
                 capabilities: Default::default(),
                 price_per_1m: 0.4,
+                cooldown_until: 0,
             },
             identity: None,
         }

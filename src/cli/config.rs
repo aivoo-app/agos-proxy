@@ -282,6 +282,7 @@ pub fn import_bundle(store: &Store, bundle: &PortableProfile, name: &str) -> Res
                 auth_token: p.auth_token.clone(),
                 kind: p.kind,
                 extra_headers: p.extra_headers.clone(),
+                masking_server_id: None,
             },
         )?;
         provider_ids.insert(created.name.clone(), created.id);
@@ -350,6 +351,7 @@ mod tests {
                     auth_token: "sk-secret".into(),
                     kind: ProviderKind::OpenAI,
                     extra_headers: BTreeMap::new(),
+                    masking_server_id: None,
                 },
             )
             .unwrap();

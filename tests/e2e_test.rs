@@ -209,6 +209,7 @@ fn setup_store_inner(base_url: &str, kind: ProviderKind, vision: bool) -> (Store
                 auth_token: "sk-mock".into(),
                 kind,
                 extra_headers: std::collections::BTreeMap::new(),
+                masking_server_id: None,
             },
         )
         .expect("create provider");
@@ -668,6 +669,7 @@ async fn economy_routes_cheap_first_caches_and_escalates() {
                 auth_token: "sk-mock".into(),
                 kind: ProviderKind::OpenAI,
                 extra_headers: std::collections::BTreeMap::new(),
+                masking_server_id: None,
             },
         )
         .expect("provider");
@@ -936,6 +938,7 @@ async fn responses_upstream_failure_fails_over_to_next_entry() {
                 auth_token: "sk-fallback".into(),
                 kind: ProviderKind::OpenAI,
                 extra_headers: std::collections::BTreeMap::new(),
+                masking_server_id: None,
             },
         )
         .expect("create fallback provider");

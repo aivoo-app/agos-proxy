@@ -350,6 +350,12 @@ where
 /// entry, not a sicker one. Failures without a known status
 /// (transport errors, timeouts) are treated as provider-side.
 pub(crate) fn demote_status_for(status_code: Option<i64>, message: &str) -> Option<ModelStatus> {
+    // A mask that refused the request, or one that cannot carry this payload,
+    // says nothing about the provider's health: try the next target instead of
+    // taking a working key out of rotation.
+    if message.contains(crate::mask::MASK_SKIP) || message.contains(crate::mask::MASK_FAILED) {
+        return None;
+    }
     if message.contains(crate::adapter::outbound::responses::ADAPTER_CAPABILITY_SKIP) {
         return None;
     }
@@ -538,6 +544,7 @@ mod tests {
                     auth_token: "tok".into(),
                     kind: ProviderKind::OpenAI,
                     extra_headers: BTreeMap::new(),
+                    masking_server_id: None,
                 },
             )
             .unwrap();
@@ -597,6 +604,7 @@ mod tests {
                     auth_token: "tok1".into(),
                     kind: ProviderKind::OpenAI,
                     extra_headers: BTreeMap::new(),
+                    masking_server_id: None,
                 },
             )
             .unwrap();
@@ -610,6 +618,7 @@ mod tests {
                     auth_token: "tok2".into(),
                     kind: ProviderKind::OpenAI,
                     extra_headers: BTreeMap::new(),
+                    masking_server_id: None,
                 },
             )
             .unwrap();
@@ -684,6 +693,7 @@ mod tests {
                     auth_token: "tok".into(),
                     kind: ProviderKind::OpenAI,
                     extra_headers: BTreeMap::new(),
+                    masking_server_id: None,
                 },
             )
             .unwrap();
@@ -697,6 +707,7 @@ mod tests {
                     auth_token: "tok".into(),
                     kind: ProviderKind::OpenAI,
                     extra_headers: BTreeMap::new(),
+                    masking_server_id: None,
                 },
             )
             .unwrap();
@@ -770,6 +781,7 @@ mod tests {
                         auth_token: "tok".into(),
                         kind: ProviderKind::OpenAI,
                         extra_headers: BTreeMap::new(),
+                        masking_server_id: None,
                     },
                 )
                 .unwrap()
@@ -1104,6 +1116,26 @@ mod tests {
             demote_status_for(None, "transport failure"),
             Some(ModelStatus::Unhealthy)
         );
+        // A mask that refused the request, or one that cannot carry this
+        // payload, never demotes the provider: the key is fine, the hop is not.
+        // Without this, a single bad hop would take every key behind it dark.
+        assert_eq!(
+            demote_status_for(
+                Some(502),
+                &format!(
+                    "{} egress mask \"edge-1\" returned 502",
+                    crate::mask::MASK_FAILED
+                )
+            ),
+            None
+        );
+        assert_eq!(
+            demote_status_for(
+                Some(413),
+                &format!("{} body too large for the hop", crate::mask::MASK_SKIP)
+            ),
+            None
+        );
     }
 
     #[tokio::test]
@@ -1138,6 +1170,7 @@ mod tests {
                     auth_token: "tok".into(),
                     kind: ProviderKind::OpenAI,
                     extra_headers: BTreeMap::new(),
+                    masking_server_id: None,
                 },
             )
             .unwrap();

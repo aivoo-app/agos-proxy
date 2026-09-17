@@ -20,8 +20,8 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::crypto::MasterKey;
 
 use crate::domain::{
-    ModelStatus, Profile, Provider, ProviderKind, Proxy, Route, RouteCapabilities, RouteEntry,
-    RoutingStrategy, UsageRecord, UsageStats,
+    MaskingServer, ModelStatus, Profile, Provider, ProviderKind, Proxy, Route, RouteCapabilities,
+    RouteEntry, RoutingStrategy, UsageRecord, UsageStats,
 };
 
 /// Intermediate provider row, used to defer decryption out of the rusqlite closure.
@@ -34,6 +34,75 @@ struct RawProvider {
     enc_token: Vec<u8>,
     kind_tag: String,
     extra_json: String,
+    masking_server_id: Option<i64>,
+}
+
+/// Intermediate masking-server row, used to defer secret decryption out of the
+/// rusqlite closure.
+struct RawMaskingServer {
+    id: i64,
+    profile_id: String,
+    name: String,
+    kind: String,
+    endpoint_url: String,
+    enc_secret: Vec<u8>,
+    max_body_bytes: i64,
+    expected_egress_ip: Option<String>,
+    last_verified_ip: Option<String>,
+    last_verified_asn: Option<String>,
+    last_verified_country: Option<String>,
+    last_verified_at: Option<i64>,
+}
+
+/// The [`MaskingServer`] column list, optionally qualified with a table alias
+/// (e.g. `"m."`). Kept in one place so every query reads the same shape and the
+/// row indices handed to [`raw_mask_from_row`] stay in sync.
+pub(crate) fn mask_columns(prefix: &str) -> String {
+    const COLS: [&str; 12] = [
+        "id",
+        "profile_id",
+        "name",
+        "kind",
+        "endpoint_url",
+        "secret",
+        "max_body_bytes",
+        "expected_egress_ip",
+        "last_verified_ip",
+        "last_verified_asn",
+        "last_verified_country",
+        "last_verified_at",
+    ];
+    COLS.iter()
+        .map(|c| format!("{prefix}{c}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Read a [`MaskingServer`] row starting at `base` (0 for a plain select, or the
+/// offset of the joined mask columns). Returns `None` when the joined row has no
+/// mask, so a `LEFT JOIN` can be mapped in one pass.
+fn raw_mask_from_row(
+    row: &rusqlite::Row<'_>,
+    base: usize,
+) -> rusqlite::Result<Option<RawMaskingServer>> {
+    let id: Option<i64> = row.get(base)?;
+    let Some(id) = id else {
+        return Ok(None);
+    };
+    Ok(Some(RawMaskingServer {
+        id,
+        profile_id: row.get(base + 1)?,
+        name: row.get(base + 2)?,
+        kind: row.get(base + 3)?,
+        endpoint_url: row.get(base + 4)?,
+        enc_secret: row.get(base + 5)?,
+        max_body_bytes: row.get(base + 6)?,
+        expected_egress_ip: row.get(base + 7)?,
+        last_verified_ip: row.get(base + 8)?,
+        last_verified_asn: row.get(base + 9)?,
+        last_verified_country: row.get(base + 10)?,
+        last_verified_at: row.get(base + 11)?,
+    }))
 }
 
 mod schema;
@@ -115,6 +184,54 @@ fn fresh_token() -> Result<String> {
     Ok(std::fmt::format(format_args!("{a:x}{b:x}")))
 }
 
+/// Column list for a provider joined to its egress mask.
+///
+/// Fixed prefix 0..8 is the provider itself (with the binding at 8); index 9
+/// onwards are the mask columns consumed by [`raw_mask_from_row`].
+fn provider_columns() -> String {
+    format!(
+        "p.id, p.profile_id, p.name, p.description, p.base_url, p.auth_token, \
+         p.kind, p.extra_headers, p.masking_server_id, {}",
+        mask_columns("m.")
+    )
+}
+
+type RawProviderRow = (RawProvider, Option<RawMaskingServer>);
+
+/// Join clause that attaches each provider's *effective* mask: the provider's own
+/// binding when it has one, otherwise its profile's default, otherwise nothing.
+///
+/// Resolving the fallback in SQL keeps every consumer — routing, health probing,
+/// CLI listings — seeing the same answer without a second lookup.
+fn mask_join() -> &'static str {
+    "LEFT JOIN masking_servers m
+        ON m.id = COALESCE(p.masking_server_id,
+                           (SELECT default_masking_server_id FROM profiles WHERE id = p.profile_id))"
+}
+
+/// Read the provider part of a row starting at `base`, plus its joined mask
+/// (which occupies the nine columns that follow).
+fn raw_provider_at(row: &rusqlite::Row<'_>, base: usize) -> rusqlite::Result<RawProviderRow> {
+    Ok((
+        RawProvider {
+            id: row.get(base)?,
+            profile_id: row.get(base + 1)?,
+            name: row.get(base + 2)?,
+            description: row.get(base + 3)?,
+            base_url: row.get(base + 4)?,
+            enc_token: row.get(base + 5)?,
+            kind_tag: row.get(base + 6)?,
+            extra_json: row.get(base + 7)?,
+            masking_server_id: row.get(base + 8)?,
+        },
+        raw_mask_from_row(row, base + 9)?,
+    ))
+}
+
+fn raw_provider_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawProviderRow> {
+    raw_provider_at(row, 0)
+}
+
 fn now_millis() -> i64 {
     Utc::now().timestamp_millis()
 }
@@ -147,6 +264,21 @@ pub struct NewProvider {
     pub auth_token: String,
     pub kind: ProviderKind,
     pub extra_headers: std::collections::BTreeMap<String, String>,
+    /// Egress mask to bind this provider to; `None` = use the profile default.
+    pub masking_server_id: Option<i64>,
+}
+
+/// Details needed to register a new [`MaskingServer`] (an egress hop).
+pub struct NewMaskingServer {
+    pub name: String,
+    /// Free-form backend label, e.g. `cf_worker`, `vps`, `nginx`.
+    pub kind: String,
+    pub endpoint_url: String,
+    /// Shared secret presented to the hop; encrypted before it reaches disk.
+    pub secret: String,
+    /// Body-size ceiling above which requests skip this hop (0 = no limit).
+    pub max_body_bytes: i64,
+    pub expected_egress_ip: Option<String>,
 }
 
 /// Details needed to append one request to the usage log.
@@ -328,6 +460,7 @@ impl Store {
             created_at: now,
             updated_at: now,
             rpm_limit: 0,
+            default_masking_server_id: None,
         })
     }
 
@@ -335,7 +468,7 @@ impl Store {
     pub fn list_profiles(&self) -> Result<Vec<Profile>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, password_hash, created_at, updated_at, rpm_limit
+            "SELECT id, name, description, password_hash, created_at, updated_at, rpm_limit, default_masking_server_id
                  FROM profiles ORDER BY name",
         )?;
         let rows = stmt.query_map((), |row| {
@@ -347,6 +480,7 @@ impl Store {
                 created_at: row.get(4)?,
                 updated_at: row.get(5)?,
                 rpm_limit: row.get(6)?,
+                default_masking_server_id: row.get(7)?,
             })
         })?;
         let mut out = Vec::new();
@@ -360,7 +494,8 @@ impl Store {
     pub fn get_profile_by_id(&self, id: &str) -> Result<Option<Profile>> {
         self.conn()
             .query_row(
-                "SELECT id, name, description, password_hash, created_at, updated_at, rpm_limit\n             FROM profiles WHERE id = ?1",
+                "SELECT id, name, description, password_hash, created_at, updated_at, rpm_limit, default_masking_server_id
+             FROM profiles WHERE id = ?1",
                 (id,),
                 |row| {
                     Ok(Profile {
@@ -371,6 +506,7 @@ impl Store {
                         created_at: row.get(4)?,
                         updated_at: row.get(5)?,
                         rpm_limit: row.get(6)?,
+                        default_masking_server_id: row.get(7)?,
                     })
                 },
             )
@@ -382,7 +518,7 @@ impl Store {
     pub fn get_profile_by_name(&self, name: &str) -> Result<Option<Profile>> {
         self.conn()
             .query_row(
-                "SELECT id, name, description, password_hash, created_at, updated_at, rpm_limit
+                "SELECT id, name, description, password_hash, created_at, updated_at, rpm_limit, default_masking_server_id
              FROM profiles WHERE name = ?1",
                 (name,),
                 |row| {
@@ -394,6 +530,7 @@ impl Store {
                         created_at: row.get(4)?,
                         updated_at: row.get(5)?,
                         rpm_limit: row.get(6)?,
+                        default_masking_server_id: row.get(7)?,
                     })
                 },
             )
@@ -507,10 +644,10 @@ impl Store {
     pub fn create_provider(&self, profile_id: &str, spec: NewProvider) -> Result<Provider> {
         let key = self.master_key();
         let encrypted_token = crate::crypto::encrypt(&key, &spec.auth_token)?;
-        let _ = self.conn()
+        self.conn()
             .execute(
-                "INSERT INTO providers (profile_id, name, description, base_url, auth_token, kind, extra_headers)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO providers (profile_id, name, description, base_url, auth_token, kind, extra_headers, masking_server_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 (
                     profile_id,
                     spec.name.as_str(),
@@ -519,104 +656,303 @@ impl Store {
                     encrypted_token,
                     provider_kind_tag(spec.kind),
                     serde_json::to_string(&spec.extra_headers).expect("BTreeMap<String,String> always serializable"),
+                    spec.masking_server_id,
                 ),
             )
             .context("inserting the provider")?;
+        let id = self.conn().last_insert_rowid();
+        // Re-read so the returned value carries the resolved mask, exactly as
+        // every other read path would produce it.
+        self.get_provider(id)?
+            .with_context(|| format!("provider {id} vanished right after insert"))
+    }
+
+    /// Decrypt a raw mask row into its domain form.
+    fn build_mask(&self, raw: RawMaskingServer) -> Result<MaskingServer> {
+        let key = self.master_key();
+        Ok(MaskingServer {
+            id: raw.id,
+            profile_id: raw.profile_id,
+            name: raw.name,
+            kind: raw.kind,
+            endpoint_url: raw.endpoint_url,
+            secret: crate::crypto::decrypt(&key, &raw.enc_secret)?,
+            max_body_bytes: raw.max_body_bytes.max(0),
+            expected_egress_ip: raw.expected_egress_ip,
+            last_verified_ip: raw.last_verified_ip,
+            last_verified_asn: raw.last_verified_asn,
+            last_verified_country: raw.last_verified_country,
+            last_verified_at: raw.last_verified_at,
+        })
+    }
+
+    /// Decrypt a raw provider row and attach its egress mask, if one is bound.
+    fn build_provider(&self, raw: RawProvider, mask: Option<RawMaskingServer>) -> Result<Provider> {
+        let key = self.master_key();
+        let auth_token = crate::crypto::decrypt(&key, &raw.enc_token)?;
+        let masking_server = match mask {
+            Some(m) => Some(self.build_mask(m)?),
+            None => None,
+        };
         Ok(Provider {
-            id: self.conn().last_insert_rowid(),
-            profile_id: profile_id.to_string(),
-            name: spec.name.clone(),
-            description: spec.description.clone(),
-            base_url: spec.base_url.clone(),
-            auth_token: spec.auth_token.clone(),
-            kind: spec.kind,
-            extra_headers: spec.extra_headers.clone(),
+            id: raw.id,
+            profile_id: raw.profile_id,
+            name: raw.name,
+            description: raw.description,
+            base_url: raw.base_url,
+            auth_token,
+            kind: provider_kind_from_tag(&raw.kind_tag).expect("invalid provider kind in store"),
+            extra_headers: serde_json::from_str::<std::collections::BTreeMap<String, String>>(
+                &raw.extra_json,
+            )
+            .expect("invalid provider headers in store"),
+            masking_server_id: raw.masking_server_id,
+            masking_server,
         })
     }
 
     /// All providers belonging to a profile.
     pub fn list_providers(&self, profile_id: &str) -> Result<Vec<Provider>> {
-        let conn = self.conn();
-        let key = self.master_key().clone();
-        let mut stmt = conn.prepare(
-            "SELECT id, profile_id, name, description, base_url, auth_token, kind, extra_headers
-             FROM providers WHERE profile_id = ?1 ORDER BY name",
-        )?;
-        let rows = stmt.query_map((profile_id,), |row| {
-            Ok(RawProvider {
-                id: row.get(0)?,
-                profile_id: row.get(1)?,
-                name: row.get(2)?,
-                description: row.get(3)?,
-                base_url: row.get(4)?,
-                enc_token: row.get(5)?,
-                kind_tag: row.get(6)?,
-                extra_json: row.get(7)?,
-            })
-        })?;
-        let mut out = Vec::new();
-        for item in rows {
-            let raw = item?;
-            let auth_token = crate::crypto::decrypt(&key, &raw.enc_token)?;
-            out.push(Provider {
-                id: raw.id,
-                profile_id: raw.profile_id,
-                name: raw.name,
-                description: raw.description,
-                base_url: raw.base_url,
-                auth_token,
-                kind: provider_kind_from_tag(&raw.kind_tag)
-                    .expect("invalid provider kind in store"),
-                extra_headers: serde_json::from_str::<std::collections::BTreeMap<String, String>>(
-                    &raw.extra_json,
-                )
-                .expect("invalid provider headers in store"),
-            });
-        }
-        Ok(out)
+        let raws: Vec<RawProviderRow> = {
+            let conn = self.conn();
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {} FROM providers p {}
+                 WHERE p.profile_id = ?1 ORDER BY p.name",
+                provider_columns(),
+                mask_join()
+            ))?;
+            let rows = stmt.query_map((profile_id,), raw_provider_from_row)?;
+            let mut out = Vec::new();
+            for item in rows {
+                out.push(item?);
+            }
+            out
+        };
+        raws.into_iter()
+            .map(|(provider, mask)| self.build_provider(provider, mask))
+            .collect()
     }
 
     /// A single provider by id.
     pub fn get_provider(&self, id: i64) -> Result<Option<Provider>> {
-        let key = self.master_key().clone();
-        let raw: Option<RawProvider> = self.conn().query_row(
-            "SELECT id, profile_id, name, description, base_url, auth_token, kind, extra_headers
-             FROM providers WHERE id = ?1",
-            (id,),
-            |row| {
-                Ok(RawProvider {
-                    id: row.get(0)?,
-                    profile_id: row.get(1)?,
-                    name: row.get(2)?,
-                    description: row.get(3)?,
-                    base_url: row.get(4)?,
-                    enc_token: row.get(5)?,
-                    kind_tag: row.get(6)?,
-                    extra_json: row.get(7)?,
-                })
-            },
-        ).optional()?;
+        let raw: Option<RawProviderRow> = {
+            let conn = self.conn();
+            conn.query_row(
+                &format!(
+                    "SELECT {} FROM providers p {}
+                     WHERE p.id = ?1",
+                    provider_columns(),
+                    mask_join()
+                ),
+                (id,),
+                raw_provider_from_row,
+            )
+            .optional()?
+        };
         match raw {
-            Some(raw) => {
-                let auth_token = crate::crypto::decrypt(&key, &raw.enc_token)?;
-                Ok(Some(Provider {
-                    id: raw.id,
-                    profile_id: raw.profile_id,
-                    name: raw.name,
-                    description: raw.description,
-                    base_url: raw.base_url,
-                    auth_token,
-                    kind: provider_kind_from_tag(&raw.kind_tag)
-                        .expect("invalid provider kind in store"),
-                    extra_headers:
-                        serde_json::from_str::<std::collections::BTreeMap<String, String>>(
-                            &raw.extra_json,
-                        )
-                        .expect("invalid provider headers in store"),
-                }))
-            }
+            Some((provider, mask)) => Ok(Some(self.build_provider(provider, mask)?)),
             None => Ok(None),
         }
+    }
+
+    /// Bind (or unbind, with `None`) a provider's egress mask.
+    pub fn set_provider_masking(&self, provider_id: i64, mask_id: Option<i64>) -> Result<()> {
+        let changed = self
+            .conn()
+            .execute(
+                "UPDATE providers SET masking_server_id = ?1 WHERE id = ?2",
+                (mask_id, provider_id),
+            )
+            .context("binding the provider's masking server")?;
+        if changed == 0 {
+            bail!("no provider matches id {provider_id}");
+        }
+        Ok(())
+    }
+
+    // --- egress masks -------------------------------------------------------
+
+    /// Register an egress mask under a profile.
+    pub fn create_masking_server(
+        &self,
+        profile_id: &str,
+        spec: NewMaskingServer,
+    ) -> Result<MaskingServer> {
+        let key = self.master_key();
+        let enc_secret = crate::crypto::encrypt(&key, &spec.secret)?;
+        self.conn()
+            .execute(
+                "INSERT INTO masking_servers
+                    (profile_id, name, kind, endpoint_url, secret, max_body_bytes, expected_egress_ip)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                (
+                    profile_id,
+                    spec.name.as_str(),
+                    spec.kind.as_str(),
+                    spec.endpoint_url.as_str(),
+                    enc_secret,
+                    spec.max_body_bytes.max(0),
+                    spec.expected_egress_ip.as_deref(),
+                ),
+            )
+            .context("inserting the masking server")?;
+        let id = self.conn().last_insert_rowid();
+        self.get_masking_server(id)?
+            .with_context(|| format!("masking server {id} vanished right after insert"))
+    }
+
+    /// All masks belonging to a profile, ordered by name.
+    pub fn list_masking_servers(&self, profile_id: &str) -> Result<Vec<MaskingServer>> {
+        let raws: Vec<RawMaskingServer> = {
+            let conn = self.conn();
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {} FROM masking_servers WHERE profile_id = ?1 ORDER BY name",
+                mask_columns("")
+            ))?;
+            let rows = stmt.query_map((profile_id,), |row| {
+                raw_mask_from_row(row, 0).and_then(|m| m.ok_or(rusqlite::Error::InvalidQuery))
+            })?;
+            let mut out = Vec::new();
+            for item in rows {
+                out.push(item?);
+            }
+            out
+        };
+        raws.into_iter().map(|raw| self.build_mask(raw)).collect()
+    }
+
+    /// A single mask by id.
+    pub fn get_masking_server(&self, id: i64) -> Result<Option<MaskingServer>> {
+        let raw: Option<RawMaskingServer> = {
+            let conn = self.conn();
+            conn.query_row(
+                &format!(
+                    "SELECT {} FROM masking_servers WHERE id = ?1",
+                    mask_columns("")
+                ),
+                (id,),
+                |row| {
+                    raw_mask_from_row(row, 0).and_then(|m| m.ok_or(rusqlite::Error::InvalidQuery))
+                },
+            )
+            .optional()?
+        };
+        match raw {
+            Some(raw) => Ok(Some(self.build_mask(raw)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// A single mask by name within a profile.
+    pub fn get_masking_server_named(
+        &self,
+        profile_id: &str,
+        name: &str,
+    ) -> Result<Option<MaskingServer>> {
+        let raw: Option<RawMaskingServer> = {
+            let conn = self.conn();
+            conn.query_row(
+                &format!(
+                    "SELECT {} FROM masking_servers WHERE profile_id = ?1 AND name = ?2",
+                    mask_columns("")
+                ),
+                (profile_id, name),
+                |row| {
+                    raw_mask_from_row(row, 0).and_then(|m| m.ok_or(rusqlite::Error::InvalidQuery))
+                },
+            )
+            .optional()?
+        };
+        match raw {
+            Some(raw) => Ok(Some(self.build_mask(raw)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Update a mask's mutable fields, re-encrypting the supplied secret.
+    pub fn update_masking_server(&self, id: i64, spec: NewMaskingServer) -> Result<()> {
+        let key = self.master_key();
+        let enc_secret = crate::crypto::encrypt(&key, &spec.secret)?;
+        let changed = self
+            .conn()
+            .execute(
+                "UPDATE masking_servers
+                 SET name = ?1, kind = ?2, endpoint_url = ?3, secret = ?4,
+                     max_body_bytes = ?5, expected_egress_ip = ?6
+                 WHERE id = ?7",
+                (
+                    spec.name.as_str(),
+                    spec.kind.as_str(),
+                    spec.endpoint_url.as_str(),
+                    enc_secret,
+                    spec.max_body_bytes.max(0),
+                    spec.expected_egress_ip.as_deref(),
+                    id,
+                ),
+            )
+            .context("updating the masking server")?;
+        if changed == 0 {
+            bail!("no masking server matches id {id}");
+        }
+        Ok(())
+    }
+
+    /// Delete a mask. Providers bound to it are unbound rather than deleted: the
+    /// binding column is `ON DELETE SET NULL`, so removing a hop never takes
+    /// providers (or their credentials) with it.
+    pub fn delete_masking_server(&self, id: i64) -> Result<()> {
+        let changed = self
+            .conn()
+            .execute("DELETE FROM masking_servers WHERE id = ?1", (id,))
+            .context("deleting the masking server")?;
+        if changed == 0 {
+            bail!("no masking server matches id {id}");
+        }
+        Ok(())
+    }
+
+    /// Record the egress identity a mask last reported through its probe.
+    pub fn set_masking_server_probe(
+        &self,
+        id: i64,
+        ip: &str,
+        asn: Option<&str>,
+        country: Option<&str>,
+    ) -> Result<()> {
+        let changed = self
+            .conn()
+            .execute(
+                "UPDATE masking_servers
+                 SET last_verified_ip = ?1, last_verified_asn = ?2,
+                     last_verified_country = ?3, last_verified_at = ?4
+                 WHERE id = ?5",
+                (ip, asn, country, now_millis(), id),
+            )
+            .context("recording the masking server probe")?;
+        if changed == 0 {
+            bail!("no masking server matches id {id}");
+        }
+        Ok(())
+    }
+
+    /// Set (or clear, with `None`) a profile's default egress mask, used by
+    /// providers that do not bind one of their own.
+    pub fn set_profile_default_masking(
+        &self,
+        profile_id: &str,
+        mask_id: Option<i64>,
+    ) -> Result<()> {
+        let changed = self
+            .conn()
+            .execute(
+                "UPDATE profiles SET default_masking_server_id = ?1, updated_at = ?2 WHERE id = ?3",
+                (mask_id, now_millis(), profile_id),
+            )
+            .context("setting the profile default masking server")?;
+        if changed == 0 {
+            bail!("no profile matches id {profile_id:?}");
+        }
+        Ok(())
     }
 
     /// Remove a provider.
@@ -917,6 +1253,7 @@ impl Store {
             status: ModelStatus::Healthy,
             capabilities,
             price_per_1m: default_price_for(model_id),
+            cooldown_until: 0,
         })
     }
 
@@ -935,7 +1272,7 @@ impl Store {
     pub fn route_entries(&self, route_id: i64) -> Result<Vec<RouteEntry>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT id, route_id, provider_id, model_id, priority, weight, status, capabilities, price_per_1m
+            "SELECT id, route_id, provider_id, model_id, priority, weight, status, capabilities, price_per_1m, cooldown_until
              FROM route_entries WHERE route_id = ?1 ORDER BY priority",
         )?;
         let rows = stmt.query_map((route_id,), |row| {
@@ -955,6 +1292,7 @@ impl Store {
                 capabilities: serde_json::from_str::<RouteCapabilities>(&caps_json)
                     .expect("invalid capabilities in store"),
                 price_per_1m: row.get::<_, Option<f64>>(8)?.unwrap_or(0.0).max(0.0),
+                cooldown_until: row.get::<_, Option<i64>>(9)?.unwrap_or(0),
             })
         })?;
         let mut out = Vec::new();
@@ -972,6 +1310,21 @@ impl Store {
                 (status_tag(status), entry_id),
             )
             .context("updating the route model status")?;
+        Ok(())
+    }
+
+    /// Set (or clear, with 0) the rate-limit cooldown for an entry.
+    ///
+    /// `until` is unix millis. Cooldown is tracked separately from
+    /// [`ModelStatus`] so a background probe marking a key healthy cannot cancel
+    /// an upstream rate-limit window.
+    pub fn set_route_entry_cooldown(&self, entry_id: i64, until: i64) -> Result<()> {
+        self.conn()
+            .execute(
+                "UPDATE route_entries SET cooldown_until = ?1 WHERE id = ?2",
+                (until.max(0), entry_id),
+            )
+            .context("updating the route model cooldown")?;
         Ok(())
     }
 
@@ -1025,75 +1378,61 @@ impl Store {
 
     /// All entries that are not Healthy and not Disabled — these are the ones
     /// the health probe should check.
+    ///
+    /// Each provider is returned with its egress mask attached, so a probe leaves
+    /// through the same hop as live traffic. Probing directly would mark every
+    /// masked key unhealthy as soon as the mask is the working path.
     pub fn entries_needing_probe(&self) -> Result<Vec<(RouteEntry, Provider)>> {
-        let conn = self.conn();
-        let key = self.master_key().clone();
-        let mut stmt = conn.prepare(
-            "SELECT e.id, e.route_id, e.provider_id, e.model_id, e.priority,
-                    e.weight, e.status, e.capabilities, e.price_per_1m,
-                    p.id, p.profile_id, p.name, p.description, p.base_url,
-                    p.auth_token, p.kind, p.extra_headers
-             FROM route_entries e
-             JOIN providers p ON p.id = e.provider_id
-             WHERE e.status != ?1 AND e.status != ?2",
-        )?;
-        let rows = stmt.query_map(
-            [
-                status_tag(ModelStatus::Healthy),
-                status_tag(ModelStatus::Disabled),
-            ],
-            |row| {
-                let status_tag_owned: String = row.get(6)?;
-                let caps_json: String = row.get(7)?;
-                let price: Option<f64> = row.get(8)?;
-                let kind_tag: String = row.get(15)?;
-                let extra_json: String = row.get(16)?;
-                // The auth token is stored encrypted (BLOB); decrypt it here
-                // the same way `list_providers` / `get_provider` do.
-                let enc_token: Vec<u8> = row.get(14)?;
-                let auth_token = crate::crypto::decrypt(&key, &enc_token).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        14,
-                        rusqlite::types::Type::Blob,
-                        format!("decrypting the provider auth token: {e}").into(),
-                    )
-                })?;
-                Ok((
-                    RouteEntry {
+        let raws: Vec<(RouteEntry, RawProviderRow)> = {
+            let conn = self.conn();
+            let mut stmt = conn.prepare(&format!(
+                "SELECT e.id, e.route_id, e.provider_id, e.model_id, e.priority,
+                        e.weight, e.status, e.capabilities, e.price_per_1m,
+                        e.cooldown_until,
+                        {}
+                 FROM route_entries e
+                 JOIN providers p ON p.id = e.provider_id
+                 {}
+                 WHERE e.status != ?1 AND e.status != ?2",
+                provider_columns(),
+                mask_join()
+            ))?;
+            let rows = stmt.query_map(
+                [
+                    status_tag(ModelStatus::Healthy),
+                    status_tag(ModelStatus::Disabled),
+                ],
+                |row| {
+                    let status_tag_owned: String = row.get(6)?;
+                    let caps_json: String = row.get(7)?;
+                    let entry = RouteEntry {
                         id: row.get(0)?,
                         route_id: row.get(1)?,
                         provider_id: row.get(2)?,
                         model_id: row.get(3)?,
                         priority: row.get(4)?,
                         weight: row.get(5)?,
-                        status: status_from_tag(&status_tag_owned)
-                            .unwrap_or_else(|e| {
-                                tracing::warn!(error = %e, "invalid status in store, defaulting to Unhealthy");
-                                ModelStatus::Unhealthy
-                            }),
+                        status: status_from_tag(&status_tag_owned).unwrap_or_else(|e| {
+                            tracing::warn!(error = %e, "invalid status in store, defaulting to Unhealthy");
+                            ModelStatus::Unhealthy
+                        }),
                         capabilities: serde_json::from_str::<RouteCapabilities>(&caps_json)
                             .expect("invalid capabilities in store"),
-                        price_per_1m: price.unwrap_or(0.0).max(0.0),
-                    },
-                    Provider {
-                        id: row.get(9)?,
-                        profile_id: row.get(10)?,
-                        name: row.get(11)?,
-                        description: row.get(12)?,
-                        base_url: row.get(13)?,
-                        auth_token,
-                        kind: provider_kind_from_tag(&kind_tag).expect("invalid kind in store"),
-                        extra_headers: serde_json::from_str(&extra_json)
-                            .expect("invalid headers in store"),
-                    },
-                ))
-            },
-        )?;
-        let mut out = Vec::new();
-        for item in rows {
-            out.push(item?);
-        }
-        Ok(out)
+                        price_per_1m: row.get::<_, Option<f64>>(8)?.unwrap_or(0.0).max(0.0),
+                        cooldown_until: row.get::<_, Option<i64>>(9)?.unwrap_or(0),
+                    };
+                    Ok((entry, raw_provider_at(row, 10)?))
+                },
+            )?;
+            let mut out = Vec::new();
+            for item in rows {
+                out.push(item?);
+            }
+            out
+        };
+        raws.into_iter()
+            .map(|(entry, (provider, mask))| Ok((entry, self.build_provider(provider, mask)?)))
+            .collect()
     }
 
     // ---- usage logging -------------------------------------------------
@@ -1323,6 +1662,7 @@ mod tests {
                     auth_token: "tok".to_string(),
                     kind: *kind,
                     extra_headers: Default::default(),
+                    masking_server_id: None,
                 },
             )?;
             let listed = store.list_providers(profile.id.as_str())?;
@@ -1383,6 +1723,7 @@ mod tests {
                 auth_token: "sk-secret".to_string(),
                 kind: ProviderKind::OpenAI,
                 extra_headers: headers,
+                masking_server_id: None,
             },
         )?;
         let listed = store.list_providers(profile.id.as_str())?;
@@ -1433,6 +1774,7 @@ mod tests {
                 auth_token: "t1".to_string(),
                 kind: ProviderKind::OpenAI,
                 extra_headers: std::collections::BTreeMap::new(),
+                masking_server_id: None,
             },
         )?;
         store.update_provider(
@@ -1444,6 +1786,7 @@ mod tests {
                 auth_token: "t2".to_string(),
                 kind: ProviderKind::Anthropic,
                 extra_headers: std::collections::BTreeMap::new(),
+                masking_server_id: None,
             },
         )?;
         let updated = store.get_provider(provider.id)?.unwrap();
@@ -1524,6 +1867,7 @@ mod tests {
                 auth_token: "a".to_string(),
                 kind: ProviderKind::OpenAI,
                 extra_headers: std::collections::BTreeMap::new(),
+                masking_server_id: None,
             },
         )?;
         let provider_b = store.create_provider(
@@ -1535,6 +1879,7 @@ mod tests {
                 auth_token: "b".to_string(),
                 kind: ProviderKind::OpenAI,
                 extra_headers: std::collections::BTreeMap::new(),
+                masking_server_id: None,
             },
         )?;
 
@@ -1590,6 +1935,7 @@ mod tests {
                 auth_token: "t".to_string(),
                 kind: ProviderKind::OpenAI,
                 extra_headers: std::collections::BTreeMap::new(),
+                masking_server_id: None,
             },
         )?;
         let proxy = store.create_proxy(profile.id.as_str(), "prog", None)?;
@@ -1638,5 +1984,186 @@ mod tests {
         assert!(crate::storage::default_price_for("provider-micro") < 1.0);
         assert!(crate::storage::default_price_for("provider-pro") > 5.0);
         assert!(crate::storage::default_price_for("provider-flash") < 1.0);
+    }
+
+    // --- egress masks -------------------------------------------------------
+
+    fn new_mask(name: &str) -> NewMaskingServer {
+        NewMaskingServer {
+            name: name.to_string(),
+            kind: "vps".to_string(),
+            endpoint_url: format!("https://{name}.example/forward"),
+            secret: format!("secret-for-{name}"),
+            max_body_bytes: 0,
+            expected_egress_ip: None,
+        }
+    }
+
+    fn new_provider(name: &str, mask_id: Option<i64>) -> NewProvider {
+        NewProvider {
+            name: name.to_string(),
+            description: None,
+            base_url: "https://upstream.example".to_string(),
+            auth_token: "up-key".to_string(),
+            kind: ProviderKind::OpenAI,
+            extra_headers: Default::default(),
+            masking_server_id: mask_id,
+        }
+    }
+
+    #[test]
+    fn a_mask_binds_to_a_provider_and_travels_with_it() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let profile = store.create_profile("masked", None, None)?;
+        let mask = store.create_masking_server(profile.id.as_str(), new_mask("edge-1"))?;
+        let provider =
+            store.create_provider(profile.id.as_str(), new_provider("key-1", Some(mask.id)))?;
+
+        // The secret is decrypted for egress use, but never serialized.
+        assert_eq!(
+            provider.masking_server.as_ref().unwrap().secret,
+            "secret-for-edge-1"
+        );
+        assert!(!serde_json::to_string(&provider)?.contains("secret-for-edge-1"));
+
+        // Every read path agrees, including the one health probing uses.
+        let loaded = store.get_provider(provider.id)?.unwrap();
+        assert_eq!(loaded.masking_server_id, Some(mask.id));
+        assert_eq!(loaded.masking_server.as_ref().unwrap().name, "edge-1");
+        let listed = store.list_providers(profile.id.as_str())?;
+        assert_eq!(
+            listed[0].masking_server.as_ref().unwrap().endpoint_url,
+            "https://edge-1.example/forward"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn five_keys_can_leave_from_five_masks() -> Result<()> {
+        // The point of the feature: one egress identity per key.
+        let store = Store::open_in_memory()?;
+        let profile = store.create_profile("fleet", None, None)?;
+        let mut endpoints = Vec::new();
+        for i in 1..=5 {
+            let mask =
+                store.create_masking_server(profile.id.as_str(), new_mask(&format!("key-{i}")))?;
+            let provider = store.create_provider(
+                profile.id.as_str(),
+                new_provider(&format!("key-{i}"), Some(mask.id)),
+            )?;
+            endpoints.push(
+                provider
+                    .masking_server
+                    .expect("each key carries its own mask")
+                    .endpoint_url,
+            );
+        }
+        endpoints.sort();
+        endpoints.dedup();
+        assert_eq!(endpoints.len(), 5, "five keys must present five hops");
+        Ok(())
+    }
+
+    #[test]
+    fn the_profile_default_covers_providers_that_bind_nothing() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let profile = store.create_profile("defaulted", None, None)?;
+        let mask = store.create_masking_server(profile.id.as_str(), new_mask("shared"))?;
+        store.set_profile_default_masking(profile.id.as_str(), Some(mask.id))?;
+
+        let bound = store.create_provider(profile.id.as_str(), new_provider("key-1", None))?;
+        assert_eq!(bound.masking_server.as_ref().unwrap().name, "shared");
+        // The explicit binding stays empty, so `provider edit` shows the truth.
+        assert_eq!(bound.masking_server_id, None);
+
+        // A provider-level binding wins over the profile default.
+        let own = store.create_masking_server(profile.id.as_str(), new_mask("own"))?;
+        let overriding =
+            store.create_provider(profile.id.as_str(), new_provider("key-2", Some(own.id)))?;
+        assert_eq!(overriding.masking_server.as_ref().unwrap().name, "own");
+
+        // Clearing the default returns everyone to direct egress.
+        store.set_profile_default_masking(profile.id.as_str(), None)?;
+        let after = store.get_provider(bound.id)?.unwrap();
+        assert!(after.masking_server.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn deleting_a_mask_unbinds_providers_without_deleting_them() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let profile = store.create_profile("cleanup", None, None)?;
+        let mask = store.create_masking_server(profile.id.as_str(), new_mask("edge-1"))?;
+        let provider =
+            store.create_provider(profile.id.as_str(), new_provider("key-1", Some(mask.id)))?;
+
+        store.delete_masking_server(mask.id)?;
+
+        // The provider survives with its credentials intact, merely unbound.
+        let survivor = store
+            .get_provider(provider.id)?
+            .expect("deleting a mask must never delete a provider");
+        assert_eq!(survivor.masking_server_id, None);
+        assert!(survivor.masking_server.is_none());
+        assert_eq!(survivor.auth_token, "up-key");
+        Ok(())
+    }
+
+    #[test]
+    fn mask_updates_and_probe_results_roundtrip() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let profile = store.create_profile("probed", None, None)?;
+        let mask = store.create_masking_server(profile.id.as_str(), new_mask("edge-1"))?;
+
+        let mut spec = new_mask("edge-1");
+        spec.secret = "rotated".to_string();
+        spec.max_body_bytes = 6 * 1024 * 1024;
+        store.update_masking_server(mask.id, spec)?;
+        store.set_masking_server_probe(mask.id, "203.0.113.7", Some("AS24940"), Some("DE"))?;
+
+        let reloaded = store.get_masking_server(mask.id)?.unwrap();
+        assert_eq!(reloaded.secret, "rotated", "rotation must take effect");
+        assert_eq!(reloaded.max_body_bytes, 6 * 1024 * 1024);
+        assert_eq!(reloaded.last_verified_ip.as_deref(), Some("203.0.113.7"));
+        assert_eq!(reloaded.last_verified_asn.as_deref(), Some("AS24940"));
+        assert!(reloaded.last_verified_at.is_some());
+
+        // Name lookups (used by tooling) agree with id lookups.
+        let by_name = store
+            .get_masking_server_named(profile.id.as_str(), "edge-1")?
+            .expect("a mask is addressable by name");
+        assert_eq!(by_name.id, mask.id);
+        assert_eq!(store.list_masking_servers(profile.id.as_str())?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_rate_limited_entry_can_be_cooled_down_and_warmed_back_up() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let profile = store.create_profile("cooling", None, None)?;
+        let provider = store.create_provider(profile.id.as_str(), new_provider("key-1", None))?;
+        let proxy = store.create_proxy(profile.id.as_str(), "p", None)?;
+        let route = store.create_route(proxy.id, "r", None, RoutingStrategy::RoundRobin, None)?;
+        let entry = store.add_route_entry(
+            route.id,
+            provider.id,
+            "m",
+            1,
+            1.0,
+            RouteCapabilities::default(),
+        )?;
+        assert_eq!(entry.cooldown_until, 0, "new entries start warm");
+
+        let until = chrono::Utc::now().timestamp_millis() + 30_000;
+        store.set_route_entry_cooldown(entry.id, until)?;
+        assert_eq!(store.route_entries(route.id)?[0].cooldown_until, until);
+
+        // Cooling is independent of health, so a probe cannot cancel it.
+        store.set_route_entry_status(entry.id, ModelStatus::Healthy)?;
+        assert_eq!(store.route_entries(route.id)?[0].cooldown_until, until);
+
+        store.set_route_entry_cooldown(entry.id, 0)?;
+        assert_eq!(store.route_entries(route.id)?[0].cooldown_until, 0);
+        Ok(())
     }
 }

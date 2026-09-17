@@ -120,7 +120,16 @@ pub async fn forward_non_streaming(
     target: &Target,
     chat_req: &ChatRequest,
 ) -> Result<Vec<u8>> {
-    let (url, headers, body) = build_upstream_request(target, chat_req, false)?;
+    let (mut url, mut headers, body) = build_upstream_request(target, chat_req, false)?;
+    // Leave through the provider's mask when one is bound (directly, or via the
+    // profile default). A hop that cannot carry the body fails here, before any
+    // bytes are spent upstream.
+    crate::mask::apply_json(
+        target.provider.masking_server.as_ref(),
+        &mut url,
+        &mut headers,
+        &body,
+    )?;
     let mut req = client.post(&url);
     for (k, v) in &headers {
         req = req.header(k, v);
@@ -131,8 +140,19 @@ pub async fn forward_non_streaming(
         .await
         .context("sending request to provider")?;
     let status = resp.status();
+    // Read the mask verdict before the body is consumed.
+    let mask_rejected = crate::mask::is_mask_rejection(&resp);
     let bytes = resp.bytes().await.context("reading provider response")?;
     if !status.is_success() {
+        if mask_rejected {
+            if let Some(mask) = target.provider.masking_server.as_ref() {
+                return Err(crate::mask::rejection_error(
+                    &mask.name,
+                    status,
+                    &String::from_utf8_lossy(&bytes),
+                ));
+            }
+        }
         return Err(ProviderError {
             status,
             body: String::from_utf8_lossy(&bytes).into_owned(),

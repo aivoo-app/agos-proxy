@@ -144,6 +144,7 @@ fn add(
                 auth_token,
                 kind,
                 extra_headers,
+                masking_server_id: None,
             },
         )?;
         println!(
@@ -186,6 +187,7 @@ fn add(
             auth_token,
             kind,
             extra_headers,
+            masking_server_id: None,
         },
     )?;
     println!(
@@ -270,6 +272,7 @@ fn edit(store: &crate::storage::Store, profile: Option<String>) -> Result<()> {
             auth_token: final_token,
             kind,
             extra_headers,
+            masking_server_id: None,
         },
     )?;
     println!(

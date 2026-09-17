@@ -1099,8 +1099,14 @@ async fn forward_responses_attempt(
     req: &ChatRequest,
     timeout: Duration,
 ) -> anyhow::Result<(serde_json::Value, Option<i64>, Option<i64>)> {
-    let (url, headers, body) =
+    let (mut url, mut headers, body) =
         crate::adapter::outbound::build_upstream_request(target, req, false)?;
+    crate::mask::apply_json(
+        target.provider.masking_server.as_ref(),
+        &mut url,
+        &mut headers,
+        &body,
+    )?;
     let mut request = client.post(&url);
     for (k, v) in &headers {
         request = request.header(k, v);
@@ -1110,11 +1116,21 @@ async fn forward_responses_attempt(
         .map_err(|_| anyhow::anyhow!("upstream timeout"))?
         .map_err(|e| anyhow::anyhow!("upstream failed: {e}"))?;
     let status = resp.status();
+    let mask_rejected = crate::mask::is_mask_rejection(&resp);
     let bytes = resp
         .bytes()
         .await
         .map_err(|e| anyhow::anyhow!("reading provider response failed: {e}"))?;
     if !status.is_success() {
+        if mask_rejected {
+            if let Some(mask) = target.provider.masking_server.as_ref() {
+                return Err(crate::mask::rejection_error(
+                    &mask.name,
+                    status,
+                    &String::from_utf8_lossy(&bytes),
+                ));
+            }
+        }
         return Err(anyhow::Error::new(crate::adapter::outbound::ProviderError {
             status,
             body: String::from_utf8_lossy(&bytes).into_owned(),
@@ -1760,6 +1776,7 @@ mod economy_tests {
                     auth_token: "unused".into(),
                     kind: ProviderKind::OpenAI,
                     extra_headers: Default::default(),
+                    masking_server_id: None,
                 },
             )
             .unwrap();

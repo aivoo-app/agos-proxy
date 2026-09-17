@@ -735,6 +735,7 @@ mod tests {
                     auth_token: "sk-mock".into(),
                     kind: ProviderKind::OpenAI,
                     extra_headers: BTreeMap::new(),
+                    masking_server_id: None,
                 },
             )
             .expect("provider");
@@ -825,6 +826,7 @@ mod tests {
                 created_at: 0,
                 updated_at: 0,
                 rpm_limit: 0,
+                default_masking_server_id: None,
             },
             model: "prog/r1".into(),
             client: reqwest::Client::new(),

@@ -327,7 +327,13 @@ pub async fn forward_completion(
     target: &Target,
     req: &CompletionRequest,
 ) -> Result<Vec<u8>> {
-    let (url, headers, body) = build_completion_upstream_request(target, req)?;
+    let (mut url, mut headers, body) = build_completion_upstream_request(target, req)?;
+    crate::mask::apply_json(
+        target.provider.masking_server.as_ref(),
+        &mut url,
+        &mut headers,
+        &body,
+    )?;
     let mut request = client.post(&url);
     for (k, v) in &headers {
         request = request.header(k, v);
@@ -338,8 +344,18 @@ pub async fn forward_completion(
         .await
         .context("sending completion request to provider")?;
     let status = resp.status();
+    let mask_rejected = crate::mask::is_mask_rejection(&resp);
     let bytes = resp.bytes().await.context("reading provider response")?;
     if !status.is_success() {
+        if mask_rejected {
+            if let Some(mask) = target.provider.masking_server.as_ref() {
+                return Err(crate::mask::rejection_error(
+                    &mask.name,
+                    status,
+                    &String::from_utf8_lossy(&bytes),
+                ));
+            }
+        }
         return Err(super::ProviderError {
             status,
             body: String::from_utf8_lossy(&bytes).into_owned(),
@@ -356,7 +372,13 @@ pub async fn forward_embedding(
     target: &Target,
     req: &EmbeddingRequest,
 ) -> Result<Vec<u8>> {
-    let (url, headers, body) = build_embedding_upstream_request(target, req)?;
+    let (mut url, mut headers, body) = build_embedding_upstream_request(target, req)?;
+    crate::mask::apply_json(
+        target.provider.masking_server.as_ref(),
+        &mut url,
+        &mut headers,
+        &body,
+    )?;
     let mut request = client.post(&url);
     for (k, v) in &headers {
         request = request.header(k, v);
@@ -367,8 +389,18 @@ pub async fn forward_embedding(
         .await
         .context("sending embedding request to provider")?;
     let status = resp.status();
+    let mask_rejected = crate::mask::is_mask_rejection(&resp);
     let bytes = resp.bytes().await.context("reading provider response")?;
     if !status.is_success() {
+        if mask_rejected {
+            if let Some(mask) = target.provider.masking_server.as_ref() {
+                return Err(crate::mask::rejection_error(
+                    &mask.name,
+                    status,
+                    &String::from_utf8_lossy(&bytes),
+                ));
+            }
+        }
         return Err(super::ProviderError {
             status,
             body: String::from_utf8_lossy(&bytes).into_owned(),
@@ -397,6 +429,8 @@ mod tests {
                 auth_token: "sk-secret".into(),
                 kind: ProviderKind::OpenAI,
                 extra_headers: extra,
+                masking_server_id: None,
+                masking_server: None,
             },
             entry: RouteEntry {
                 id: 1,
@@ -408,6 +442,7 @@ mod tests {
                 status: ModelStatus::Healthy,
                 capabilities: Default::default(),
                 price_per_1m: 0.4,
+                cooldown_until: 0,
             },
             identity: None,
         }
