@@ -711,6 +711,27 @@ impl Store {
         })
     }
 
+    /// Persist the latest probe result for a mask, so `mask list` and
+    /// `mask audit` can show the identity without re-probing.
+    pub fn record_mask_probe(
+        &self,
+        mask_id: i64,
+        ip: &str,
+        asn: Option<&str>,
+        country: Option<&str>,
+    ) -> Result<()> {
+        self.conn()
+            .execute(
+                "UPDATE masking_servers
+                 SET last_verified_ip = ?1, last_verified_asn = ?2,
+                     last_verified_country = ?3, last_verified_at = ?4
+                 WHERE id = ?5",
+                (ip, asn, country, now_millis(), mask_id),
+            )
+            .context("recording the mask probe")?;
+        Ok(())
+    }
+
     /// All providers belonging to a profile.
     pub fn list_providers(&self, profile_id: &str) -> Result<Vec<Provider>> {
         let raws: Vec<RawProviderRow> = {
@@ -970,7 +991,7 @@ impl Store {
         let changed = self
             .conn()
             .execute(
-                "UPDATE providers SET name = ?1, description = ?2, base_url = ?3, auth_token = ?4, kind = ?5, extra_headers = ?6 WHERE id = ?7",
+                "UPDATE providers SET name = ?1, description = ?2, base_url = ?3, auth_token = ?4, kind = ?5, extra_headers = ?6, masking_server_id = ?7 WHERE id = ?8",
                 (
                     spec.name.as_str(),
                     spec.description.as_deref(),
@@ -978,6 +999,7 @@ impl Store {
                     encrypted_token,
                     provider_kind_tag(spec.kind),
                     serde_json::to_string(&spec.extra_headers).expect("BTreeMap<String,String> always serializable"),
+                    spec.masking_server_id,
                     id,
                 ),
             )

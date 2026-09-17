@@ -38,6 +38,9 @@ pub enum ProviderArgs {
         /// Extra header sent upstream, as `Name: value` (repeatable).
         #[arg(long = "header")]
         headers: Vec<String>,
+        /// Egress mask to bind this key to (see `agos-proxy mask --help`).
+        #[arg(long)]
+        mask: Option<String>,
     },
     /// List the providers configured on a profile.
     List {
@@ -77,6 +80,7 @@ pub fn run(args: ProviderArgs) -> Result<()> {
             kind,
             description,
             headers,
+            mask,
         } => add(
             &store,
             profile,
@@ -86,6 +90,7 @@ pub fn run(args: ProviderArgs) -> Result<()> {
             kind,
             description,
             headers,
+            mask,
         ),
         ProviderArgs::List { profile } => list(&store, profile),
         ProviderArgs::Edit { profile } => edit(&store, profile),
@@ -95,6 +100,42 @@ pub fn run(args: ProviderArgs) -> Result<()> {
             yes,
         } => delete(&store, profile, provider, yes),
     }
+}
+
+/// Resolve `--mask` (or an interactive picker with a "no mask" option) to a
+/// masking server id. Returns `None` when the user chose not to bind one.
+fn resolve_mask_id(
+    store: &crate::storage::Store,
+    profile: &crate::domain::Profile,
+    given: Option<String>,
+    theme: &dialoguer::theme::ColorfulTheme,
+) -> Result<Option<i64>> {
+    let masks = store.list_masking_servers(profile.id.as_str())?;
+    if let Some(name) = given.filter(|n| !n.is_empty()) {
+        if name == "none" {
+            return Ok(None);
+        }
+        return Ok(Some(
+            masks
+                .iter()
+                .find(|m| m.name == name)
+                .with_context(|| {
+                    format!("no mask named {name:?} under profile {:?}", profile.name)
+                })?
+                .id,
+        ));
+    }
+    if masks.is_empty() {
+        return Ok(None);
+    }
+    let mut choices: Vec<String> = vec!["(no mask)".to_string()];
+    choices.extend(masks.iter().map(|m| m.name.clone()));
+    let pick = Select::with_theme(theme)
+        .with_prompt("Egress mask (optional)")
+        .items(&choices)
+        .default(0)
+        .interact()?;
+    Ok((pick > 0).then(|| masks[pick - 1].id))
 }
 
 /// Resolve the owning profile from a flag, or let the user pick one.
@@ -118,6 +159,7 @@ fn add(
     kind: Option<String>,
     description: Option<String>,
     headers: Vec<String>,
+    mask: Option<String>,
 ) -> Result<()> {
     let theme = ColorfulTheme::default();
     let profile = resolve_profile(store, profile)?;
@@ -135,6 +177,7 @@ fn add(
                 .with_context(|| format!("header {h:?} must be `Name: value`"))?;
             extra_headers.insert(k.trim().to_string(), v.trim().to_string());
         }
+        let masking_server_id = resolve_mask_id(store, &profile, mask, &theme)?;
         let provider = store.create_provider(
             profile.id.as_str(),
             NewProvider {
@@ -144,7 +187,7 @@ fn add(
                 auth_token,
                 kind,
                 extra_headers,
-                masking_server_id: None,
+                masking_server_id,
             },
         )?;
         println!(
@@ -173,6 +216,7 @@ fn add(
         .allow_empty(true)
         .interact_text()?;
     let extra_headers = prompt_headers()?;
+    let masking_server_id = resolve_mask_id(store, &profile, mask, &theme)?;
 
     let provider = store.create_provider(
         profile.id.as_str(),
@@ -187,7 +231,7 @@ fn add(
             auth_token,
             kind,
             extra_headers,
-            masking_server_id: None,
+            masking_server_id,
         },
     )?;
     println!(
@@ -209,13 +253,20 @@ fn list(store: &crate::storage::Store, profile: Option<String>) -> Result<()> {
         );
         return Ok(());
     }
-    println!("{:<16} {:<14} {:<30} BASE URL", "ID", "KIND", "NAME");
+    println!(
+        "{:<16} {:<14} {:<24} {:<40} BASE URL",
+        "ID", "KIND", "NAME", "MASK"
+    );
     for p in providers {
         println!(
-            "{:<16} {:<14} {:<30} {}",
+            "{:<16} {:<14} {:<24} {:<40} {}",
             p.id,
             kind_label(&p.kind),
             p.name,
+            p.masking_server
+                .as_ref()
+                .map(|m| m.name.as_str())
+                .unwrap_or("-"),
             p.base_url
         );
     }
@@ -258,6 +309,9 @@ fn edit(store: &crate::storage::Store, profile: Option<String>) -> Result<()> {
         .allow_empty(true)
         .interact_text()?;
     let extra_headers = prompt_headers()?;
+    // Keep the existing egress mask unless the user picks a different one.
+    let masking_server_id = resolve_mask_id(store, &profile, None, &theme)?
+        .or(provider.masking_server.as_ref().map(|m| m.id));
 
     store.update_provider(
         provider.id,
@@ -272,7 +326,7 @@ fn edit(store: &crate::storage::Store, profile: Option<String>) -> Result<()> {
             auth_token: final_token,
             kind,
             extra_headers,
-            masking_server_id: None,
+            masking_server_id,
         },
     )?;
     println!(

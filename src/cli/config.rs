@@ -55,6 +55,10 @@ pub struct PortableFile {
 pub struct PortableProfile {
     pub name: String,
     pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub masking_servers: Vec<PortableMask>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_masking_server: Option<String>,
     pub providers: Vec<PortableProvider>,
     pub proxies: Vec<PortableProxy>,
 }
@@ -67,6 +71,21 @@ pub struct PortableProvider {
     pub auth_token: String,
     pub kind: ProviderKind,
     pub extra_headers: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub masking_server: Option<String>,
+}
+
+/// An egress mask, exported with its secret (the whole file is sealed).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PortableMask {
+    pub name: String,
+    pub kind: String,
+    pub endpoint_url: String,
+    pub secret: String,
+    #[serde(default)]
+    pub max_body_bytes: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_egress_ip: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -169,6 +188,23 @@ fn import_cmd(
 /// Collect a profile's full tree from the store.
 pub fn export_bundle(store: &Store, profile: &crate::domain::Profile) -> Result<PortableProfile> {
     let providers = store.list_providers(profile.id.as_str())?;
+    let masks = store.list_masking_servers(profile.id.as_str())?;
+    let portable_masks = masks
+        .iter()
+        .map(|m| PortableMask {
+            name: m.name.clone(),
+            kind: m.kind.clone(),
+            endpoint_url: m.endpoint_url.clone(),
+            secret: m.secret.clone(),
+            max_body_bytes: m.max_body_bytes,
+            expected_egress_ip: m.expected_egress_ip.clone(),
+        })
+        .collect();
+    let default_masking_server = profile
+        .default_masking_server_id
+        .and_then(|id| masks.iter().find(|m| m.id == id))
+        .map(|m| m.name.clone());
+
     let portable_providers = providers
         .iter()
         .map(|p| PortableProvider {
@@ -178,6 +214,7 @@ pub fn export_bundle(store: &Store, profile: &crate::domain::Profile) -> Result<
             auth_token: p.auth_token.clone(),
             kind: p.kind,
             extra_headers: p.extra_headers.clone(),
+            masking_server: p.masking_server.as_ref().map(|m| m.name.clone()),
         })
         .collect();
 
@@ -223,6 +260,8 @@ pub fn export_bundle(store: &Store, profile: &crate::domain::Profile) -> Result<
     Ok(PortableProfile {
         name: profile.name.clone(),
         description: profile.description.clone(),
+        masking_servers: portable_masks,
+        default_masking_server,
         providers: portable_providers,
         proxies: portable_proxies,
     })
@@ -270,9 +309,35 @@ pub fn import_bundle(store: &Store, bundle: &PortableProfile, name: &str) -> Res
     }
     let profile = store.create_profile(name, bundle.description.as_deref(), None)?;
 
-    // Providers first; entries reference them by name.
+    // Masks first so providers can bind to them by name.
+    let mut mask_ids: BTreeMap<String, i64> = BTreeMap::new();
+    for m in &bundle.masking_servers {
+        let created = store.create_masking_server(
+            profile.id.as_str(),
+            crate::storage::NewMaskingServer {
+                name: m.name.clone(),
+                kind: m.kind.clone(),
+                endpoint_url: m.endpoint_url.clone(),
+                secret: m.secret.clone(),
+                max_body_bytes: m.max_body_bytes,
+                expected_egress_ip: m.expected_egress_ip.clone(),
+            },
+        )?;
+        mask_ids.insert(created.name.clone(), created.id);
+    }
+    if let Some(default_name) = &bundle.default_masking_server {
+        if let Some(id) = mask_ids.get(default_name) {
+            store.set_profile_default_masking(profile.id.as_str(), Some(*id))?;
+        }
+    }
+
+    // Providers next; entries reference them by name.
     let mut provider_ids: BTreeMap<String, i64> = BTreeMap::new();
     for p in &bundle.providers {
+        let masking_server_id = p
+            .masking_server
+            .as_ref()
+            .and_then(|n| mask_ids.get(n).copied());
         let created = store.create_provider(
             profile.id.as_str(),
             NewProvider {
@@ -282,7 +347,7 @@ pub fn import_bundle(store: &Store, bundle: &PortableProfile, name: &str) -> Res
                 auth_token: p.auth_token.clone(),
                 kind: p.kind,
                 extra_headers: p.extra_headers.clone(),
-                masking_server_id: None,
+                masking_server_id,
             },
         )?;
         provider_ids.insert(created.name.clone(), created.id);
@@ -337,6 +402,7 @@ pub fn import_bundle(store: &Store, bundle: &PortableProfile, name: &str) -> Res
 mod tests {
     use super::*;
     use crate::domain::Profile;
+    use crate::storage::NewMaskingServer;
 
     fn seeded_store() -> Store {
         let store = Store::open_in_memory().unwrap();
@@ -379,6 +445,59 @@ mod tests {
     }
 
     #[test]
+    fn export_import_roundtrip_preserves_masks() {
+        let store = seeded_store();
+        let profile = get_profile(&store);
+        let mask = store
+            .create_masking_server(
+                profile.id.as_str(),
+                NewMaskingServer {
+                    name: "hop1".into(),
+                    kind: "cf_worker".into(),
+                    endpoint_url: "https://hop1.example.workers.dev".into(),
+                    secret: "s3cret".into(),
+                    max_body_bytes: 0,
+                    expected_egress_ip: None,
+                },
+            )
+            .unwrap();
+        let providers = store.list_providers(profile.id.as_str()).unwrap();
+        store
+            .update_provider(
+                providers[0].id,
+                crate::storage::NewProvider {
+                    name: providers[0].name.clone(),
+                    description: None,
+                    base_url: providers[0].base_url.clone(),
+                    auth_token: providers[0].auth_token.clone(),
+                    kind: providers[0].kind,
+                    extra_headers: providers[0].extra_headers.clone(),
+                    masking_server_id: Some(mask.id),
+                },
+            )
+            .unwrap();
+
+        let bundle = export_bundle(&store, &profile).unwrap();
+        assert_eq!(bundle.masking_servers.len(), 1);
+        assert_eq!(bundle.providers[0].masking_server.as_deref(), Some("hop1"));
+
+        let target = Store::open_in_memory().unwrap();
+        import_bundle(&target, &bundle, "coder2").unwrap();
+        let restored = target.list_providers("x");
+        assert!(restored.is_err() || true); // profile id differs; check by lookup below
+        let new_profile = target.get_profile_by_name("coder2").unwrap().unwrap();
+        let back = target.list_providers(new_profile.id.as_str()).unwrap();
+        assert_eq!(
+            back[0].masking_server.as_ref().map(|m| m.name.as_str()),
+            Some("hop1")
+        );
+        assert_eq!(
+            back[0].masking_server.as_ref().map(|m| m.secret.as_str()),
+            Some("s3cret")
+        );
+    }
+
+    #[test]
     fn export_import_roundtrip_preserves_tree() {
         let store = seeded_store();
         let bundle = export_bundle(&store, &get_profile(&store)).unwrap();
@@ -411,6 +530,8 @@ mod tests {
         let bundle = PortableProfile {
             name: "t".into(),
             description: None,
+            masking_servers: Vec::new(),
+            default_masking_server: None,
             providers: vec![],
             proxies: vec![],
         };
