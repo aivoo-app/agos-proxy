@@ -14,6 +14,10 @@ pub enum UsageArgs {
         /// Name of the profile to report on.
         #[arg(long)]
         profile: Option<String>,
+        /// Aggregate per upstream key (provider) instead of per model, showing
+        /// each key's egress mask and how often it was rate limited.
+        #[arg(long)]
+        by_key: bool,
     },
     /// The most recent individual requests, newest first.
     Recent {
@@ -30,7 +34,13 @@ pub enum UsageArgs {
 pub fn run(args: UsageArgs) -> Result<()> {
     let store = open_store()?;
     match args {
-        UsageArgs::Stats { profile } => stats(&store, profile),
+        UsageArgs::Stats { profile, by_key } => {
+            if by_key {
+                stats_by_key(&store, profile)
+            } else {
+                stats(&store, profile)
+            }
+        }
         UsageArgs::Recent { profile, limit } => recent(&store, profile, limit),
     }
 }
@@ -76,6 +86,48 @@ fn stats(store: &crate::storage::Store, profile: Option<String>) -> Result<()> {
     }
     println!("{:<28} {:>48} {:>10.4}", "TOTAL", "", total);
     println!("Tip: `route edit` → Economy + `route economy` to cut this bill 60-85%.");
+    Ok(())
+}
+
+/// Per-key view: how a profile's traffic spread across the upstream keys behind
+/// its routes, and how often each one was throttled.
+fn stats_by_key(store: &crate::storage::Store, profile: Option<String>) -> Result<()> {
+    let profile = resolve(store, profile)?;
+    let rows = store.key_stats(profile.id.as_str())?;
+    if rows.is_empty() {
+        println!("No usage recorded for {:?} yet.", profile.name);
+        return Ok(());
+    }
+    println!("Usage for {:?} (per key):", profile.name);
+    println!(
+        "{:<20} {:>18} {:>7} {:>9} {:>8} {:>12}",
+        "KEY", "MASK", "CALLS", "FAILURES", "429s", "AVG LAT(ms)"
+    );
+    let total: i64 = rows.iter().map(|s| s.calls).sum();
+    let throttled: i64 = rows.iter().map(|s| s.rate_limited).sum();
+    for s in &rows {
+        println!(
+            "{:<20} {:>18} {:>7} {:>9} {:>8} {:>12.0}",
+            s.provider_name,
+            s.mask_name.as_deref().unwrap_or("-"),
+            s.calls,
+            s.failures,
+            s.rate_limited,
+            s.avg_latency_ms
+        );
+    }
+    println!(
+        "{:<20} {:>18} {:>7} {:>9} {:>8}",
+        "TOTAL", "", total, "", ""
+    );
+    if throttled > 0 {
+        println!(
+            "Note: {throttled} request(s) came back rate limited. Keys that share \
+             an egress IP share an upstream quota, so bind each key to its own \
+             mask (`provider edit`) to spread the load; a key is parked for its \
+             retry window (AGOS_RATE_LIMIT_COOLDOWN_SECS) after a 429."
+        );
+    }
     Ok(())
 }
 
