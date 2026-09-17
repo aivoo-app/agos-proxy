@@ -66,12 +66,32 @@ jobs:
     name: publish release
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: bundles
-      - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: bundles/*/*.tar.gz
-          generate_release_notes: true
+
+      - name: Create release if missing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" \
+              --verify-tag \
+              --generate-notes
+          fi
+
+      - name: Upload release assets sequentially
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          find bundles -type f -name '*.tar.gz' -print0 |
+            while IFS= read -r -d '' asset; do
+              echo "Uploading ${asset}..."
+              gh release upload "$tag" "$asset" --clobber
+            done
