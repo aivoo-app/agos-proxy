@@ -227,6 +227,26 @@ pub struct RouteCapabilities {
     pub max_context: Option<u32>,
 }
 
+/// Per-key aggregate: how a profile's traffic spread across the upstream
+/// accounts behind its routes.
+///
+/// The operational view for a profile that spreads several keys of one upstream
+/// across several egress masks: it shows, per key, how much work each one
+/// carried and how often it was throttled, which is how you tell whether the
+/// keys are actually being used in parallel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyStats {
+    pub provider_id: i64,
+    pub provider_name: String,
+    /// Egress mask this key leaves through, when one is bound.
+    pub mask_name: Option<String>,
+    pub calls: i64,
+    pub failures: i64,
+    /// Responses that came back `429`, i.e. this key hit its quota.
+    pub rate_limited: i64,
+    pub avg_latency_ms: f64,
+}
+
 /// One logged request against a route entry: outcome, latency, and token use.
 ///
 /// Written by the server on every completion attempt (streaming or not) and

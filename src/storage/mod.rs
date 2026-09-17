@@ -20,8 +20,8 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::crypto::MasterKey;
 
 use crate::domain::{
-    MaskingServer, ModelStatus, Profile, Provider, ProviderKind, Proxy, Route, RouteCapabilities,
-    RouteEntry, RoutingStrategy, UsageRecord, UsageStats,
+    KeyStats, MaskingServer, ModelStatus, Profile, Provider, ProviderKind, Proxy, Route,
+    RouteCapabilities, RouteEntry, RoutingStrategy, UsageRecord, UsageStats,
 };
 
 /// Intermediate provider row, used to defer decryption out of the rusqlite closure.
@@ -1555,6 +1555,48 @@ impl Store {
             if let Some(p) = price {
                 s.est_cost_usd = (s.prompt_tokens + s.completion_tokens) as f64 * p / 1_000_000.0;
             }
+        }
+        Ok(out)
+    }
+
+    /// Per-key (provider) aggregates for a profile, including how often each key
+    /// came back `429`.
+    ///
+    /// This is the dashboard for a profile that spreads several keys of one
+    /// upstream across several egress masks: even call counts mean the keys are
+    /// genuinely being used in parallel, while a lopsided split means the router
+    /// is still leaning on one of them.
+    pub fn key_stats(&self, profile_id: &str) -> Result<Vec<KeyStats>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT p.id, p.name, m.name,
+                    COUNT(*) AS calls,
+                    COALESCE(SUM(CASE WHEN u.success = 0 THEN 1 ELSE 0 END), 0) AS failures,
+                    COALESCE(SUM(CASE WHEN u.status_code = 429 THEN 1 ELSE 0 END), 0) AS rate_limited,
+                    COALESCE(AVG(u.latency_ms), 0)
+             FROM usage_log u
+             JOIN route_entries e ON e.id = u.route_entry_id
+             JOIN providers p ON p.id = e.provider_id
+             {}
+             WHERE u.profile_id = ?1
+             GROUP BY p.id, m.name
+             ORDER BY calls DESC",
+            mask_join()
+        ))?;
+        let rows = stmt.query_map([profile_id], |row| {
+            Ok(KeyStats {
+                provider_id: row.get(0)?,
+                provider_name: row.get(1)?,
+                mask_name: row.get(2)?,
+                calls: row.get(3)?,
+                failures: row.get(4)?,
+                rate_limited: row.get(5)?,
+                avg_latency_ms: row.get(6)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for item in rows {
+            out.push(item?);
         }
         Ok(out)
     }

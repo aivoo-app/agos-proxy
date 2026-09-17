@@ -1117,6 +1117,7 @@ async fn forward_responses_attempt(
         .map_err(|e| anyhow::anyhow!("upstream failed: {e}"))?;
     let status = resp.status();
     let mask_rejected = crate::mask::is_mask_rejection(&resp);
+    let retry_after = crate::adapter::outbound::retry_after_secs(resp.headers());
     let bytes = resp
         .bytes()
         .await
@@ -1134,6 +1135,7 @@ async fn forward_responses_attempt(
         return Err(anyhow::Error::new(crate::adapter::outbound::ProviderError {
             status,
             body: String::from_utf8_lossy(&bytes).into_owned(),
+            retry_after,
         })
         .context("provider returned an error response"));
     }
@@ -1282,6 +1284,7 @@ async fn handle_completion(
                     .await
                     .map_err(|e| anyhow::anyhow!("upstream failed: {e}"))?;
                 let status = resp.status();
+                let retry_after = crate::adapter::outbound::retry_after_secs(resp.headers());
                 let bytes = resp
                     .bytes()
                     .await
@@ -1291,6 +1294,7 @@ async fn handle_completion(
                         crate::adapter::outbound::ProviderError {
                             status,
                             body: String::from_utf8_lossy(&bytes).into_owned(),
+                            retry_after,
                         },
                     ));
                 }
@@ -1597,6 +1601,7 @@ async fn handle_embeddings(
                     .await
                     .map_err(|e| anyhow::anyhow!("upstream failed: {e}"))?;
                 let status = resp.status();
+                let retry_after = crate::adapter::outbound::retry_after_secs(resp.headers());
                 let bytes = resp
                     .bytes()
                     .await
@@ -1606,6 +1611,7 @@ async fn handle_embeddings(
                         crate::adapter::outbound::ProviderError {
                             status,
                             body: String::from_utf8_lossy(&bytes).into_owned(),
+                            retry_after,
                         },
                     ));
                 }

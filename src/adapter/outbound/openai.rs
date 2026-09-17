@@ -345,6 +345,7 @@ pub async fn forward_completion(
         .context("sending completion request to provider")?;
     let status = resp.status();
     let mask_rejected = crate::mask::is_mask_rejection(&resp);
+    let retry_after = super::retry_after_secs(resp.headers());
     let bytes = resp.bytes().await.context("reading provider response")?;
     if !status.is_success() {
         if mask_rejected {
@@ -359,6 +360,7 @@ pub async fn forward_completion(
         return Err(super::ProviderError {
             status,
             body: String::from_utf8_lossy(&bytes).into_owned(),
+            retry_after,
         })
         .context("provider returned an error response");
     }
@@ -390,6 +392,7 @@ pub async fn forward_embedding(
         .context("sending embedding request to provider")?;
     let status = resp.status();
     let mask_rejected = crate::mask::is_mask_rejection(&resp);
+    let retry_after = super::retry_after_secs(resp.headers());
     let bytes = resp.bytes().await.context("reading provider response")?;
     if !status.is_success() {
         if mask_rejected {
@@ -404,6 +407,7 @@ pub async fn forward_embedding(
         return Err(super::ProviderError {
             status,
             body: String::from_utf8_lossy(&bytes).into_owned(),
+            retry_after,
         })
         .context("provider returned an error response");
     }
