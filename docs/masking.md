@@ -44,17 +44,119 @@ as JSON:
 {"ip": "5.9.8.7", "asn": "AS24940 Hetzner", "country": "DE"}
 ```
 
-**Behavior rules for a mask implementation:**
+**Behavior rules for a mask implementation:** the complete algorithm is
+specified in [Masking server handling](#masking-server-handling) below.
 
-- never read or modify the request/response body — stream it through
-  (`proxy_buffering off` on nginx, `redirect: manual` in fetch);
-- strip `X-forward-*`, `cf-*`, `x-forwarded-*`, and don't forward `host`;
-- allowlist: reject any request whose secret doesn't match (default-deny);
-- long timeouts for LLM responses (SSE can idle for minutes).
+Ready-made, conforming implementations: `examples/mask/worker.js`
+(Cloudflare), `examples/mask/lambda.mjs` (Lambda function URL),
+`examples/mask/nginx.conf` (any VPS).
 
-Ready-made implementations: `examples/mask/worker.js` (Cloudflare),
-`examples/mask/lambda.mjs` (Lambda function URL), `examples/mask/nginx.conf`
-(any VPS).
+## Masking server handling
+
+A normative description of what a masking server must do with every request.
+Order matters: authentication first, probe second, everything else only after
+both pass. "MUST" items are what AGOS's failure classification relies on.
+
+### 1. Authenticate (MUST, always first)
+
+- Read `X-forward-mask`. Compare against the configured secret.
+- Wrong **or absent** secret → `403` and stop. Default-deny: every path, every
+  method, no exceptions. There is no unauthenticated endpoint.
+- Never echo the secret back — not in a response body, not in a log line, not
+  in an error message. Rate-limit 403s (the nginx example rate-limits the
+  probe zone) to slow brute-forcing.
+
+### 2. Probe (SHOULD)
+
+- Request carries `X-forward-probe: ip` (and the secret): answer `200` with
+  the mask's **own egress identity** as JSON
+  `{"ip": "...", "asn": "AS24940 Hetzner", "country": "DE"}` and stop — do
+  not forward a probe upstream. `asn`/`country` may be `null` if unknown;
+  `ip` must be the address the *upstream* would see. This endpoint is what
+  `mask test --egress-ip` and `mask audit` consume.
+
+### 3. Validate the target (MUST)
+
+- `X-forward-target` must be an **absolute `https://` URL**. Missing, relative,
+  or plain-http target → `502` with `X-forward-mask: err`. Plain http would
+  expose the body and the provider token in transit.
+- **SSRF discipline:** the client picks the destination, so anyone holding the
+  secret can relay anywhere. If the mask endpoint is reachable by more than
+  your AGOS instance, SHOULD allowlist upstream hostnames (e.g. only
+  `api.openai.com`, `api.anthropic.com`) and reject everything else with
+  `err`. A secret is the only gate otherwise — treat its compromise as full
+  relay compromise.
+
+### 4. Sanitize request headers (MUST)
+
+Strip, before forwarding:
+
+| Strip | Why |
+|---|---|
+| `x-forward-*` (`x-forward-mask/target/probe`) | control headers are for this hop only |
+| **`x-forwarded-*`** (`-for`, `-host`, `-proto`) | forwarding the client's `X-Forwarded-For` **reveals your real IP** to the upstream — the one mistake that defeats the whole mask |
+| `cf-*` | platform-injected, meaningless upstream |
+| `host` | must be the target's host, never yours |
+| `content-length` | recomputed by the forwarding layer |
+| `accept-encoding` | either pass it through and stream bytes opaquely (nginx), or drop it and let the runtime renegotiate (Workers/Lambda decompress transparently). Never combine negotiated compression with buffering |
+| hop-by-hop (`connection`, `keep-alive`, `transfer-encoding`, `upgrade`, `expect`, `proxy-*`) | invalid across a proxy hop |
+
+Keep everything else untouched — in particular the upstream `Authorization`
+header AGOS attached, `anthropic-version`, and similar.
+
+### 5. Forward (MUST)
+
+- Same method, **body streamed unmodified**. Never read, parse, or buffer the
+  full body: nginx `proxy_buffering off; proxy_request_buffering off;`,
+  Workers fetch pass-through (`duplex: "half"`), Lambda
+  `streamifyResponse`. LLM streams run for minutes; buffering breaks SSE and
+  times out clients.
+- **`redirect: manual` (or equivalent) — never follow redirects.** Following
+  one would re-send the body to a different host and report a different
+  status to AGOS. Pass 3xx through verbatim.
+- Generous timeouts: read/idle ≥ 3600 s, and no wall-clock cap below the
+  upstream's longest possible stream (serverless ceilings are in the table
+  below — pick the backend accordingly).
+
+### 6. Annotate the response (MUST)
+
+- Pass the upstream status and headers through unchanged and add
+  `X-forward-mask: ok`. Never modify the body.
+- Upstream errors (400/401/429/500…) are **upstream truth**: forward them as
+  `ok` — AGOS needs to see the provider's 429 to park the key. Only failures
+  of the mask itself are `err`.
+
+### 7. Failure paths (MUST)
+
+| Situation | Status | `X-forward-mask` |
+|---|---|---|
+| wrong/absent secret | `403` | *(absent)* |
+| probe request | `200` + identity JSON | — |
+| missing/invalid target | `502` | `err` |
+| fetch/TLS/timeout before first byte | `502` | `err` |
+| upstream responded (any status) | upstream's status | `ok` |
+
+AGOS classifies on this header: `err` means "mask broken, leave the key
+alone"; `ok` with a 429 means "key rate-limited, park it". If a mask
+implementation cannot set `err` (e.g. minimal nginx), AGOS falls back to
+status-code heuristics only if the mask's optional status preset is
+configured — that's why the header contract is strongly preferred.
+After the first byte, a broken upstream connection simply ends the stream;
+AGOS surfaces it as a truncated response.
+
+### 8. Privacy and hardening (MUST/SHOULD)
+
+- Never log request/response bodies, the secret, or provider tokens. If you
+  log at all, log method + target host + status + duration only.
+- HTTPS-only listener; keep the secret in an env var or secret store, never in
+  a committed file. One secret per mask; rotate from AGOS with
+  `mask set --secret ...` and redeploy the new value.
+- Do not add identifying headers of your own (`x-relay-by`, `server` tokens
+  are fine to leave default, but nothing custom) — the goal is a boring,
+  unremarkable client.
+- Keep the probe endpoint cheap and rate-limited; it's the only endpoint that
+  answers without touching the upstream.
+
 
 ## Backend notes (verified limits)
 
