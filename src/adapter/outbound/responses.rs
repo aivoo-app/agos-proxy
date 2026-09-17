@@ -73,12 +73,9 @@ pub fn translate_request(chat_req: &ChatRequest, model_id: &str) -> Result<serde
         }
     }
 
-    // Reject unsupported features so the router can fail over to a capable entry.
-    // Each error carries the capability-skip marker so failover demotion
-    // treats it as a client-side skip (no status change).
-    if chat_req.stream {
-        bail!("{ADAPTER_CAPABILITY_SKIP}: streaming not supported by openai_responses adapter; use a streaming-capable upstream");
-    }
+    // Streaming is served from the non-streamed answer by the handler;
+    // we just ignore the stream flag and make a non-streaming request.
+    let _ = chat_req.stream;
     let extra = &chat_req.extra;
     if extra.get("tools").is_some_and(|v| !v.is_null()) {
         bail!("{ADAPTER_CAPABILITY_SKIP}: tools/function calling not supported by openai_responses adapter; use a tools-capable upstream");
@@ -315,18 +312,6 @@ mod tests {
         )
         .expect_err("response_format should be rejected");
         assert!(err.to_string().contains("response_format"));
-    }
-
-    #[test]
-    fn request_rejects_stream() {
-        let err = translate_request(
-            &chat(serde_json::json!({
-                "stream": true,
-            })),
-            "responses-model",
-        )
-        .expect_err("stream should be rejected");
-        assert!(err.to_string().contains("streaming"));
     }
 
     #[test]
