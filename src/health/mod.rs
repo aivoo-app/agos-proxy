@@ -57,6 +57,23 @@ pub fn spawn(
                 } else {
                     tracing::debug!("pruned old usage records");
                 }
+                // Also prune expired response cache entries
+                match tokio::task::spawn_blocking({
+                    let store = store.clone();
+                    move || store.prune_response_cache()
+                })
+                .await
+                {
+                    Ok(Ok(deleted)) => {
+                        tracing::debug!(deleted, "pruned expired response cache entries");
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(error = %e, "response cache pruning failed");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "response cache pruning task failed");
+                    }
+                }
             }
 
             // Prune rate limiter every 60 probe cycles (~30 minutes)
@@ -116,6 +133,12 @@ async fn ping(
     model_id: &str,
 ) -> bool {
     let base = normalize_base(&provider.base_url);
+    // `GET /v1/models` is a cheap, side-effect-free reachability check. It is
+    // used for every provider kind, including Responses-only upstreams: a
+    // Responses-only provider answers either with a model list (validated
+    // below) or with an unshaped/404 body, which still counts as reachable.
+    // A `POST /v1/responses` probe is deliberately not used here — it would
+    // spend upstream tokens / quota on every probe cycle.
     let url = format!("{base}{PING_PATH}");
     let mut req = client.get(&url);
     if !provider.auth_token.is_empty() {
@@ -123,9 +146,18 @@ async fn ping(
     }
     match timeout(PING_TIMEOUT, req.send()).await {
         Ok(Ok(resp)) => {
-            let ok = resp.status().is_success();
-            if !ok {
-                tracing::debug!(status = %resp.status(), "ping non-success");
+            let status = resp.status();
+            // A 404/405 from a Responses-only gateway still proves the host is
+            // reachable and authenticated; only auth/rate errors (401/403/429)
+            // and 5xx count as down. Model validation below handles wrong ids.
+            if status == reqwest::StatusCode::NOT_FOUND
+                || status == reqwest::StatusCode::METHOD_NOT_ALLOWED
+            {
+                tracing::debug!(status = %status, path = %PING_PATH, "ping path missing; treating host as reachable");
+                return true;
+            }
+            if !status.is_success() {
+                tracing::debug!(status = %status, path = %PING_PATH, "ping non-success");
                 return false;
             }
             // Model-level validation: if the endpoint returns a parsable model

@@ -86,7 +86,8 @@ pub enum ModelArgs {
         /// Blended price USD/1M tokens for Economy sorting.
         #[arg(long)]
         price: Option<f64>,
-        /// Skip the capability prompts (defaults everything on).
+        /// Skip the capability prompts (defaults to no capabilities; use
+        /// `route model edit` later if the model supports tools/vision/JSON).
         #[arg(long)]
         yes: bool,
     },
@@ -410,10 +411,12 @@ fn model_add(
         let existing = store.route_entries(route.id)?;
         let next_priority = existing.len() as i32 + 1;
         let capabilities = if yes {
+            // Match interactive wizard defaults (all false) so scripted creation
+            // doesn't overclaim capabilities. Operators can still edit later.
             RouteCapabilities {
-                tools: true,
-                vision: true,
-                json_mode: true,
+                tools: false,
+                vision: false,
+                json_mode: false,
                 max_context: None,
             }
         } else {

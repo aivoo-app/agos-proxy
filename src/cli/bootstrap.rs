@@ -131,7 +131,8 @@ pub struct ModelSpec {
     /// Blended price USD/1M tokens for Economy sorting.
     #[serde(default)]
     pub price_per_1m: Option<f64>,
-    /// Capability flags, defaulting to everything on.
+    /// Capability flags, defaulting to everything off (matching the interactive
+    /// wizard) so imports never overclaim tools/vision/JSON support.
     #[serde(default = "default_capabilities")]
     pub capabilities: CapabilitiesSpec,
 }
@@ -139,28 +140,24 @@ pub struct ModelSpec {
 /// Capability flags for a route entry.
 #[derive(Debug, Default, Deserialize)]
 pub struct CapabilitiesSpec {
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub tools: bool,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub vision: bool,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub json_mode: bool,
     /// Maximum context window in tokens; `None` if unknown.
     #[serde(default)]
     pub max_context: Option<u32>,
 }
 
-fn default_true() -> bool {
-    true
-}
-
 /// `CapabilitiesSpec` default (used when the object itself is omitted): every
-/// capability enabled, context window unknown.
+/// capability disabled (matching interactive wizard), context window unknown.
 fn default_capabilities() -> CapabilitiesSpec {
     CapabilitiesSpec {
-        tools: true,
-        vision: true,
-        json_mode: true,
+        tools: false,
+        vision: false,
+        json_mode: false,
         max_context: None,
     }
 }
@@ -395,7 +392,7 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_default_to_enabled() {
+    fn capabilities_default_to_disabled() {
         let setup: Setup = serde_json::from_str(
             r#"{
                 "profile": "p",
@@ -405,10 +402,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(setup.profile, "p");
-        // A model spec with no capability flags should come out all-true.
+        // A model spec with no capability flags should come out all-false
+        // (matching interactive wizard defaults).
         let model: ModelSpec = serde_json::from_str(r#"{"provider":"x","model":"m"}"#).unwrap();
         assert!(
-            model.capabilities.tools && model.capabilities.vision && model.capabilities.json_mode
+            !model.capabilities.tools
+                && !model.capabilities.vision
+                && !model.capabilities.json_mode
         );
     }
 }

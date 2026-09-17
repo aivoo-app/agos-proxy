@@ -21,15 +21,19 @@ pub async fn auth_middleware(
     // Health endpoints may be authenticated depending on configuration.
     // /health is always unauthenticated for basic liveness probing.
     // /ready can be gated if require_auth_on_health is set.
-    if path == "/health" {
+    // /metrics and /v1/providers/health expose per-profile/proxy/route
+    // inventory, so they follow the same gate: unauthenticated only when
+    // health auth is disabled (single-tenant / local scraping), otherwise
+    // they require a valid profile token like every other endpoint.
+    if path == "/health"
+        || ((path == "/metrics" || path == "/v1/providers/health" || path == "/ready")
+            && !state.require_auth_on_health)
+    {
         return next.run(request).await;
     }
 
-    if path == "/ready" && !state.require_auth_on_health {
-        return next.run(request).await;
-    }
-
-    // All other endpoints (including /ready when auth is required) need auth.
+    // All other endpoints (including /ready, /metrics and /v1/providers/health
+    // when auth is required) need auth.
     // The profile token can be presented the way each native client speaks it:
     // OpenAI SDKs use `Authorization: Bearer`, the Anthropic SDK sends
     // `x-api-key`, and the Google SDK puts a `key=` query parameter. All of
