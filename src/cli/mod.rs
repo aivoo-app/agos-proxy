@@ -15,6 +15,7 @@
 //! │   └── token rotate          rotate a profile's API token
 //! ├── provider  add  list       manage providers for a profile
 //! ├── proxy     create          manage proxies
+//! ├── mask      add  audit      manage egress masks
 //! ├── route     create  status  manage routes and their model chains
 //! ├── chat                      test a proxy/route interactively
 //! ├── setup                     guided terminal setup wizard
@@ -31,6 +32,7 @@ mod bootstrap;
 mod chat;
 mod config;
 pub mod gen_docs;
+mod mask;
 mod profile;
 mod provider;
 mod proxy;
@@ -76,6 +78,9 @@ pub enum Command {
     /// Manage providers (upstreams + credentials) for a profile.
     #[command(subcommand)]
     Provider(provider::ProviderArgs),
+    /// Manage egress masks (network identities per provider).
+    #[command(subcommand)]
+    Mask(mask::MaskArgs),
     /// Manage proxies for a profile.
     #[command(subcommand)]
     Proxy(proxy::ProxyArgs),
@@ -129,6 +134,7 @@ pub fn run(cli: Cli) -> Result<()> {
         } => server_command(&bind, attempt_timeout, stream_idle_timeout),
         Command::Profile(args) => profile::run(args),
         Command::Provider(args) => provider::run(args),
+        Command::Mask(args) => mask::run(args),
         Command::Proxy(args) => proxy::run(args),
         Command::Route(args) => route::run(args),
         Command::Chat(args) => chat::run(args),

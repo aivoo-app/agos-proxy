@@ -213,6 +213,8 @@ mod tests {
             auth_token: "sk-test".into(),
             kind: crate::domain::ProviderKind::OpenAIResponses,
             extra_headers: BTreeMap::new(),
+            masking_server_id: None,
+            masking_server: None,
         };
         let entry = RouteEntry {
             id: 1,
@@ -224,6 +226,7 @@ mod tests {
             price_per_1m: 0.0,
             status: crate::domain::ModelStatus::Healthy,
             capabilities: Default::default(),
+            cooldown_until: 0,
         };
         Target {
             provider,

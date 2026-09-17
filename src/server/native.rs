@@ -231,14 +231,25 @@ async fn chat_stream(
         // One renderer per attempt: the Responses surface accumulates text
         // and tool arguments, and that state must not leak into a retry.
         let _renderer = state.adapter.stream_renderer(kind);
-        let (url, headers, body) = match outbound::build_upstream_request(&target, &chat_req, true)
-        {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(err = %e, "build upstream request failed, trying next");
-                continue;
-            }
-        };
+        let (mut url, mut headers, body) =
+            match outbound::build_upstream_request(&target, &chat_req, true) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(err = %e, "build upstream request failed, trying next");
+                    continue;
+                }
+            };
+        // Streaming requests also leave through the mask: the hop must stream the
+        // reply back unbuffered for this to stay a live SSE connection.
+        if let Err(e) = crate::mask::apply_json(
+            target.provider.masking_server.as_ref(),
+            &mut url,
+            &mut headers,
+            &body,
+        ) {
+            tracing::warn!(err = %e, "mask cannot carry this request, trying next");
+            continue;
+        }
         let mut request = client.post(&url);
         for (k, v) in &headers {
             request = request.header(k, v);
@@ -251,10 +262,17 @@ async fn chat_stream(
                 break;
             }
             Ok(Ok(resp)) => {
-                // Non-success status, log and try the next target.
+                // Non-success status, log and try the next target. A hop that
+                // refused the request is reported as such, so it is never read
+                // as the provider being unhealthy.
                 let status = resp.status();
+                let mask_rejected = crate::mask::is_mask_rejection(&resp);
                 let _bytes = resp.bytes().await.unwrap_or_default();
-                let msg = format!("provider returned {status}");
+                let msg = if mask_rejected {
+                    format!("{} egress mask returned {status}", crate::mask::MASK_FAILED)
+                } else {
+                    format!("provider returned {status}")
+                };
                 log_attempt(
                     &store,
                     &profile_id,

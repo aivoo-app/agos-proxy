@@ -161,7 +161,12 @@ pub fn resolve_targets(store: &Store, profile_id: &str, model: &str) -> Result<V
             });
         }
     }
-    Ok(targets)
+    // Same cool-down handling as the strategy-aware path below.
+    Ok(warm_first(
+        targets,
+        |t| t.entry.cooldown_until,
+        now_millis(),
+    ))
 }
 
 /// Like [`resolve_targets`], but also reorders the list according to the
@@ -193,7 +198,7 @@ pub fn resolve_targets_with_strategy(
 
     let identity = route.identity.clone();
     let entries = store.route_entries(route.id)?;
-    let mut targets: Vec<Target> = entries
+    let targets: Vec<Target> = entries
         .into_iter()
         .filter(|e| matches!(e.status, ModelStatus::Healthy | ModelStatus::Degraded))
         .filter(|e| needs.satisfies(e.capabilities.clone()))
@@ -209,6 +214,11 @@ pub fn resolve_targets_with_strategy(
                 })
         })
         .collect();
+
+    // Entries parked by an upstream rate limit sit out while any warm entry
+    // remains, so a single exhausted key cannot absorb the round-robin turns
+    // that a fresh key should be getting.
+    let mut targets = warm_first(targets, |t| t.entry.cooldown_until, now_millis());
 
     match route.strategy {
         RoutingStrategy::Priority => {} // already in priority order
@@ -267,6 +277,40 @@ pub fn wants_escalation_header(value: Option<&str>) -> bool {
     )
 }
 
+/// How long a rate-limited entry is parked when the upstream does not say,
+/// in seconds. Overridable with `AGOS_RATE_LIMIT_COOLDOWN_SECS`.
+pub fn rate_limit_cooldown_secs() -> i64 {
+    std::env::var("AGOS_RATE_LIMIT_COOLDOWN_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(60)
+}
+
+/// Wall-clock milliseconds, the same unit the store persists.
+fn now_millis() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+/// Order candidates so that entries which are *not* cooling come first.
+///
+/// When every candidate is cooling, the cooling ones are returned in
+/// soonest-to-warm order instead. That fallback matters: a request must never
+/// hard-fail merely because every key is currently throttled — it should still
+/// take the best available shot, and the try succeeds the moment a window
+/// opens.
+fn warm_first<T>(mut items: Vec<T>, cooldown_until: impl Fn(&T) -> i64, now: i64) -> Vec<T> {
+    let (warm, mut cooling): (Vec<T>, Vec<T>) = items
+        .drain(..)
+        .partition(|item| cooldown_until(item) <= now);
+    if warm.is_empty() {
+        cooling.sort_by_key(|item| cooldown_until(item));
+        cooling
+    } else {
+        warm
+    }
+}
+
 /// Execute a request against resolved targets with priority failover.
 pub async fn execute_with_failover<F, Fut>(
     store: Arc<Store>,
@@ -284,14 +328,16 @@ where
 
     let mut last_error = None;
     // (target, upstream status code if the attempt carried one, upstream error
-    // message). Both drive the demotion classification below.
-    let mut failures: Vec<(Target, Option<i64>, String)> = Vec::new();
+    // message, retry hint). The first three drive the demotion classification
+    // below; the hint drives the cooldown applied to a rate-limited entry.
+    let mut failures: Vec<(Target, Option<i64>, String, Option<i64>)> = Vec::new();
     for target in &targets {
         match timeout(attempt_timeout, attempt_fn(target.clone())).await {
             Ok(Ok(bytes)) => return Ok(bytes),
             Ok(Err(e)) => {
                 let provider_err = e.downcast_ref::<crate::adapter::outbound::ProviderError>();
                 let status = provider_err.map(|pe| pe.status.as_u16() as i64);
+                let retry_after = provider_err.and_then(|pe| pe.retry_after);
                 // anyhow's Display only shows the outer context, so the raw
                 // upstream body (which names images on a rejection) must come
                 // from the downcast. Transport failures fall back to the error
@@ -300,7 +346,7 @@ where
                     .map(|pe| pe.body.clone())
                     .unwrap_or_else(|| e.to_string());
                 last_error = Some(e);
-                failures.push((target.clone(), status, message));
+                failures.push((target.clone(), status, message, retry_after));
                 tracing::warn!(
                     provider = %target.provider.name,
                     model = %target.entry.model_id,
@@ -311,7 +357,7 @@ where
                 last_error = Some(anyhow::anyhow!(
                     "attempt timed out after {attempt_timeout:?}"
                 ));
-                failures.push((target.clone(), None, "upstream timeout".to_string()));
+                failures.push((target.clone(), None, "upstream timeout".to_string(), None));
                 tracing::warn!(
                     provider = %target.provider.name,
                     model = %target.entry.model_id,
@@ -328,9 +374,18 @@ where
     // healthy chain dark on a single malformed request — unless the upstream
     // names images in its rejection, which means the upstream cannot serve
     // vision requests at all and it should be skipped for them.
-    for (target, status_code, message) in &failures {
+    for (target, status_code, message, retry_after) in &failures {
         if let Some(status) = demote_status_for(*status_code, message) {
             let _ = store.set_route_entry_status(target.entry.id, status);
+        }
+        // A quota refusal needs more than `Degraded`: degraded entries stay
+        // selectable, so the entry is explicitly parked until the upstream's
+        // window (or our fallback) expires. This is what keeps several keys
+        // useful rather than re-picking the one that is already exhausted.
+        if *status_code == Some(429) {
+            let secs = retry_after.unwrap_or_else(rate_limit_cooldown_secs);
+            let until = now_millis() + secs.max(0) * 1000;
+            let _ = store.set_route_entry_cooldown(target.entry.id, until);
         }
     }
 
@@ -350,6 +405,12 @@ where
 /// entry, not a sicker one. Failures without a known status
 /// (transport errors, timeouts) are treated as provider-side.
 pub(crate) fn demote_status_for(status_code: Option<i64>, message: &str) -> Option<ModelStatus> {
+    // A mask that refused the request, or one that cannot carry this payload,
+    // says nothing about the provider's health: try the next target instead of
+    // taking a working key out of rotation.
+    if message.contains(crate::mask::MASK_SKIP) || message.contains(crate::mask::MASK_FAILED) {
+        return None;
+    }
     if message.contains(crate::adapter::outbound::responses::ADAPTER_CAPABILITY_SKIP) {
         return None;
     }
@@ -538,6 +599,7 @@ mod tests {
                     auth_token: "tok".into(),
                     kind: ProviderKind::OpenAI,
                     extra_headers: BTreeMap::new(),
+                    masking_server_id: None,
                 },
             )
             .unwrap();
@@ -597,6 +659,7 @@ mod tests {
                     auth_token: "tok1".into(),
                     kind: ProviderKind::OpenAI,
                     extra_headers: BTreeMap::new(),
+                    masking_server_id: None,
                 },
             )
             .unwrap();
@@ -610,6 +673,7 @@ mod tests {
                     auth_token: "tok2".into(),
                     kind: ProviderKind::OpenAI,
                     extra_headers: BTreeMap::new(),
+                    masking_server_id: None,
                 },
             )
             .unwrap();
@@ -684,6 +748,7 @@ mod tests {
                     auth_token: "tok".into(),
                     kind: ProviderKind::OpenAI,
                     extra_headers: BTreeMap::new(),
+                    masking_server_id: None,
                 },
             )
             .unwrap();
@@ -697,6 +762,7 @@ mod tests {
                     auth_token: "tok".into(),
                     kind: ProviderKind::OpenAI,
                     extra_headers: BTreeMap::new(),
+                    masking_server_id: None,
                 },
             )
             .unwrap();
@@ -770,6 +836,7 @@ mod tests {
                         auth_token: "tok".into(),
                         kind: ProviderKind::OpenAI,
                         extra_headers: BTreeMap::new(),
+                        masking_server_id: None,
                     },
                 )
                 .unwrap()
@@ -1104,6 +1171,102 @@ mod tests {
             demote_status_for(None, "transport failure"),
             Some(ModelStatus::Unhealthy)
         );
+        // A mask that refused the request, or one that cannot carry this
+        // payload, never demotes the provider: the key is fine, the hop is not.
+        // Without this, a single bad hop would take every key behind it dark.
+        assert_eq!(
+            demote_status_for(
+                Some(502),
+                &format!(
+                    "{} egress mask \"edge-1\" returned 502",
+                    crate::mask::MASK_FAILED
+                )
+            ),
+            None
+        );
+        assert_eq!(
+            demote_status_for(
+                Some(413),
+                &format!("{} body too large for the hop", crate::mask::MASK_SKIP)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn cooling_entries_are_skipped_while_warm_ones_remain() {
+        // The other four keys are parked; only the warm one should be offered,
+        // so round-robin stops handing turns to an exhausted key.
+        let now = 1_000_000;
+        let entries = vec![(1i64, 0i64), (2, now + 5_000), (3, now + 1_000)];
+        let ordered = warm_first(entries, |e| e.1, now);
+        assert_eq!(ordered, vec![(1, 0)]);
+    }
+
+    #[test]
+    fn when_every_entry_is_cooling_the_soonest_to_warm_is_tried_first() {
+        // All five keys throttled must not mean "fail the request": the closest
+        // window is tried, and the request succeeds as soon as one opens.
+        let now = 1_000_000;
+        let entries = vec![(1i64, now + 9_000), (2, now + 1_000), (3, now + 5_000)];
+        let ordered = warm_first(entries, |e| e.1, now);
+        assert_eq!(
+            ordered.iter().map(|e| e.0).collect::<Vec<_>>(),
+            vec![2, 3, 1]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_429_parks_the_entry_for_the_window_the_upstream_asked_for() {
+        let (store, targets) = setup();
+        let entry_id = targets[0].entry.id;
+        let route_id = targets[0].entry.route_id;
+        let store = Arc::new(store);
+
+        let result =
+            execute_with_failover(store.clone(), targets, Duration::from_secs(5), |_| async {
+                Err(anyhow::Error::new(
+                    crate::adapter::outbound::ProviderError {
+                        status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                        body: "quota exhausted".to_string(),
+                        retry_after: Some(30),
+                    },
+                ))
+            })
+            .await;
+        assert!(result.is_err(), "a 429 must still surface to the caller");
+
+        let entries = store.route_entries(route_id).unwrap();
+        let entry = entries.iter().find(|e| e.id == entry_id).unwrap();
+        // Health still degrades (visibility), but the entry is also parked.
+        assert_eq!(entry.status, ModelStatus::Degraded);
+        let now = chrono::Utc::now().timestamp_millis();
+        assert!(
+            entry.cooldown_until > now + 25_000 && entry.cooldown_until <= now + 31_000,
+            "cool-down should follow the upstream's 30s hint, got {}",
+            entry.cooldown_until
+        );
+
+        // And the single entry is still offered rather than hard-failing.
+        let resolved =
+            resolve_targets(&store, &store.list_profiles().unwrap()[0].id, "prog/r1").unwrap();
+        assert_eq!(resolved.len(), 1, "a cooling entry is still a last resort");
+    }
+
+    #[test]
+    fn the_default_cool_down_is_configurable() {
+        // Read the documented default without mutating the process environment
+        // for other tests: the fallback is what matters when an upstream gives
+        // no hint at all.
+        let previous = std::env::var("AGOS_RATE_LIMIT_COOLDOWN_SECS").ok();
+        std::env::set_var("AGOS_RATE_LIMIT_COOLDOWN_SECS", "5");
+        assert_eq!(rate_limit_cooldown_secs(), 5);
+        std::env::set_var("AGOS_RATE_LIMIT_COOLDOWN_SECS", "nonsense");
+        assert_eq!(rate_limit_cooldown_secs(), 60, "bad input falls back");
+        match previous {
+            Some(v) => std::env::set_var("AGOS_RATE_LIMIT_COOLDOWN_SECS", v),
+            None => std::env::remove_var("AGOS_RATE_LIMIT_COOLDOWN_SECS"),
+        }
     }
 
     #[tokio::test]
@@ -1138,6 +1301,7 @@ mod tests {
                     auth_token: "tok".into(),
                     kind: ProviderKind::OpenAI,
                     extra_headers: BTreeMap::new(),
+                    masking_server_id: None,
                 },
             )
             .unwrap();

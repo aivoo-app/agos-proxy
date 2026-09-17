@@ -27,6 +27,10 @@ pub struct Profile {
     pub updated_at: i64,
     /// Requests-per-minute ceiling for API callers; 0 means unlimited.
     pub rpm_limit: i64,
+    /// Mask used by providers that do not bind one of their own; `None` means
+    /// such providers egress directly. A provider-level binding always wins.
+    #[serde(default)]
+    pub default_masking_server_id: Option<i64>,
 }
 
 /// What wire format a provider speaks. AGOS Proxy uses this to pick a request
@@ -60,6 +64,63 @@ pub struct Provider {
     pub kind: ProviderKind,
     /// Optional non-standard headers some providers require.
     pub extra_headers: BTreeMap<String, String>,
+    /// Egress mask this provider's requests leave through. `None` falls back to
+    /// the owning profile's default mask, and then to a direct connection.
+    #[serde(default)]
+    pub masking_server_id: Option<i64>,
+    /// The *effective* mask for this provider, denormalized at load time so every
+    /// egress path (chat forwarding, health probes, model listing) can reach it
+    /// without a second store lookup.
+    ///
+    /// `Some` when the provider binds a mask itself **or** its profile sets a
+    /// default; `None` means the provider egresses directly. Read
+    /// [`Provider::masking_server_id`] for the explicit binding alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub masking_server: Option<MaskingServer>,
+}
+
+/// An HTTP egress hop ("mask") that upstream requests are relayed through.
+///
+/// A mask is deliberately dumb and platform-neutral: it receives the absolute
+/// upstream URL plus a shared secret in request headers, forwards the body
+/// untouched, and streams the reply back. Cloudflare Workers, AWS Lambda,
+/// Cloud Run services, plain nginx boxes and commercial proxies can all satisfy
+/// that contract, so switching backend is a configuration change rather than a
+/// code change.
+///
+/// Binding a mask to a provider is what makes several upstream keys present
+/// distinct network identities, instead of every key egressing from the IP of
+/// the host running AGOS.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaskingServer {
+    pub id: i64,
+    pub profile_id: String,
+    /// Human-readable label, e.g. `opencode-key-1`.
+    pub name: String,
+    /// Free-form backend label for display and presets, e.g. `cf_worker`,
+    /// `lambda`, `cloud_run`, `nginx`, `vps`, `commercial`.
+    pub kind: String,
+    /// Absolute URL of the hop, e.g. `https://edge-1.example.workers.dev`.
+    pub endpoint_url: String,
+    /// Shared secret presented as `X-forward-mask`. Encrypted at rest like a
+    /// provider token, and `skip`ped by serde so it can never be serialized
+    /// into an API response or an export.
+    #[serde(skip)]
+    pub secret: String,
+    /// Requests whose body exceeds this size skip the mask instead of failing
+    /// on it (0 = no limit). Serverless backends cap request bodies (a Lambda
+    /// at 6 MB), and a base64 image blows past that.
+    #[serde(default)]
+    pub max_body_bytes: i64,
+    /// Optional pin: the egress IP this mask is expected to present, checked by
+    /// `mask audit`.
+    pub expected_egress_ip: Option<String>,
+    /// Last egress identity reported by the mask's probe endpoint.
+    pub last_verified_ip: Option<String>,
+    pub last_verified_asn: Option<String>,
+    pub last_verified_country: Option<String>,
+    /// Unix millis of the last successful probe.
+    pub last_verified_at: Option<i64>,
 }
 
 /// A named group of routes a profile exposes, e.g. `Programmer`.
@@ -142,6 +203,14 @@ pub struct RouteEntry {
     /// `Economy` strategy to sort cheapest-first. 0.0 = unknown (last).
     #[serde(default)]
     pub price_per_1m: f64,
+    /// Unix-millis instant until which the router skips this entry because the
+    /// upstream rate-limited it (0 = not cooling).
+    ///
+    /// Deliberately orthogonal to [`ModelStatus`]: a background health probe may
+    /// flip a rate-limited key back to `Healthy`, but the cooldown still holds,
+    /// because a reachable key is not the same thing as a key with quota left.
+    #[serde(default)]
+    pub cooldown_until: i64,
 }
 
 /// Optional feature flags on a route entry, used to avoid routing a request to a
@@ -156,6 +225,26 @@ pub struct RouteCapabilities {
     pub json_mode: bool,
     /// Maximum context window in tokens; `None` if unknown.
     pub max_context: Option<u32>,
+}
+
+/// Per-key aggregate: how a profile's traffic spread across the upstream
+/// accounts behind its routes.
+///
+/// The operational view for a profile that spreads several keys of one upstream
+/// across several egress masks: it shows, per key, how much work each one
+/// carried and how often it was throttled, which is how you tell whether the
+/// keys are actually being used in parallel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyStats {
+    pub provider_id: i64,
+    pub provider_name: String,
+    /// Egress mask this key leaves through, when one is bound.
+    pub mask_name: Option<String>,
+    pub calls: i64,
+    pub failures: i64,
+    /// Responses that came back `429`, i.e. this key hit its quota.
+    pub rate_limited: i64,
+    pub avg_latency_ms: f64,
 }
 
 /// One logged request against a route entry: outcome, latency, and token use.

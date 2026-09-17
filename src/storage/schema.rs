@@ -38,6 +38,27 @@ pub const SCHEMA: &str = "
         extra_headers TEXT NOT NULL
     );
 
+    -- Egress masks: HTTP hops that upstream requests are sent through, so a
+    -- provider's traffic leaves from a different network identity than the
+    -- host running AGOS. Bound at the provider level (see
+    -- `providers.masking_server_id`) so each key can present its own identity.
+    CREATE TABLE IF NOT EXISTS masking_servers (
+        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+        profile_id          TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+        name                TEXT NOT NULL,
+        kind                TEXT NOT NULL,
+        endpoint_url        TEXT NOT NULL,
+        secret              BLOB NOT NULL,
+        max_body_bytes      INTEGER NOT NULL DEFAULT 0,
+        expected_egress_ip  TEXT,
+        last_verified_ip    TEXT,
+        last_verified_asn   TEXT,
+        last_verified_country TEXT,
+        last_verified_at    INTEGER
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_masks_profile ON masking_servers(profile_id, name);
+
     CREATE TABLE IF NOT EXISTS proxies (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
         profile_id  TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
@@ -125,6 +146,29 @@ pub fn migrate_columns(conn: &rusqlite::Connection) -> anyhow::Result<()> {
         "route_entries",
         "price_per_1m",
         "REAL NOT NULL DEFAULT 0.0",
+    )?;
+
+    // Egress masking. Both references use ON DELETE SET NULL so removing a mask
+    // only unbinds it — it never cascades into providers or profiles.
+    ensure_column(
+        conn,
+        "providers",
+        "masking_server_id",
+        "INTEGER REFERENCES masking_servers(id) ON DELETE SET NULL",
+    )?;
+    ensure_column(
+        conn,
+        "profiles",
+        "default_masking_server_id",
+        "INTEGER REFERENCES masking_servers(id) ON DELETE SET NULL",
+    )?;
+    // Unix-millis instant until which a rate-limited entry is skipped by the
+    // router. 0 means "not cooling".
+    ensure_column(
+        conn,
+        "route_entries",
+        "cooldown_until",
+        "INTEGER NOT NULL DEFAULT 0",
     )?;
 
     // Normalize any route entry status tags that are no longer valid in the

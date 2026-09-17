@@ -42,6 +42,83 @@ pub fn normalize_base(base_url: &str) -> &str {
 pub struct ProviderError {
     pub status: reqwest::StatusCode,
     pub body: String,
+    /// Upstream-advised wait before retrying this entry, in seconds.
+    ///
+    /// Captured because a rate-limited key must be taken out of rotation for
+    /// the period the upstream asked for: `Degraded` alone is not enough, since
+    /// degraded entries stay selectable.
+    pub retry_after: Option<i64>,
+}
+
+impl ProviderError {
+    /// Build the error for a non-success upstream response, capturing any retry
+    /// hint the upstream supplied.
+    pub fn from_response(
+        status: reqwest::StatusCode,
+        headers: &reqwest::header::HeaderMap,
+        body: String,
+    ) -> Self {
+        Self {
+            status,
+            body,
+            retry_after: retry_after_secs(headers),
+        }
+    }
+}
+
+/// Parse an upstream retry hint from response headers.
+///
+/// Understands `Retry-After` in delta-seconds form plus the duration-ish
+/// `x-ratelimit-reset-*` values some gateways emit (`30s`, `2m`, `1h30m`). An
+/// HTTP-date `Retry-After` is deliberately not parsed: it falls back to the
+/// configured default cooldown rather than guessing a wall-clock offset.
+pub fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<i64> {
+    const HINTS: [&str; 3] = [
+        "retry-after",
+        "x-ratelimit-reset-requests",
+        "x-ratelimit-reset-tokens",
+    ];
+    HINTS.iter().find_map(|name| {
+        headers
+            .get(*name)
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_delay_secs)
+    })
+}
+
+/// Parse `120`, `120s`, `2m`, `1.5s` or `1h30m` into whole seconds.
+fn parse_delay_secs(value: &str) -> Option<i64> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if let Ok(secs) = value.parse::<i64>() {
+        return Some(secs.max(0));
+    }
+    // Duration form: one or more `<number><unit>` segments, e.g. `1h30m`.
+    let mut total = 0f64;
+    let mut number = String::new();
+    let mut saw_unit = false;
+    for ch in value.chars() {
+        if ch.is_ascii_digit() || ch == '.' {
+            number.push(ch);
+            continue;
+        }
+        let multiplier = match ch.to_ascii_lowercase() {
+            's' => 1.0,
+            'm' => 60.0,
+            'h' => 3600.0,
+            _ => return None,
+        };
+        total += number.parse::<f64>().ok()? * multiplier;
+        number.clear();
+        saw_unit = true;
+    }
+    if saw_unit && number.is_empty() {
+        Some(total.round() as i64)
+    } else {
+        None
+    }
 }
 
 /// Check whether a provider kind is supported by the current adapter set.
@@ -120,7 +197,16 @@ pub async fn forward_non_streaming(
     target: &Target,
     chat_req: &ChatRequest,
 ) -> Result<Vec<u8>> {
-    let (url, headers, body) = build_upstream_request(target, chat_req, false)?;
+    let (mut url, mut headers, body) = build_upstream_request(target, chat_req, false)?;
+    // Leave through the provider's mask when one is bound (directly, or via the
+    // profile default). A hop that cannot carry the body fails here, before any
+    // bytes are spent upstream.
+    crate::mask::apply_json(
+        target.provider.masking_server.as_ref(),
+        &mut url,
+        &mut headers,
+        &body,
+    )?;
     let mut req = client.post(&url);
     for (k, v) in &headers {
         req = req.header(k, v);
@@ -131,11 +217,24 @@ pub async fn forward_non_streaming(
         .await
         .context("sending request to provider")?;
     let status = resp.status();
+    // Read the mask verdict and any retry hint before the body is consumed.
+    let mask_rejected = crate::mask::is_mask_rejection(&resp);
+    let retry_after = retry_after_secs(resp.headers());
     let bytes = resp.bytes().await.context("reading provider response")?;
     if !status.is_success() {
+        if mask_rejected {
+            if let Some(mask) = target.provider.masking_server.as_ref() {
+                return Err(crate::mask::rejection_error(
+                    &mask.name,
+                    status,
+                    &String::from_utf8_lossy(&bytes),
+                ));
+            }
+        }
         return Err(ProviderError {
             status,
             body: String::from_utf8_lossy(&bytes).into_owned(),
+            retry_after,
         })
         .context("provider returned an error response");
     }
@@ -185,5 +284,31 @@ mod tests {
             normalize_base("https://generativelanguage.googleapis.com/v1beta"),
             "https://generativelanguage.googleapis.com/v1beta"
         );
+    }
+
+    #[test]
+    fn retry_hints_are_parsed_from_the_forms_gateways_actually_send() {
+        assert_eq!(parse_delay_secs("120"), Some(120));
+        assert_eq!(parse_delay_secs("120s"), Some(120));
+        assert_eq!(parse_delay_secs("2m"), Some(120));
+        assert_eq!(parse_delay_secs("1h30m"), Some(5400));
+        assert_eq!(parse_delay_secs("1m30s"), Some(90));
+        // An HTTP-date `Retry-After` is not guessed at: the configured default
+        // cool-down is used instead of inventing a wall-clock offset.
+        assert_eq!(parse_delay_secs("Wed, 21 Oct 2015 07:28:00 GMT"), None);
+        assert_eq!(parse_delay_secs(""), None);
+        assert_eq!(parse_delay_secs("soon"), None);
+    }
+
+    #[test]
+    fn retry_hints_prefer_retry_after_over_gateway_reset_headers() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        assert_eq!(retry_after_secs(&headers), None);
+
+        headers.insert("x-ratelimit-reset-requests", "30s".parse().unwrap());
+        assert_eq!(retry_after_secs(&headers), Some(30));
+
+        headers.insert("retry-after", "5".parse().unwrap());
+        assert_eq!(retry_after_secs(&headers), Some(5));
     }
 }

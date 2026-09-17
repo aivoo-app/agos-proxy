@@ -139,10 +139,26 @@ async fn ping(
     // below) or with an unshaped/404 body, which still counts as reachable.
     // A `POST /v1/responses` probe is deliberately not used here — it would
     // spend upstream tokens / quota on every probe cycle.
-    let url = format!("{base}{PING_PATH}");
-    let mut req = client.get(&url);
+    let mut url = format!("{base}{PING_PATH}");
+    let mut headers = std::collections::BTreeMap::new();
     if !provider.auth_token.is_empty() {
-        req = req.bearer_auth(&provider.auth_token);
+        headers.insert(
+            "Authorization".to_string(),
+            format!("Bearer {}", provider.auth_token),
+        );
+    }
+    // Probe through the provider's mask, exactly like live traffic. Probing
+    // directly would fail every key whose only working path is the hop, marking
+    // a whole route unhealthy at once.
+    if let Some(mask) = provider.masking_server.as_ref() {
+        if let Err(e) = crate::mask::apply_request(Some(mask), &mut url, &mut headers, 0) {
+            tracing::debug!(error = %e, "ping could not be routed through its mask");
+            return false;
+        }
+    }
+    let mut req = client.get(&url);
+    for (k, v) in &headers {
+        req = req.header(k, v);
     }
     match timeout(PING_TIMEOUT, req.send()).await {
         Ok(Ok(resp)) => {

@@ -188,6 +188,7 @@ fn add_provider(store: &Store, theme: &ColorfulTheme, profile: &Profile) -> Resu
             auth_token,
             kind,
             extra_headers,
+            masking_server_id: None,
         },
     )?;
     println!(

@@ -241,6 +241,7 @@ fn seed(
                 auth_token: spec.auth_token.clone(),
                 kind: parse_kind(spec.kind.as_deref())?,
                 extra_headers: spec.extra_headers.clone(),
+                masking_server_id: None,
             },
         )?;
         provider_ids.insert(spec.name.clone(), provider.id);

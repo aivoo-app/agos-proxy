@@ -87,6 +87,7 @@ async fn live_responses_list_models_and_chat() {
                 auth_token: key,
                 kind: ProviderKind::OpenAIResponses,
                 extra_headers: Default::default(),
+                masking_server_id: None,
             },
         )
         .expect("provider");

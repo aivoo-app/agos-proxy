@@ -14,6 +14,7 @@ pub mod cli;
 pub mod crypto;
 pub mod domain;
 pub mod health;
+pub mod mask;
 pub mod router;
 pub mod server;
 pub mod storage;

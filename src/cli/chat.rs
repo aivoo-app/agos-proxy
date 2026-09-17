@@ -387,6 +387,7 @@ mod tests {
                     auth_token: "sk-mock".into(),
                     kind: ProviderKind::OpenAI,
                     extra_headers: BTreeMap::new(),
+                    masking_server_id: None,
                 },
             )
             .expect("create provider");
