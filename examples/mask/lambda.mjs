@@ -82,7 +82,7 @@ function PassThroughWithMask() {
 function forwardHeaders(lower) {
   const out = {};
   for (const [k, v] of Object.entries(lower)) {
-    if (/^x-forward-|^x-forwarded$|^host$/.test(k)) continue;
+    if (/^(x-forward-|x-forwarded-)|^(host|content-length|accept-encoding)$/.test(k)) continue;
     out[k] = v;
   }
   return out;

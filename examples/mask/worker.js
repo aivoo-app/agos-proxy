@@ -16,7 +16,7 @@
  *        --endpoint-url https://<your-worker>.workers.dev --secret $MASK_SECRET
  */
 
-const STRIP_REQUEST = /^x-forward-|^cf-|^x-forwarded-$/i;
+const STRIP_REQUEST = /^(x-forward-|x-forwarded-|cf-)|^(host|content-length|accept-encoding)$/i;
 
 export default {
   async fetch(request, env) {
