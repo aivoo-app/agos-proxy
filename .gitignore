@@ -1,6 +1,5 @@
 # Build artifacts
 /target
-Cargo.lock
 
 # Local planning notes — never shared
 AGENT.md
