@@ -344,9 +344,15 @@ where
 /// demote the entry (429 only Degraded, everything else Unhealthy); client-side
 /// 4xx that originates from the translated request body itself never demotes —
 /// except a 4xx whose error message refuses images/vision, meaning the upstream
-/// cannot serve image requests at all. Failures without a known status
+/// cannot serve image requests at all. Local adapter capability rejections
+/// (tools/vision/JSON/stream unsupported by the adapter, marked with
+/// `ADAPTER_CAPABILITY_SKIP`) also never demote: the request needs a different
+/// entry, not a sicker one. Failures without a known status
 /// (transport errors, timeouts) are treated as provider-side.
 pub(crate) fn demote_status_for(status_code: Option<i64>, message: &str) -> Option<ModelStatus> {
+    if message.contains(crate::adapter::outbound::responses::ADAPTER_CAPABILITY_SKIP) {
+        return None;
+    }
     match status_code {
         Some(429) => Some(ModelStatus::Degraded),
         Some(c) if (400..500).contains(&c) => {
@@ -1069,6 +1075,23 @@ mod tests {
         // Everything else about the old classification is unchanged.
         assert_eq!(demote_status_for(Some(400), "invalid temperature"), None);
         assert_eq!(demote_status_for(Some(422), "request too large"), None);
+        // Local adapter capability rejections fail over without demoting: the
+        // request needs a different entry, not a sicker one.
+        assert_eq!(
+            demote_status_for(
+                None,
+                "adapter capability skip: tools/function calling not supported \
+                 by openai_responses adapter; use a tools-capable upstream"
+            ),
+            None
+        );
+        assert_eq!(
+            demote_status_for(
+                Some(500),
+                "adapter capability skip: image (vision) input not supported"
+            ),
+            None
+        );
         assert_eq!(
             demote_status_for(Some(429), "rate limited"),
             Some(ModelStatus::Degraded)

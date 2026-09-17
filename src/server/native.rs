@@ -163,7 +163,8 @@ async fn chat_non_stream(
                     false,
                     &outcome,
                     started.elapsed().as_millis() as i64,
-                );
+                )
+                .await;
                 outcome
             }
         },
@@ -261,7 +262,8 @@ async fn chat_stream(
                     true,
                     &Err(anyhow::anyhow!("{msg}")),
                     started_at.elapsed().as_millis() as i64,
-                );
+                )
+                .await;
             }
             Ok(Err(e)) => {
                 // Upstream connection failed.
@@ -272,7 +274,8 @@ async fn chat_stream(
                     true,
                     &Err(anyhow::anyhow!("upstream failed: {e}")),
                     started_at.elapsed().as_millis() as i64,
-                );
+                )
+                .await;
             }
             Err(_) => {
                 // Upstream timed out.
@@ -283,7 +286,8 @@ async fn chat_stream(
                     true,
                     &Err(anyhow::anyhow!("upstream timeout")),
                     started_at.elapsed().as_millis() as i64,
-                );
+                )
+                .await;
             }
         }
     }
@@ -358,7 +362,8 @@ async fn chat_stream(
             true,
             &Ok(Vec::new()),
             started.elapsed().as_millis() as i64,
-        );
+        )
+        .await;
     });
 
     let body = axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));

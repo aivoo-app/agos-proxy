@@ -251,7 +251,7 @@ async fn handle_non_streaming(
                 let started = std::time::Instant::now();
                 let outcome = outbound::forward_non_streaming(&client, &target, &req).await;
                 let latency_ms = started.elapsed().as_millis() as i64;
-                log_attempt(&store, &profile_id, &target, false, &outcome, latency_ms);
+                log_attempt(&store, &profile_id, &target, false, &outcome, latency_ms).await;
                 outcome
             }
         },
@@ -413,7 +413,7 @@ fn cache_hash(profile_id: &str, model: &str, req: &ChatRequest) -> Option<String
     Some(hex::encode(h.finalize()))
 }
 
-pub(crate) fn log_attempt(
+pub(crate) async fn log_attempt(
     store: &Arc<Store>,
     profile_id: &str,
     target: &crate::router::Target,
@@ -441,18 +441,27 @@ pub(crate) fn log_attempt(
             (false, status, Some(e.to_string()), None, None)
         }
     };
-    let _ = store.record_usage(crate::storage::NewUsage {
-        profile_id: profile_id.to_string(),
-        route_entry_id: target.entry.id,
-        model_id: target.entry.model_id.clone(),
-        streamed,
-        success,
-        status_code,
-        error_message,
-        latency_ms,
-        prompt_tokens,
-        completion_tokens,
-    });
+    let store = store.clone();
+    let profile_id = profile_id.to_string();
+    let entry_id = target.entry.id;
+    let model_id = target.entry.model_id.clone();
+    // `spawn_blocking` is awaited so tests and shutdown observe the write;
+    // failures are still non-fatal to the request itself.
+    let _ = tokio::task::spawn_blocking(move || {
+        store.record_usage(crate::storage::NewUsage {
+            profile_id,
+            route_entry_id: entry_id,
+            model_id,
+            streamed,
+            success,
+            status_code,
+            error_message,
+            latency_ms,
+            prompt_tokens,
+            completion_tokens,
+        })
+    })
+    .await;
 }
 
 async fn handle_streaming(
@@ -512,16 +521,17 @@ async fn handle_streaming(
             match forward_responses_attempt(&client, &target, &chat_req, attempt_timeout).await {
                 Ok((completion, prompt_tokens, completion_tokens)) => {
                     log_stream_outcome(
-                        &store,
-                        &profile_id,
-                        &target,
+                        store.clone(),
+                        profile_id.clone(),
+                        target.clone(),
                         true,
                         Some(200),
                         None,
                         started_at.elapsed().as_millis() as i64,
                         prompt_tokens,
                         completion_tokens,
-                    );
+                    )
+                    .await;
                     return sse_response_from_completion(&completion);
                 }
                 Err(e) => {
@@ -535,13 +545,14 @@ async fn handle_streaming(
                         .map(|pe| format!("provider returned {}: {}", pe.status, pe.body))
                         .unwrap_or_else(|| e.to_string());
                     fail_stream_attempt(
-                        &store,
-                        &profile_id,
-                        &target,
+                        store.clone(),
+                        profile_id.clone(),
+                        target.clone(),
                         status,
                         message,
                         started_at.elapsed().as_millis() as i64,
-                    );
+                    )
+                    .await;
                     continue;
                 }
             }
@@ -562,40 +573,43 @@ async fn handle_streaming(
                 let status = resp.status();
                 let bytes = resp.bytes().await.unwrap_or_default();
                 fail_stream_attempt(
-                    &store,
-                    &profile_id,
-                    &target,
+                    store.clone(),
+                    profile_id.clone(),
+                    target.clone(),
                     Some(status.as_u16() as i32),
                     format!(
                         "provider returned {status}: {}",
                         String::from_utf8_lossy(&bytes)
                     ),
                     started_at.elapsed().as_millis() as i64,
-                );
+                )
+                .await;
                 continue;
             }
             Ok(Err(e)) => {
                 // Upstream connection failed.
                 fail_stream_attempt(
-                    &store,
-                    &profile_id,
-                    &target,
+                    store.clone(),
+                    profile_id.clone(),
+                    target.clone(),
                     None,
                     format!("upstream failed: {e}"),
                     started_at.elapsed().as_millis() as i64,
-                );
+                )
+                .await;
                 continue;
             }
             Err(_) => {
                 // Upstream timed out before sending headers.
                 fail_stream_attempt(
-                    &store,
-                    &profile_id,
-                    &target,
+                    store.clone(),
+                    profile_id.clone(),
+                    target.clone(),
                     None,
                     "upstream timeout".to_string(),
                     started_at.elapsed().as_millis() as i64,
-                );
+                )
+                .await;
                 continue;
             }
         };
@@ -627,46 +641,50 @@ async fn handle_streaming(
                     "upstream answered 2xx with an in-band SSE error, failing over"
                 );
                 fail_stream_attempt(
-                    &store,
-                    &profile_id,
-                    &target,
+                    store.clone(),
+                    profile_id.clone(),
+                    target.clone(),
                     Some(code.unwrap_or(502) as i32),
                     format!("upstream in-band error: {message}"),
                     started_at.elapsed().as_millis() as i64,
-                );
+                )
+                .await;
                 continue;
             }
             Probe::Failed(msg) => {
                 fail_stream_attempt(
-                    &store,
-                    &profile_id,
-                    &target,
+                    store.clone(),
+                    profile_id.clone(),
+                    target.clone(),
                     None,
                     msg,
                     started_at.elapsed().as_millis() as i64,
-                );
+                )
+                .await;
                 continue;
             }
             Probe::Timeout => {
                 fail_stream_attempt(
-                    &store,
-                    &profile_id,
-                    &target,
+                    store.clone(),
+                    profile_id.clone(),
+                    target.clone(),
                     Some(504),
                     "upstream stalled before sending any stream data".to_string(),
                     started_at.elapsed().as_millis() as i64,
-                );
+                )
+                .await;
                 continue;
             }
             Probe::Transport(e) => {
                 fail_stream_attempt(
-                    &store,
-                    &profile_id,
-                    &target,
+                    store.clone(),
+                    profile_id.clone(),
+                    target.clone(),
                     None,
                     format!("stream error: {e}"),
                     started_at.elapsed().as_millis() as i64,
-                );
+                )
+                .await;
                 continue;
             }
         }
@@ -841,25 +859,26 @@ async fn probe_stream(idle_timeout: Duration, resp: reqwest::Response) -> Probe 
 
 /// Log one failed streaming attempt and demote the entry per the failure
 /// classification.
-fn fail_stream_attempt(
-    store: &Arc<Store>,
-    profile_id: &str,
-    target: &crate::router::Target,
+async fn fail_stream_attempt(
+    store: Arc<Store>,
+    profile_id: String,
+    target: crate::router::Target,
     status_code: Option<i32>,
     message: String,
     latency_ms: i64,
 ) {
     log_stream_outcome(
-        store,
-        profile_id,
-        target,
+        store.clone(),
+        profile_id.clone(),
+        target.clone(),
         false,
         status_code,
         Some(message.clone()),
         latency_ms,
         None,
         None,
-    );
+    )
+    .await;
     if let Some(status) = crate::router::demote_status_for(status_code.map(|c| c as i64), &message)
     {
         let _ = store.set_route_entry_status(target.entry.id, status);
@@ -869,10 +888,10 @@ fn fail_stream_attempt(
 /// Record exactly one usage row for a streaming attempt with real status and
 /// token counts (unlike [`log_attempt`], which parses a full response body).
 #[allow(clippy::too_many_arguments)]
-fn log_stream_outcome(
-    store: &Arc<Store>,
-    profile_id: &str,
-    target: &crate::router::Target,
+async fn log_stream_outcome(
+    store: Arc<Store>,
+    profile_id: String,
+    target: crate::router::Target,
     success: bool,
     status_code: Option<i32>,
     error_message: Option<String>,
@@ -880,18 +899,24 @@ fn log_stream_outcome(
     prompt_tokens: Option<i64>,
     completion_tokens: Option<i64>,
 ) {
-    let _ = store.record_usage(crate::storage::NewUsage {
-        profile_id: profile_id.to_string(),
-        route_entry_id: target.entry.id,
-        model_id: target.entry.model_id.clone(),
-        streamed: true,
-        success,
-        status_code,
-        error_message,
-        latency_ms,
-        prompt_tokens,
-        completion_tokens,
-    });
+    let result = tokio::task::spawn_blocking(move || {
+        store.record_usage(crate::storage::NewUsage {
+            profile_id,
+            route_entry_id: target.entry.id,
+            model_id: target.entry.model_id.clone(),
+            streamed: true,
+            success,
+            status_code,
+            error_message,
+            latency_ms,
+            prompt_tokens,
+            completion_tokens,
+        })
+    })
+    .await;
+    if let Err(e) = result {
+        tracing::debug!(error = %e, "usage logging task failed");
+    }
 }
 
 /// Stream a committed upstream response to the client.
@@ -1039,26 +1064,28 @@ async fn pump_stream(
     match failure {
         Some((status_code, message)) => {
             fail_stream_attempt(
-                &store,
-                &profile_id,
-                &target,
+                store.clone(),
+                profile_id.clone(),
+                target.clone(),
                 status_code,
                 message,
                 latency_ms,
-            );
+            )
+            .await;
         }
         None => {
             log_stream_outcome(
-                &store,
-                &profile_id,
-                &target,
+                store.clone(),
+                profile_id.clone(),
+                target.clone(),
                 true,
                 Some(200),
                 None,
                 latency_ms,
                 prompt_tokens.map(|t| t as i64),
                 completion_tokens.map(|t| t as i64),
-            );
+            )
+            .await;
         }
     }
 }
@@ -1259,7 +1286,8 @@ async fn handle_completion(
                     false,
                     &outcome,
                     started.elapsed().as_millis() as i64,
-                );
+                )
+                .await;
                 outcome
             }
         },
@@ -1370,35 +1398,38 @@ async fn handle_completion_streaming(
                     }
                     Probe::InBandError { code, message } => {
                         fail_stream_attempt(
-                            &store,
-                            &profile_id,
-                            &target,
+                            store.clone(),
+                            profile_id.clone(),
+                            target.clone(),
                             Some(code.unwrap_or(502) as i32),
                             format!("upstream in-band error: {message}"),
                             started_at.elapsed().as_millis() as i64,
-                        );
+                        )
+                        .await;
                         continue;
                     }
                     Probe::Failed(msg) | Probe::Transport(msg) => {
                         fail_stream_attempt(
-                            &store,
-                            &profile_id,
-                            &target,
+                            store.clone(),
+                            profile_id.clone(),
+                            target.clone(),
                             None,
                             msg,
                             started_at.elapsed().as_millis() as i64,
-                        );
+                        )
+                        .await;
                         continue;
                     }
                     Probe::Timeout => {
                         fail_stream_attempt(
-                            &store,
-                            &profile_id,
-                            &target,
+                            store.clone(),
+                            profile_id.clone(),
+                            target.clone(),
                             Some(504),
                             "upstream stalled before sending any stream data".to_string(),
                             started_at.elapsed().as_millis() as i64,
-                        );
+                        )
+                        .await;
                         continue;
                     }
                 }
@@ -1408,38 +1439,41 @@ async fn handle_completion_streaming(
                 let status = resp.status();
                 let bytes = resp.bytes().await.unwrap_or_default();
                 fail_stream_attempt(
-                    &store,
-                    &profile_id,
-                    &target,
+                    store.clone(),
+                    profile_id.clone(),
+                    target.clone(),
                     Some(status.as_u16() as i32),
                     format!(
                         "provider returned {status}: {}",
                         String::from_utf8_lossy(&bytes)
                     ),
                     started_at.elapsed().as_millis() as i64,
-                );
+                )
+                .await;
             }
             Ok(Err(e)) => {
                 // Upstream connection failed.
                 fail_stream_attempt(
-                    &store,
-                    &profile_id,
-                    &target,
+                    store.clone(),
+                    profile_id.clone(),
+                    target.clone(),
                     None,
                     format!("upstream failed: {e}"),
                     started_at.elapsed().as_millis() as i64,
-                );
+                )
+                .await;
             }
             Err(_) => {
                 // Upstream timed out before sending headers.
                 fail_stream_attempt(
-                    &store,
-                    &profile_id,
-                    &target,
+                    store.clone(),
+                    profile_id.clone(),
+                    target.clone(),
                     None,
                     "upstream timeout".to_string(),
                     started_at.elapsed().as_millis() as i64,
-                );
+                )
+                .await;
             }
         }
     }
@@ -1567,7 +1601,8 @@ async fn handle_embeddings(
                     false,
                     &outcome,
                     started.elapsed().as_millis() as i64,
-                );
+                )
+                .await;
                 outcome
             }
         },
@@ -1708,8 +1743,8 @@ mod economy_tests {
         );
     }
 
-    #[test]
-    fn image_rejecting_4xx_demotes_the_streaming_entry() {
+    #[tokio::test]
+    async fn image_rejecting_4xx_demotes_the_streaming_entry() {
         use crate::domain::{ModelStatus, ProviderKind, RoutingStrategy};
         use crate::storage::NewProvider;
 
@@ -1762,7 +1797,15 @@ mod economy_tests {
             store
                 .set_route_entry_status(target.entry.id, ModelStatus::Healthy)
                 .unwrap();
-            fail_stream_attempt(&store, &profile.id, &target, code, message.into(), 1);
+            fail_stream_attempt(
+                store.clone(),
+                profile.id.clone(),
+                target.clone(),
+                code,
+                message.into(),
+                1,
+            )
+            .await;
             let entries = store.route_entries(route.id).unwrap();
             assert_eq!(entries[0].status, expected, "{message}");
         }

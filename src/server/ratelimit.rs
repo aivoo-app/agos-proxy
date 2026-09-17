@@ -3,8 +3,17 @@
 //! A sliding one-minute window is kept per profile id: each accepted request
 //! records a timestamp, timestamps older than the window are evicted, and a
 //! request is refused once the recorded count reaches the profile's
-//! requests-per-minute ceiling. The limiter lives entirely in memory — it is
-//! per-process by design, since the proxy is a single binary.
+//! requests-per-minute ceiling.
+//!
+//! **Important:** The limiter lives entirely in memory and is **per-process**.
+//! Running multiple `agos-proxy` instances (e.g., blue/green deployments,
+//! systemd restart overlap, HA pairs) against the same profile will each
+//! enforce their own independent limit, effectively multiplying the allowed
+//! throughput. A process restart also resets all windows.
+//!
+//! For multi-instance deployments requiring shared rate limiting, consider
+//! running a single proxy instance behind a load balancer, or implementing a
+//! distributed rate limiter (e.g., Redis-backed) externally.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;

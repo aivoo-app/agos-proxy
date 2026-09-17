@@ -1,23 +1,28 @@
 //! Outbound adapter for the OpenAI *Responses* API (`POST {base}/v1/responses`).
 //!
 //! Some models (notably free tiers) only serve the Responses
-//! endpoint. Chat-completions traffic is translated on the way out: the
-//! transcript is flattened into a single `input` string, sampling parameters
-//! are passed through, and the reply's `output[]` items are walked to recover
-//! the assistant text, which is reshaped into a standard chat-completion
-//! response.
+//! endpoint. Chat-completions traffic is translated on the way out: system
+//! messages go to `instructions`, user/assistant turns go to `input`, sampling
+//! parameters are passed through, and the reply's `output[]` items are walked
+//! to recover the assistant text, which is reshaped into a standard
+//! chat-completion response.
 //!
 //! v1 scope (see the build plan): streaming requests are served from the
-//! non-streamed answer, tool calls are dropped with a debug log, and a reply
-//! that carries no assistant text (e.g. reasoning-only output) is treated as a
-//! failed attempt so the router fails over.
+//! non-streamed answer; tool calls, structured outputs, and vision requests
+//! are rejected with an error so the router can fail over to a capable entry.
 
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
 
 use super::normalize_base;
 use crate::router::Target;
-use crate::translator::{content_text, ChatRequest, Message};
+use crate::translator::{content_has_image, content_text, ChatRequest, Message};
+
+/// Marker for adapter-side capability rejections (tools/vision/JSON/stream).
+/// `execute_with_failover`/`demote_status_for` treat these as client-side
+/// skips: fail over without demoting the entry, since the request — not the
+/// upstream — is at fault.
+pub const ADAPTER_CAPABILITY_SKIP: &str = "adapter capability skip";
 
 /// Upstream URL: `{base}/v1/responses` (the base may already end in `/v1`).
 pub fn build_url(target: &Target) -> String {
@@ -39,30 +44,55 @@ pub fn build_headers(target: &Target) -> BTreeMap<String, String> {
 
 /// Translate a chat-completions request into a Responses request.
 ///
-/// The full transcript is joined in order as `role: content` lines — the
-/// Responses endpoint accepts a plain string for `input`. `temperature`,
+/// System messages are extracted into the dedicated `instructions` field;
+/// user/assistant turns are joined into the `input` string. `temperature`,
 /// `top_p` and `max_tokens`/`max_completion_tokens` are forwarded
-/// (`max_*` becomes `max_output_tokens`); `stream`, `tools`, `tool_choice` and
-/// `response_format` are not supported by this adapter in v1 and are dropped
-/// with a debug log so operators can see when a request is lossy.
-pub fn translate_request(chat_req: &ChatRequest, model_id: &str) -> serde_json::Value {
+/// (`max_*` becomes `max_output_tokens`).
+///
+/// Returns an error if the request uses features not supported by this adapter
+/// (tools, tool_choice, response_format, images), so the router can fail over
+/// to a capable entry instead of silently dropping them.
+pub fn translate_request(chat_req: &ChatRequest, model_id: &str) -> Result<serde_json::Value> {
+    let mut instructions = String::new();
     let mut input = String::new();
+
     for message in &chat_req.messages {
-        if !input.is_empty() {
-            input.push('\n');
+        let text = message_text(message);
+        if message.role == "system" {
+            if !instructions.is_empty() {
+                instructions.push('\n');
+            }
+            instructions.push_str(&text);
+        } else {
+            if !input.is_empty() {
+                input.push('\n');
+            }
+            input.push_str(&message.role);
+            input.push_str(": ");
+            input.push_str(&text);
         }
-        input.push_str(&message.role);
-        input.push_str(": ");
-        input.push_str(&message_text(message));
     }
 
+    // Reject unsupported features so the router can fail over to a capable entry.
+    // Each error carries the capability-skip marker so failover demotion
+    // treats it as a client-side skip (no status change).
     if chat_req.stream {
-        tracing::debug!("responses adapter: `stream` is not supported upstream (v1); serving the non-streamed answer");
+        bail!("{ADAPTER_CAPABILITY_SKIP}: streaming not supported by openai_responses adapter; use a streaming-capable upstream");
     }
     let extra = &chat_req.extra;
-    for key in ["tools", "tool_choice", "response_format"] {
-        if extra.get(key).is_some_and(|v| !v.is_null()) {
-            tracing::debug!(key, "responses adapter: dropping unsupported request field");
+    if extra.get("tools").is_some_and(|v| !v.is_null()) {
+        bail!("{ADAPTER_CAPABILITY_SKIP}: tools/function calling not supported by openai_responses adapter; use a tools-capable upstream");
+    }
+    if extra.get("tool_choice").is_some_and(|v| !v.is_null()) {
+        bail!("{ADAPTER_CAPABILITY_SKIP}: tool_choice not supported by openai_responses adapter; use a tools-capable upstream");
+    }
+    if extra.get("response_format").is_some_and(|v| !v.is_null()) {
+        bail!("{ADAPTER_CAPABILITY_SKIP}: response_format (JSON mode) not supported by openai_responses adapter; use a json-mode-capable upstream");
+    }
+    // Check for images in any message content.
+    for message in &chat_req.messages {
+        if content_has_image(&message.content) {
+            bail!("{ADAPTER_CAPABILITY_SKIP}: image (vision) input not supported by openai_responses adapter; use a vision-capable upstream");
         }
     }
 
@@ -71,6 +101,12 @@ pub fn translate_request(chat_req: &ChatRequest, model_id: &str) -> serde_json::
         "input": input,
     });
     let obj = body.as_object_mut().expect("json object");
+    if !instructions.is_empty() {
+        obj.insert(
+            "instructions".to_string(),
+            serde_json::Value::String(instructions),
+        );
+    }
     for key in ["temperature", "top_p"] {
         if let Some(v) = extra.get(key) {
             obj.insert(key.to_string(), v.clone());
@@ -83,7 +119,7 @@ pub fn translate_request(chat_req: &ChatRequest, model_id: &str) -> serde_json::
             break;
         }
     }
-    body
+    Ok(body)
 }
 
 /// Extract the plain-text content of a message: a JSON string as-is, or the
@@ -206,7 +242,7 @@ mod tests {
                 { "role": "system", "content": "be terse" },
                 { "role": "user", "content": "hi" }
             ],
-            "stream": true,
+            "stream": false,
         });
         // Sampling params ride on the top level; ChatRequest keeps them via
         // serde `flatten` into `extra`.
@@ -234,18 +270,76 @@ mod tests {
             &chat(serde_json::json!({
                 "temperature": 0.5,
                 "max_tokens": 128,
+            })),
+            "responses-model",
+        )
+        .expect("translate");
+        assert_eq!(body["model"], "responses-model");
+        assert_eq!(body["instructions"], "be terse");
+        assert_eq!(body["input"], "user: hi");
+        assert_eq!(body["temperature"], 0.5);
+        assert_eq!(body["max_output_tokens"], 128);
+    }
+
+    #[test]
+    fn request_rejects_tools() {
+        let err = translate_request(
+            &chat(serde_json::json!({
                 "tools": [{ "type": "function" }],
+            })),
+            "responses-model",
+        )
+        .expect_err("tools should be rejected");
+        assert!(err.to_string().contains("tools"));
+    }
+
+    #[test]
+    fn request_rejects_tool_choice() {
+        let err = translate_request(
+            &chat(serde_json::json!({
+                "tool_choice": "auto",
+            })),
+            "responses-model",
+        )
+        .expect_err("tool_choice should be rejected");
+        assert!(err.to_string().contains("tool_choice"));
+    }
+
+    #[test]
+    fn request_rejects_response_format() {
+        let err = translate_request(
+            &chat(serde_json::json!({
                 "response_format": { "type": "json_object" },
             })),
             "responses-model",
-        );
-        assert_eq!(body["model"], "responses-model");
-        assert_eq!(body["input"], "system: be terse\nuser: hi");
-        assert_eq!(body["temperature"], 0.5);
-        assert_eq!(body["max_output_tokens"], 128);
-        assert!(body.get("tools").is_none());
-        assert!(body.get("stream").is_none());
-        assert!(body.get("response_format").is_none());
+        )
+        .expect_err("response_format should be rejected");
+        assert!(err.to_string().contains("response_format"));
+    }
+
+    #[test]
+    fn request_rejects_stream() {
+        let err = translate_request(
+            &chat(serde_json::json!({
+                "stream": true,
+            })),
+            "responses-model",
+        )
+        .expect_err("stream should be rejected");
+        assert!(err.to_string().contains("streaming"));
+    }
+
+    #[test]
+    fn request_rejects_images() {
+        let mut req = chat(serde_json::json!({}));
+        // Add an image to the user message
+        req.messages[1].content = serde_json::json!([
+            { "type": "text", "text": "what is this" },
+            { "type": "image_url", "image_url": { "url": "https://x/cat.png" } }
+        ]);
+        let err =
+            translate_request(&req, "responses-model").expect_err("images should be rejected");
+        assert!(err.to_string().contains("vision") || err.to_string().contains("image"));
     }
 
     #[test]
@@ -256,7 +350,8 @@ mod tests {
                 "max_completion_tokens": 64,
             })),
             "responses-model",
-        );
+        )
+        .expect("translate");
         assert_eq!(body["max_output_tokens"], 64);
     }
 
