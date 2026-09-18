@@ -11,7 +11,9 @@ use futures::StreamExt;
 use super::sse;
 use crate::adapter::outbound;
 use crate::adapter::Registry;
-use crate::router::{execute_with_failover, resolve_targets_with_strategy, RoutingState};
+use crate::router::{
+    execute_with_failover, resolve_targets_with_strategy, RequestNeeds, RoutingState,
+};
 use crate::storage::Store;
 use crate::translator::ChatRequest;
 
@@ -185,9 +187,7 @@ async fn handle_non_streaming(
         needs,
         &state.routing_state,
     ) {
-        Ok(t) if t.is_empty() => {
-            return service_unavailable("no healthy providers available for this route")
-        }
+        Ok(t) if t.is_empty() => return no_targets(needs),
         Ok(t) => t,
         Err(e) => {
             let msg = e.to_string();
@@ -421,26 +421,19 @@ pub(crate) async fn log_attempt(
     outcome: &Result<Vec<u8>, anyhow::Error>,
     latency_ms: i64,
 ) {
-    let (success, status_code, error_message, prompt_tokens, completion_tokens) = match outcome {
-        Ok(bytes) => {
-            let usage = serde_json::from_slice::<serde_json::Value>(bytes)
-                .ok()
-                .and_then(|mut v| {
-                    let usage_obj = v.get_mut("usage")?.as_object()?.clone();
-                    let prompt = usage_obj.get("prompt_tokens").and_then(|t| t.as_i64());
-                    let completion = usage_obj.get("completion_tokens").and_then(|t| t.as_i64());
-                    Some((prompt, completion))
-                })
-                .unwrap_or((None, None));
-            (true, Some(200), None, usage.0, usage.1)
-        }
-        Err(e) => {
-            let status = e
-                .downcast_ref::<crate::adapter::outbound::ProviderError>()
-                .map(|pe| pe.status.as_u16() as i32);
-            (false, status, Some(e.to_string()), None, None)
-        }
-    };
+    let (success, status_code, error_message, prompt_tokens, completion_tokens, cached) =
+        match outcome {
+            Ok(bytes) => {
+                let (prompt, completion, cached) = crate::translator::extract_usage_tokens(bytes);
+                (true, Some(200), None, prompt, completion, cached)
+            }
+            Err(e) => {
+                let status = e
+                    .downcast_ref::<crate::adapter::outbound::ProviderError>()
+                    .map(|pe| pe.status.as_u16() as i32);
+                (false, status, Some(e.to_string()), None, None, None)
+            }
+        };
     let store = store.clone();
     let profile_id = profile_id.to_string();
     let entry_id = target.entry.id;
@@ -459,6 +452,7 @@ pub(crate) async fn log_attempt(
             latency_ms,
             prompt_tokens,
             completion_tokens,
+            cached_prompt_tokens: cached,
         })
     })
     .await;
@@ -484,9 +478,7 @@ async fn handle_streaming(
         needs,
         &state.routing_state,
     ) {
-        Ok(t) if t.is_empty() => {
-            return service_unavailable("no healthy providers available for this route");
-        }
+        Ok(t) if t.is_empty() => return no_targets(needs),
         Ok(t) => t,
         Err(e) => {
             let msg = e.to_string();
@@ -519,7 +511,7 @@ async fn handle_streaming(
         // the chain is tried.
         if target.provider.kind == crate::domain::ProviderKind::OpenAIResponses {
             match forward_responses_attempt(&client, &target, &chat_req, attempt_timeout).await {
-                Ok((completion, prompt_tokens, completion_tokens)) => {
+                Ok((completion, prompt_tokens, completion_tokens, cached_prompt_tokens)) => {
                     log_stream_outcome(
                         store.clone(),
                         profile_id.clone(),
@@ -530,6 +522,7 @@ async fn handle_streaming(
                         started_at.elapsed().as_millis() as i64,
                         prompt_tokens,
                         completion_tokens,
+                        cached_prompt_tokens,
                     )
                     .await;
                     return sse_response_from_completion(&completion);
@@ -877,12 +870,15 @@ async fn fail_stream_attempt(
         latency_ms,
         None,
         None,
+        None,
     )
     .await;
-    if let Some(status) = crate::router::demote_status_for(status_code.map(|c| c as i64), &message)
-    {
-        let _ = store.set_route_entry_status(target.entry.id, status);
-    }
+    let _ = crate::router::apply_failure_action(
+        &store,
+        &target,
+        status_code.map(|c| c as i64),
+        &message,
+    );
 }
 
 /// Record exactly one usage row for a streaming attempt with real status and
@@ -898,6 +894,7 @@ async fn log_stream_outcome(
     latency_ms: i64,
     prompt_tokens: Option<i64>,
     completion_tokens: Option<i64>,
+    cached_prompt_tokens: Option<i64>,
 ) {
     let result = tokio::task::spawn_blocking(move || {
         store.record_usage(crate::storage::NewUsage {
@@ -911,6 +908,7 @@ async fn log_stream_outcome(
             latency_ms,
             prompt_tokens,
             completion_tokens,
+            cached_prompt_tokens,
         })
     })
     .await;
@@ -956,6 +954,7 @@ async fn pump_stream(
 
     let mut prompt_tokens: Option<u64> = None;
     let mut completion_tokens: Option<u64> = None;
+    let mut cached_prompt_tokens: Option<u64> = None;
     let mut first_chunk = true;
     let mut failure: Option<(Option<i32>, String)> = None;
 
@@ -1010,9 +1009,10 @@ async fn pump_stream(
             }
             sse::Frame::Other { json, raw } => {
                 if let Some(j) = &json {
-                    let (p, c) = sse::frame_usage(kind, j);
+                    let (p, c, cached) = sse::frame_usage(kind, j);
                     prompt_tokens = prompt_tokens.or(p);
                     completion_tokens = completion_tokens.or(c);
+                    cached_prompt_tokens = cached_prompt_tokens.or(cached);
                 }
                 match kind {
                     ProviderKind::OpenAI | ProviderKind::Custom => {
@@ -1084,6 +1084,7 @@ async fn pump_stream(
                 latency_ms,
                 prompt_tokens.map(|t| t as i64),
                 completion_tokens.map(|t| t as i64),
+                cached_prompt_tokens.map(|t| t as i64),
             )
             .await;
         }
@@ -1098,7 +1099,7 @@ async fn forward_responses_attempt(
     target: &crate::router::Target,
     req: &ChatRequest,
     timeout: Duration,
-) -> anyhow::Result<(serde_json::Value, Option<i64>, Option<i64>)> {
+) -> anyhow::Result<(serde_json::Value, Option<i64>, Option<i64>, Option<i64>)> {
     let (mut url, mut headers, body) =
         crate::adapter::outbound::build_upstream_request(target, req, false)?;
     crate::mask::apply_json(
@@ -1149,7 +1150,13 @@ async fn forward_responses_attempt(
     let completion_tokens = usage
         .and_then(|u| u.get("output_tokens"))
         .and_then(|t| t.as_i64());
-    Ok((completion, prompt_tokens, completion_tokens))
+    // Responses upstreams report cache reads one level down:
+    // `usage.input_tokens_details.cached_tokens`.
+    let cached_prompt_tokens = usage
+        .and_then(|u| u.get("input_tokens_details"))
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(|t| t.as_i64());
+    Ok((completion, prompt_tokens, completion_tokens, cached_prompt_tokens))
 }
 
 /// Wrap a full chat-completion answer into a minimal OpenAI SSE stream so
@@ -1236,9 +1243,7 @@ async fn handle_completion(
         crate::router::RequestNeeds::default(),
         &state.routing_state,
     ) {
-        Ok(t) if t.is_empty() => {
-            return service_unavailable("no healthy providers available for this route")
-        }
+        Ok(t) if t.is_empty() => return no_targets(RequestNeeds::default()),
         Ok(t) => t,
         Err(e) => {
             let msg = e.to_string();
@@ -1337,9 +1342,7 @@ async fn handle_completion_streaming(
         crate::router::RequestNeeds::default(),
         &state.routing_state,
     ) {
-        Ok(t) if t.is_empty() => {
-            return service_unavailable("no healthy providers available for this route")
-        }
+        Ok(t) if t.is_empty() => return no_targets(RequestNeeds::default()),
         Ok(t) => t,
         Err(e) => {
             let msg = e.to_string();
@@ -1553,9 +1556,7 @@ async fn handle_embeddings(
         crate::router::RequestNeeds::default(),
         &state.routing_state,
     ) {
-        Ok(t) if t.is_empty() => {
-            return service_unavailable("no healthy providers available for this route")
-        }
+        Ok(t) if t.is_empty() => return no_targets(RequestNeeds::default()),
         Ok(t) => t,
         Err(e) => {
             let msg = e.to_string();
@@ -1708,6 +1709,52 @@ pub(crate) fn service_unavailable(msg: impl Into<String>) -> Response {
         .unwrap()
 }
 
+/// Answer an empty target list with the status that matches its real cause.
+///
+/// The route resolved and every entry is *individually* usable, so an empty
+/// result means either (a) the request needs a capability no entry declares — a
+/// configuration gap only the caller can fix, answered `400
+/// capability_unavailable` — or (b) plain text was requested and every provider
+/// is genuinely down, answered `503` so clients back off and retry. Collapsing
+/// both into a 503 is what made "wrong model for this image" look like an
+/// outage.
+pub(crate) fn no_targets(needs: RequestNeeds) -> Response {
+    if needs.is_empty() {
+        service_unavailable("no healthy providers available for this route")
+    } else {
+        capability_unavailable(needs)
+    }
+}
+
+/// 400 Bad Request — the route exists and its entries are healthy, but none of
+/// them declares the capability the request needs.
+///
+/// This is deliberately *not* a 503. An empty target list has two very different
+/// causes: every provider is down (retryable, and the caller should back off) or
+/// no model in the chain can serve this kind of request (not retryable — retrying
+/// the identical request will fail identically forever). Answering 503 for the
+/// second case sent clients into retry loops and hid the real problem, which is a
+/// routing configuration gap the caller can fix by naming the missing capability.
+pub(crate) fn capability_unavailable(needs: RequestNeeds) -> Response {
+    let missing = needs.missing_list();
+    let body = serde_json::json!({
+        "error": {
+            "message": format!(
+                "route has no entry with the required capability: {missing}. \
+                 Add or enable an entry that declares it (see `agos-proxy route model add \
+                 --help`), or send the request without it."
+            ),
+            "type": "capability_unavailable",
+            "missing_capabilities": needs.as_labels(),
+        }
+    });
+    axum::response::Response::builder()
+        .status(axum::http::StatusCode::BAD_REQUEST)
+        .header("Content-Type", "application/json")
+        .body(axum::body::Body::from(body.to_string()))
+        .unwrap()
+}
+
 #[cfg(test)]
 mod economy_tests {
     use super::*;
@@ -1812,15 +1859,20 @@ mod economy_tests {
             (
                 Some(400),
                 r#"{"error":{"message":"image input not supported"}}"#,
-                ModelStatus::Unhealthy,
+                ModelStatus::Healthy,
             ),
             (Some(429), "rate limited", ModelStatus::Degraded),
             (Some(503), "overloaded", ModelStatus::Unhealthy),
             (None, "upstream timeout", ModelStatus::Unhealthy),
         ] {
+            // Every iteration starts from a fully-capable, healthy entry.
             store
                 .set_route_entry_status(target.entry.id, ModelStatus::Healthy)
                 .unwrap();
+            store.set_route_entry_vision(target.entry.id, true).unwrap();
+            let mut target = target.clone();
+            target.entry.capabilities.vision = true;
+
             fail_stream_attempt(
                 store.clone(),
                 profile.id.clone(),
@@ -1832,6 +1884,16 @@ mod economy_tests {
             .await;
             let entries = store.route_entries(route.id).unwrap();
             assert_eq!(entries[0].status, expected, "{message}");
+
+            // An image refusal is a missing *capability*, not a sick provider:
+            // the flag is cleared so later image requests skip this entry,
+            // while the key stays healthy for the text traffic it does serve.
+            let refusal =
+                expected == ModelStatus::Healthy && message.contains("image input not supported");
+            assert_eq!(
+                entries[0].capabilities.vision, !refusal,
+                "vision flag after {message:?}"
+            );
         }
     }
 }

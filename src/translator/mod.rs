@@ -185,6 +185,65 @@ pub fn content_text(content: &serde_json::Value) -> String {
         .join("\n")
 }
 
+/// Token accounting pulled from an upstream response body.
+///
+/// `(prompt_tokens, completion_tokens, cached_prompt_tokens)`. The cached count
+/// is `None` when the upstream did not report one — which is *not* the same as
+/// "nothing was cached", so it is stored as NULL rather than 0.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UsageTokens {
+    pub prompt_tokens: Option<i64>,
+    pub completion_tokens: Option<i64>,
+    pub cached_prompt_tokens: Option<i64>,
+}
+
+/// Extract token usage from a response body in any of the three wire shapes the
+/// proxy can be handed back: OpenAI chat-completions, Anthropic messages, and
+/// Google generateContent.
+///
+/// Cache-read counts are read per provider because each names them differently:
+/// OpenAI `usage.prompt_tokens_details.cached_tokens`, Anthropic
+/// `usage.cache_read_input_tokens`, Google `usageMetadata.cachedContentTokenCount`.
+/// Reporting them is what makes prompt caching verifiable from `agos-proxy stats`
+/// instead of a matter of trust.
+pub fn extract_usage_tokens(body: &[u8]) -> (Option<i64>, Option<i64>, Option<i64>) {
+    let u = parse_usage_tokens(body);
+    (u.prompt_tokens, u.completion_tokens, u.cached_prompt_tokens)
+}
+
+/// Same as [`extract_usage_tokens`], but returns the named struct.
+pub fn parse_usage_tokens(body: &[u8]) -> UsageTokens {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return UsageTokens::default();
+    };
+    let usage = v.get("usage").or_else(|| v.get("usageMetadata"));
+    let Some(usage) = usage else {
+        return UsageTokens::default();
+    };
+    let get = |keys: &[&str]| -> Option<i64> {
+        keys.iter()
+            .find_map(|k| usage.get(*k).and_then(|t| t.as_i64()))
+    };
+    // OpenAI nests the cache-read count one level down; the other two are flat.
+    let openai_cached = usage
+        .get("prompt_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(|t| t.as_i64());
+    UsageTokens {
+        prompt_tokens: get(&["prompt_tokens", "input_tokens", "promptTokenCount"]),
+        completion_tokens: get(&[
+            "completion_tokens",
+            "output_tokens",
+            "candidatesTokenCount",
+        ]),
+        cached_prompt_tokens: get(&[
+            "cache_read_input_tokens",
+            "cachedContentTokenCount",
+        ])
+        .or(openai_cached),
+    }
+}
+
 /// A provider-independent single-turn response, produced by the outbound
 /// adapters and consumed by [`crate::adapter::inbound`] inbound adapters so
 /// each can render its own native response shape. This is the seam that lets a

@@ -165,34 +165,54 @@ impl<'a> Frame<'a> {
     }
 }
 
-/// Extract `(prompt_tokens, completion_tokens)` from a frame's JSON, per
-/// provider shape. OpenAI chunks carry a `usage` object (sent when
-/// `stream_options.include_usage` is set); Anthropic splits it across
+/// Extract `(prompt_tokens, completion_tokens, cached_prompt_tokens)` from a
+/// frame's JSON, per provider shape. OpenAI chunks carry a `usage` object (sent
+/// when `stream_options.include_usage` is set); Anthropic splits it across
 /// `message_start` (input) and `message_delta` (output); Google carries
 /// `usageMetadata` on every chunk.
-pub fn frame_usage(kind: ProviderKind, json: &serde_json::Value) -> (Option<u64>, Option<u64>) {
+///
+/// The cached count is `None` when the upstream did not report one, which is
+/// distinct from "zero cached tokens": Anthropic only includes
+/// `cache_read_input_tokens` in `message_start` when caching is active, so a
+/// missing field means "not reported", never "no cache hit".
+pub fn frame_usage(
+    kind: ProviderKind,
+    json: &serde_json::Value,
+) -> (Option<u64>, Option<u64>, Option<u64>) {
     let num = |v: &serde_json::Value| v.as_u64().or_else(|| v.as_i64().map(|n| n.max(0) as u64));
     match kind {
         ProviderKind::OpenAI | ProviderKind::Custom => {
             let usage = json.get("usage");
             let prompt = usage.and_then(|u| u.get("prompt_tokens")).and_then(num);
             let completion = usage.and_then(|u| u.get("completion_tokens")).and_then(num);
-            (prompt, completion)
+            let cached = usage
+                .and_then(|u| u.get("prompt_tokens_details"))
+                .and_then(|d| d.get("cached_tokens"))
+                .and_then(num);
+            (prompt, completion, cached)
         }
         // Never reached in-stream: Responses upstreams are served non-streamed.
-        ProviderKind::OpenAIResponses => (None, None),
+        ProviderKind::OpenAIResponses => (None, None, None),
         ProviderKind::Anthropic => match json.get("type").and_then(|t| t.as_str()) {
             Some("message_start") => (
                 json.pointer("/message/usage/input_tokens").and_then(num),
                 None,
+                json.pointer("/message/usage/cache_read_input_tokens")
+                    .and_then(num),
             ),
-            Some("message_delta") => (None, json.pointer("/usage/output_tokens").and_then(num)),
-            _ => (None, None),
+            Some("message_delta") => (
+                None,
+                json.pointer("/usage/output_tokens").and_then(num),
+                None,
+            ),
+            _ => (None, None, None),
         },
         ProviderKind::Google => (
             json.pointer("/usageMetadata/promptTokenCount")
                 .and_then(num),
             json.pointer("/usageMetadata/candidatesTokenCount")
+                .and_then(num),
+            json.pointer("/usageMetadata/cachedContentTokenCount")
                 .and_then(num),
         ),
     }
@@ -329,7 +349,15 @@ mod tests {
             serde_json::from_str(r#"{"usage":{"prompt_tokens":5,"completion_tokens":7}}"#).unwrap();
         assert_eq!(
             frame_usage(ProviderKind::OpenAI, &openai),
-            (Some(5), Some(7))
+            (Some(5), Some(7), None)
+        );
+        let cached_openai: serde_json::Value = serde_json::from_str(
+            r#"{"usage":{"prompt_tokens":9,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":4}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            frame_usage(ProviderKind::OpenAI, &cached_openai),
+            (Some(9), Some(1), Some(4))
         );
         let start: serde_json::Value = serde_json::from_str(
             r#"{"type":"message_start","message":{"usage":{"input_tokens":11}}}"#,
@@ -337,14 +365,22 @@ mod tests {
         .unwrap();
         assert_eq!(
             frame_usage(ProviderKind::Anthropic, &start),
-            (Some(11), None)
+            (Some(11), None, None)
+        );
+        let cached_start: serde_json::Value = serde_json::from_str(
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":12,"cache_read_input_tokens":8}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            frame_usage(ProviderKind::Anthropic, &cached_start),
+            (Some(12), None, Some(8))
         );
         let delta: serde_json::Value =
             serde_json::from_str(r#"{"type":"message_delta","usage":{"output_tokens":3}}"#)
                 .unwrap();
         assert_eq!(
             frame_usage(ProviderKind::Anthropic, &delta),
-            (None, Some(3))
+            (None, Some(3), None)
         );
         let google_usage: serde_json::Value = serde_json::from_str(
             r#"{"usageMetadata":{"promptTokenCount":2,"candidatesTokenCount":4}}"#,
@@ -352,7 +388,15 @@ mod tests {
         .unwrap();
         assert_eq!(
             frame_usage(ProviderKind::Google, &google_usage),
-            (Some(2), Some(4))
+            (Some(2), Some(4), None)
+        );
+        let cached_google: serde_json::Value = serde_json::from_str(
+            r#"{"usageMetadata":{"promptTokenCount":6,"candidatesTokenCount":2,"cachedContentTokenCount":5}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            frame_usage(ProviderKind::Google, &cached_google),
+            (Some(6), Some(2), Some(5))
         );
     }
 
