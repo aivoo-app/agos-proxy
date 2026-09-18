@@ -35,6 +35,7 @@ struct RawProvider {
     kind_tag: String,
     extra_json: String,
     masking_server_id: Option<i64>,
+    shared: bool,
 }
 
 /// Intermediate masking-server row, used to defer secret decryption out of the
@@ -52,13 +53,14 @@ struct RawMaskingServer {
     last_verified_asn: Option<String>,
     last_verified_country: Option<String>,
     last_verified_at: Option<i64>,
+    shared: bool,
 }
 
 /// The [`MaskingServer`] column list, optionally qualified with a table alias
 /// (e.g. `"m."`). Kept in one place so every query reads the same shape and the
 /// row indices handed to [`raw_mask_from_row`] stay in sync.
 pub(crate) fn mask_columns(prefix: &str) -> String {
-    const COLS: [&str; 12] = [
+    const COLS: [&str; 13] = [
         "id",
         "profile_id",
         "name",
@@ -71,6 +73,7 @@ pub(crate) fn mask_columns(prefix: &str) -> String {
         "last_verified_asn",
         "last_verified_country",
         "last_verified_at",
+        "shared",
     ];
     COLS.iter()
         .map(|c| format!("{prefix}{c}"))
@@ -102,6 +105,7 @@ fn raw_mask_from_row(
         last_verified_asn: row.get(base + 9)?,
         last_verified_country: row.get(base + 10)?,
         last_verified_at: row.get(base + 11)?,
+        shared: row.get::<_, Option<i64>>(base + 12)?.unwrap_or(0) != 0,
     }))
 }
 
@@ -186,12 +190,12 @@ fn fresh_token() -> Result<String> {
 
 /// Column list for a provider joined to its egress mask.
 ///
-/// Fixed prefix 0..8 is the provider itself (with the binding at 8); index 9
-/// onwards are the mask columns consumed by [`raw_mask_from_row`].
+/// Fixed prefix 0..9 is the provider itself (binding at 8, sharing flag at 9);
+/// index 10 onwards are the mask columns consumed by [`raw_mask_from_row`].
 fn provider_columns() -> String {
     format!(
         "p.id, p.profile_id, p.name, p.description, p.base_url, p.auth_token, \
-         p.kind, p.extra_headers, p.masking_server_id, {}",
+         p.kind, p.extra_headers, p.masking_server_id, p.shared, {}",
         mask_columns("m.")
     )
 }
@@ -223,8 +227,9 @@ fn raw_provider_at(row: &rusqlite::Row<'_>, base: usize) -> rusqlite::Result<Raw
             kind_tag: row.get(base + 6)?,
             extra_json: row.get(base + 7)?,
             masking_server_id: row.get(base + 8)?,
+            shared: row.get::<_, Option<i64>>(base + 9)?.unwrap_or(0) != 0,
         },
-        raw_mask_from_row(row, base + 9)?,
+        raw_mask_from_row(row, base + 10)?,
     ))
 }
 
@@ -266,6 +271,8 @@ pub struct NewProvider {
     pub extra_headers: std::collections::BTreeMap<String, String>,
     /// Egress mask to bind this provider to; `None` = use the profile default.
     pub masking_server_id: Option<i64>,
+    /// Publish this provider to every profile (see [`Provider::shared`]).
+    pub shared: bool,
 }
 
 /// Details needed to register a new [`MaskingServer`] (an egress hop).
@@ -279,6 +286,8 @@ pub struct NewMaskingServer {
     /// Body-size ceiling above which requests skip this hop (0 = no limit).
     pub max_body_bytes: i64,
     pub expected_egress_ip: Option<String>,
+    /// Publish this mask to every profile (see [`MaskingServer::shared`]).
+    pub shared: bool,
 }
 
 /// Details needed to append one request to the usage log.
@@ -646,8 +655,8 @@ impl Store {
         let encrypted_token = crate::crypto::encrypt(&key, &spec.auth_token)?;
         self.conn()
             .execute(
-                "INSERT INTO providers (profile_id, name, description, base_url, auth_token, kind, extra_headers, masking_server_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO providers (profile_id, name, description, base_url, auth_token, kind, extra_headers, masking_server_id, shared)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 (
                     profile_id,
                     spec.name.as_str(),
@@ -657,6 +666,7 @@ impl Store {
                     provider_kind_tag(spec.kind),
                     serde_json::to_string(&spec.extra_headers).expect("BTreeMap<String,String> always serializable"),
                     spec.masking_server_id,
+                    spec.shared as i64,
                 ),
             )
             .context("inserting the provider")?;
@@ -683,6 +693,7 @@ impl Store {
             last_verified_asn: raw.last_verified_asn,
             last_verified_country: raw.last_verified_country,
             last_verified_at: raw.last_verified_at,
+            shared: raw.shared,
         })
     }
 
@@ -708,6 +719,7 @@ impl Store {
             .expect("invalid provider headers in store"),
             masking_server_id: raw.masking_server_id,
             masking_server,
+            shared: raw.shared,
         })
     }
 
@@ -752,6 +764,46 @@ impl Store {
         raws.into_iter()
             .map(|(provider, mask)| self.build_provider(provider, mask))
             .collect()
+    }
+
+    /// Every provider a profile may route through: its own providers plus every
+    /// provider another profile has shared. Owned providers come first, then
+    /// shared ones ordered by name, so pickers read naturally.
+    pub fn list_providers_for(&self, profile_id: &str) -> Result<Vec<Provider>> {
+        let raws: Vec<RawProviderRow> = {
+            let conn = self.conn();
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {} FROM providers p {}
+                 WHERE p.profile_id = ?1 OR p.shared = 1
+                 ORDER BY (p.profile_id = ?1) DESC, p.name",
+                provider_columns(),
+                mask_join()
+            ))?;
+            let rows = stmt.query_map((profile_id,), raw_provider_from_row)?;
+            let mut out = Vec::new();
+            for item in rows {
+                out.push(item?);
+            }
+            out
+        };
+        raws.into_iter()
+            .map(|(provider, mask)| self.build_provider(provider, mask))
+            .collect()
+    }
+
+    /// Publish (or unpublish) a provider across the instance.
+    pub fn set_provider_shared(&self, provider_id: i64, shared: bool) -> Result<()> {
+        let changed = self
+            .conn()
+            .execute(
+                "UPDATE providers SET shared = ?1 WHERE id = ?2",
+                (shared as i64, provider_id),
+            )
+            .context("updating the provider's sharing flag")?;
+        if changed == 0 {
+            bail!("no provider matches id {provider_id}");
+        }
+        Ok(())
     }
 
     /// A single provider by id.
@@ -804,8 +856,8 @@ impl Store {
         self.conn()
             .execute(
                 "INSERT INTO masking_servers
-                    (profile_id, name, kind, endpoint_url, secret, max_body_bytes, expected_egress_ip)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    (profile_id, name, kind, endpoint_url, secret, max_body_bytes, expected_egress_ip, shared)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 (
                     profile_id,
                     spec.name.as_str(),
@@ -814,6 +866,7 @@ impl Store {
                     enc_secret,
                     spec.max_body_bytes.max(0),
                     spec.expected_egress_ip.as_deref(),
+                    spec.shared as i64,
                 ),
             )
             .context("inserting the masking server")?;
@@ -840,6 +893,44 @@ impl Store {
             out
         };
         raws.into_iter().map(|raw| self.build_mask(raw)).collect()
+    }
+
+    /// Every mask a profile may bind a shared provider through: its own masks
+    /// plus masks other profiles have shared. Owned masks come first.
+    pub fn list_masking_servers_for(&self, profile_id: &str) -> Result<Vec<MaskingServer>> {
+        let raws: Vec<RawMaskingServer> = {
+            let conn = self.conn();
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {} FROM masking_servers
+                 WHERE profile_id = ?1 OR shared = 1
+                 ORDER BY (profile_id = ?1) DESC, name",
+                mask_columns("")
+            ))?;
+            let rows = stmt.query_map((profile_id,), |row| {
+                raw_mask_from_row(row, 0).and_then(|m| m.ok_or(rusqlite::Error::InvalidQuery))
+            })?;
+            let mut out = Vec::new();
+            for item in rows {
+                out.push(item?);
+            }
+            out
+        };
+        raws.into_iter().map(|raw| self.build_mask(raw)).collect()
+    }
+
+    /// Publish (or unpublish) a mask across the instance.
+    pub fn set_mask_shared(&self, mask_id: i64, shared: bool) -> Result<()> {
+        let changed = self
+            .conn()
+            .execute(
+                "UPDATE masking_servers SET shared = ?1 WHERE id = ?2",
+                (shared as i64, mask_id),
+            )
+            .context("updating the mask's sharing flag")?;
+        if changed == 0 {
+            bail!("no masking server matches id {mask_id}");
+        }
+        Ok(())
     }
 
     /// A single mask by id.
@@ -899,8 +990,8 @@ impl Store {
             .execute(
                 "UPDATE masking_servers
                  SET name = ?1, kind = ?2, endpoint_url = ?3, secret = ?4,
-                     max_body_bytes = ?5, expected_egress_ip = ?6
-                 WHERE id = ?7",
+                     max_body_bytes = ?5, expected_egress_ip = ?6, shared = ?7
+                 WHERE id = ?8",
                 (
                     spec.name.as_str(),
                     spec.kind.as_str(),
@@ -908,6 +999,7 @@ impl Store {
                     enc_secret,
                     spec.max_body_bytes.max(0),
                     spec.expected_egress_ip.as_deref(),
+                    spec.shared as i64,
                     id,
                 ),
             )
@@ -991,7 +1083,7 @@ impl Store {
         let changed = self
             .conn()
             .execute(
-                "UPDATE providers SET name = ?1, description = ?2, base_url = ?3, auth_token = ?4, kind = ?5, extra_headers = ?6, masking_server_id = ?7 WHERE id = ?8",
+                "UPDATE providers SET name = ?1, description = ?2, base_url = ?3, auth_token = ?4, kind = ?5, extra_headers = ?6, masking_server_id = ?7, shared = ?8 WHERE id = ?9",
                 (
                     spec.name.as_str(),
                     spec.description.as_deref(),
@@ -1000,6 +1092,7 @@ impl Store {
                     provider_kind_tag(spec.kind),
                     serde_json::to_string(&spec.extra_headers).expect("BTreeMap<String,String> always serializable"),
                     spec.masking_server_id,
+                    spec.shared as i64,
                     id,
                 ),
             )
@@ -1727,6 +1820,7 @@ mod tests {
                     kind: *kind,
                     extra_headers: Default::default(),
                     masking_server_id: None,
+                    shared: false,
                 },
             )?;
             let listed = store.list_providers(profile.id.as_str())?;
@@ -1788,6 +1882,7 @@ mod tests {
                 kind: ProviderKind::OpenAI,
                 extra_headers: headers,
                 masking_server_id: None,
+                shared: false,
             },
         )?;
         let listed = store.list_providers(profile.id.as_str())?;
@@ -1839,6 +1934,7 @@ mod tests {
                 kind: ProviderKind::OpenAI,
                 extra_headers: std::collections::BTreeMap::new(),
                 masking_server_id: None,
+                shared: false,
             },
         )?;
         store.update_provider(
@@ -1851,6 +1947,7 @@ mod tests {
                 kind: ProviderKind::Anthropic,
                 extra_headers: std::collections::BTreeMap::new(),
                 masking_server_id: None,
+                shared: false,
             },
         )?;
         let updated = store.get_provider(provider.id)?.unwrap();
@@ -1932,6 +2029,7 @@ mod tests {
                 kind: ProviderKind::OpenAI,
                 extra_headers: std::collections::BTreeMap::new(),
                 masking_server_id: None,
+                shared: false,
             },
         )?;
         let provider_b = store.create_provider(
@@ -1944,6 +2042,7 @@ mod tests {
                 kind: ProviderKind::OpenAI,
                 extra_headers: std::collections::BTreeMap::new(),
                 masking_server_id: None,
+                shared: false,
             },
         )?;
 
@@ -2000,6 +2099,7 @@ mod tests {
                 kind: ProviderKind::OpenAI,
                 extra_headers: std::collections::BTreeMap::new(),
                 masking_server_id: None,
+                shared: false,
             },
         )?;
         let proxy = store.create_proxy(profile.id.as_str(), "prog", None)?;
@@ -2060,6 +2160,7 @@ mod tests {
             secret: format!("secret-for-{name}"),
             max_body_bytes: 0,
             expected_egress_ip: None,
+            shared: false,
         }
     }
 
@@ -2072,7 +2173,63 @@ mod tests {
             kind: ProviderKind::OpenAI,
             extra_headers: Default::default(),
             masking_server_id: mask_id,
+            shared: false,
         }
+    }
+
+    #[test]
+    fn a_shared_provider_is_visible_to_other_profiles() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let owner = store.create_profile("owner", None, None)?;
+        let other = store.create_profile("other", None, None)?;
+        let provider = store.create_provider(owner.id.as_str(), new_provider("shared-key", None))?;
+
+        // Not shared yet: only the owner sees it.
+        assert_eq!(store.list_providers(owner.id.as_str())?.len(), 1);
+        assert!(store.list_providers_for(other.id.as_str())?.is_empty());
+
+        store.set_provider_shared(provider.id, true)?;
+        let visible = store.list_providers_for(other.id.as_str())?;
+        assert_eq!(visible.len(), 1, "shared provider must be visible");
+        assert!(visible[0].shared);
+        assert_eq!(visible[0].name, "shared-key");
+
+        // The owner's own listing is unchanged (it never gained a duplicate).
+        assert_eq!(store.list_providers(owner.id.as_str())?.len(), 1);
+
+        // Unpublishing hides it again.
+        store.set_provider_shared(provider.id, false)?;
+        assert!(store.list_providers_for(other.id.as_str())?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn sharing_flag_survives_provider_update_and_roundtrips_export() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let profile = store.create_profile("p", None, None)?;
+        let provider = store.create_provider(profile.id.as_str(), new_provider("k", None))?;
+        assert!(!provider.shared);
+
+        store.update_provider(
+            provider.id,
+            NewProvider {
+                shared: true,
+                ..new_provider("k", None)
+            },
+        )?;
+        assert!(store.get_provider(provider.id)?.unwrap().shared);
+
+        // A mask follows the same pattern.
+        let mask = store.create_masking_server(
+            profile.id.as_str(),
+            crate::storage::NewMaskingServer {
+                shared: true,
+                ..new_mask("edge")
+            },
+        )?;
+        assert!(mask.shared);
+        assert_eq!(store.list_masking_servers_for(profile.id.as_str())?.len(), 1);
+        Ok(())
     }
 
     #[test]

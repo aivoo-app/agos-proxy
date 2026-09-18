@@ -324,7 +324,9 @@ pub fn pick_profile(store: &Store, prompt: &str) -> Result<crate::domain::Profil
     Ok(all[idx].clone())
 }
 
-/// Pick a provider belonging to `profile` from a select menu.
+/// Pick a provider a profile may route through: its own providers plus every
+/// provider another profile has shared. Shared foreign providers are labelled
+/// with their owner so they are never mistaken for local ones.
 ///
 /// If only one provider exists it is returned directly, so "pick provider"
 /// flows stay fast and never feel like a dead end.
@@ -335,7 +337,7 @@ pub fn pick_provider(
 ) -> Result<crate::domain::Provider> {
     use dialoguer::{theme::ColorfulTheme, Select};
     let theme = ColorfulTheme::default();
-    let all = store.list_providers(profile.id.as_str())?;
+    let all = store.list_providers_for(profile.id.as_str())?;
     if all.is_empty() {
         bail!(
             "no providers configured for {:?} yet; add one first",
@@ -347,7 +349,14 @@ pub fn pick_provider(
     }
     let labels: Vec<String> = all
         .iter()
-        .map(|p| format!("{}  ({})", p.name, p.base_url))
+        .map(|p| {
+            let base = format!("{}  ({})", p.name, p.base_url);
+            if p.shared {
+                format!("{base} [shared]")
+            } else {
+                base
+            }
+        })
         .collect();
     let idx = Select::with_theme(&theme)
         .with_prompt(prompt)

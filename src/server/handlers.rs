@@ -1783,6 +1783,7 @@ mod economy_tests {
                     kind: ProviderKind::OpenAI,
                     extra_headers: Default::default(),
                     masking_server_id: None,
+                    shared: false,
                 },
             )
             .unwrap();

@@ -215,6 +215,7 @@ mod tests {
             extra_headers: BTreeMap::new(),
             masking_server_id: None,
             masking_server: None,
+            shared: false,
         };
         let entry = RouteEntry {
             id: 1,

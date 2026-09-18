@@ -78,6 +78,9 @@ pub struct ProviderSpec {
     /// Extra headers sent with every upstream request.
     #[serde(default)]
     pub extra_headers: std::collections::BTreeMap<String, String>,
+    /// Publish this provider to every profile on the instance.
+    #[serde(default)]
+    pub shared: Option<bool>,
 }
 
 /// One proxy and the routes under it.
@@ -242,6 +245,7 @@ fn seed(
                 kind: parse_kind(spec.kind.as_deref())?,
                 extra_headers: spec.extra_headers.clone(),
                 masking_server_id: None,
+                shared: spec.shared.unwrap_or(false),
             },
         )?;
         provider_ids.insert(spec.name.clone(), provider.id);

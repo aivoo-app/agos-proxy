@@ -77,6 +77,12 @@ pub struct Provider {
     /// [`Provider::masking_server_id`] for the explicit binding alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub masking_server: Option<MaskingServer>,
+    /// Whether this provider is published to the whole instance. A shared
+    /// provider can be referenced from any profile's route chain (the owning
+    /// profile's credentials are used, never exposed), while only its owner can
+    /// edit or delete it.
+    #[serde(default)]
+    pub shared: bool,
 }
 
 /// An HTTP egress hop ("mask") that upstream requests are relayed through.
@@ -121,6 +127,11 @@ pub struct MaskingServer {
     pub last_verified_country: Option<String>,
     /// Unix millis of the last successful probe.
     pub last_verified_at: Option<i64>,
+    /// Whether this mask is published to the whole instance. A shared mask may
+    /// carry egress for shared providers used by other profiles; its secret
+    /// still never leaves the store.
+    #[serde(default)]
+    pub shared: bool,
 }
 
 /// A named group of routes a profile exposes, e.g. `Programmer`.

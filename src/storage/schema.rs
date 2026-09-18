@@ -35,7 +35,8 @@ pub const SCHEMA: &str = "
         base_url      TEXT NOT NULL,
         auth_token    BLOB NOT NULL,
         kind          TEXT NOT NULL,
-        extra_headers TEXT NOT NULL
+        extra_headers TEXT NOT NULL,
+        shared        INTEGER NOT NULL DEFAULT 0
     );
 
     -- Egress masks: HTTP hops that upstream requests are sent through, so a
@@ -54,7 +55,8 @@ pub const SCHEMA: &str = "
         last_verified_ip    TEXT,
         last_verified_asn   TEXT,
         last_verified_country TEXT,
-        last_verified_at    INTEGER
+        last_verified_at    INTEGER,
+        shared              INTEGER NOT NULL DEFAULT 0
     );
 
     CREATE UNIQUE INDEX IF NOT EXISTS idx_masks_profile ON masking_servers(profile_id, name);
@@ -168,6 +170,16 @@ pub fn migrate_columns(conn: &rusqlite::Connection) -> anyhow::Result<()> {
         conn,
         "route_entries",
         "cooldown_until",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+
+    // Cross-profile resource sharing: 1 = the resource is published to the
+    // whole instance and may be referenced from any profile's route chain.
+    ensure_column(conn, "providers", "shared", "INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(
+        conn,
+        "masking_servers",
+        "shared",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
 

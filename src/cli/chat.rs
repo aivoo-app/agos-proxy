@@ -388,6 +388,7 @@ mod tests {
                     kind: ProviderKind::OpenAI,
                     extra_headers: BTreeMap::new(),
                     masking_server_id: None,
+                    shared: false,
                 },
             )
             .expect("create provider");

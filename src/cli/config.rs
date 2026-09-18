@@ -73,6 +73,9 @@ pub struct PortableProvider {
     pub extra_headers: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub masking_server: Option<String>,
+    /// Sharing flag; `false` when the bundle predates sharing.
+    #[serde(default)]
+    pub shared: bool,
 }
 
 /// An egress mask, exported with its secret (the whole file is sealed).
@@ -86,6 +89,9 @@ pub struct PortableMask {
     pub max_body_bytes: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_egress_ip: Option<String>,
+    /// Sharing flag; `false` when the bundle predates sharing.
+    #[serde(default)]
+    pub shared: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -198,6 +204,7 @@ pub fn export_bundle(store: &Store, profile: &crate::domain::Profile) -> Result<
             secret: m.secret.clone(),
             max_body_bytes: m.max_body_bytes,
             expected_egress_ip: m.expected_egress_ip.clone(),
+            shared: m.shared,
         })
         .collect();
     let default_masking_server = profile
@@ -215,6 +222,7 @@ pub fn export_bundle(store: &Store, profile: &crate::domain::Profile) -> Result<
             kind: p.kind,
             extra_headers: p.extra_headers.clone(),
             masking_server: p.masking_server.as_ref().map(|m| m.name.clone()),
+            shared: p.shared,
         })
         .collect();
 
@@ -321,6 +329,7 @@ pub fn import_bundle(store: &Store, bundle: &PortableProfile, name: &str) -> Res
                 secret: m.secret.clone(),
                 max_body_bytes: m.max_body_bytes,
                 expected_egress_ip: m.expected_egress_ip.clone(),
+                shared: m.shared,
             },
         )?;
         mask_ids.insert(created.name.clone(), created.id);
@@ -348,6 +357,7 @@ pub fn import_bundle(store: &Store, bundle: &PortableProfile, name: &str) -> Res
                 kind: p.kind,
                 extra_headers: p.extra_headers.clone(),
                 masking_server_id,
+                shared: p.shared,
             },
         )?;
         provider_ids.insert(created.name.clone(), created.id);
@@ -418,6 +428,7 @@ mod tests {
                     kind: ProviderKind::OpenAI,
                     extra_headers: BTreeMap::new(),
                     masking_server_id: None,
+                    shared: false,
                 },
             )
             .unwrap();
@@ -458,6 +469,7 @@ mod tests {
                     secret: "s3cret".into(),
                     max_body_bytes: 0,
                     expected_egress_ip: None,
+                    shared: false,
                 },
             )
             .unwrap();
@@ -473,6 +485,7 @@ mod tests {
                     kind: providers[0].kind,
                     extra_headers: providers[0].extra_headers.clone(),
                     masking_server_id: Some(mask.id),
+                    shared: false,
                 },
             )
             .unwrap();

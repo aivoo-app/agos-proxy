@@ -189,6 +189,7 @@ fn add_provider(store: &Store, theme: &ColorfulTheme, profile: &Profile) -> Resu
             kind,
             extra_headers,
             masking_server_id: None,
+            shared: false,
         },
     )?;
     println!(

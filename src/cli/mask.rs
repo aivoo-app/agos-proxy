@@ -73,6 +73,9 @@ pub enum MaskArgs {
         /// Expected egress IP; `none` clears the expectation.
         #[arg(long)]
         expected_egress_ip: Option<String>,
+        /// Publish (or unpublish) this mask across every profile.
+        #[arg(long, default_missing_value = "true", num_args = 0..=1)]
+        share: Option<bool>,
     },
     /// Make a mask the profile-wide fallback for providers without their own.
     SetDefault {
@@ -154,6 +157,7 @@ pub fn run(args: MaskArgs) -> Result<()> {
             secret,
             max_body_bytes,
             expected_egress_ip,
+            share,
         } => set(
             &store,
             profile,
@@ -163,6 +167,7 @@ pub fn run(args: MaskArgs) -> Result<()> {
             secret,
             max_body_bytes,
             expected_egress_ip,
+            share,
         ),
         MaskArgs::SetDefault { profile, mask } => set_default(&store, profile, mask),
         MaskArgs::Delete { profile, mask, yes } => delete(&store, profile, mask, yes),
@@ -241,6 +246,7 @@ fn add(
             secret,
             max_body_bytes,
             expected_egress_ip,
+            shared: false,
         }
     } else {
         let name = match name {
@@ -280,6 +286,7 @@ fn add(
             secret,
             max_body_bytes: max_body.trim().parse().unwrap_or(0),
             expected_egress_ip: None,
+            shared: false,
         }
     };
 
@@ -307,8 +314,8 @@ fn list(store: &crate::storage::Store, profile: Option<String>) -> Result<()> {
     }
     let default_id = profile.default_masking_server_id;
     println!(
-        "{:<16} {:<12} {:<40} {:>10} {:<16} ENDPOINT",
-        "ID", "KIND", "NAME", "MAX BODY", "EGRESS IP"
+        "{:<16} {:<12} {:<40} {:>10} {:<16} {:<7} ENDPOINT",
+        "ID", "KIND", "NAME", "MAX BODY", "EGRESS IP", "SHARED"
     );
     for m in masks {
         let default_mark = if Some(m.id) == default_id {
@@ -317,7 +324,7 @@ fn list(store: &crate::storage::Store, profile: Option<String>) -> Result<()> {
             ""
         };
         println!(
-            "{:<16} {:<12} {:<40} {:>10} {:<16} {}",
+            "{:<16} {:<12} {:<40} {:>10} {:<16} {:<7} {}",
             m.id,
             m.kind,
             format!("{}{}", m.name, default_mark),
@@ -327,6 +334,7 @@ fn list(store: &crate::storage::Store, profile: Option<String>) -> Result<()> {
                 "-".to_string()
             },
             m.last_verified_ip.as_deref().unwrap_or("-"),
+            if m.shared { "yes" } else { "no" },
             m.endpoint_url
         );
     }
@@ -344,6 +352,7 @@ fn set(
     secret: Option<String>,
     max_body_bytes: Option<i64>,
     expected_egress_ip: Option<String>,
+    share: Option<bool>,
 ) -> Result<()> {
     let theme = ColorfulTheme::default();
     let profile = resolve_profile(store, profile)?;
@@ -369,6 +378,8 @@ fn set(
         None => current.expected_egress_ip.clone(),
     };
 
+    let shared = share.unwrap_or(current.shared);
+
     store.update_masking_server(
         current.id,
         NewMaskingServer {
@@ -378,6 +389,7 @@ fn set(
             secret: new_secret,
             max_body_bytes: max_body,
             expected_egress_ip: expected,
+            shared,
         },
     )?;
     println!(

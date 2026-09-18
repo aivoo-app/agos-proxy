@@ -435,6 +435,7 @@ mod tests {
                 extra_headers: extra,
                 masking_server_id: None,
                 masking_server: None,
+                shared: false,
             },
             entry: RouteEntry {
                 id: 1,
