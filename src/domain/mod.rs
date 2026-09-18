@@ -18,6 +18,6 @@
 pub mod model;
 
 pub use model::{
-    KeyStats, MaskingServer, ModelStatus, Profile, Provider, ProviderKind, Proxy, Route,
-    RouteCapabilities, RouteEntry, RoutingStrategy, UsageRecord, UsageStats,
+    KeyStats, MaskingServer, ModelStatus, Profile, PromptCachePolicy, Provider, ProviderKind, Proxy,
+    Route, RouteCapabilities, RouteEntry, RoutingStrategy, UsageRecord, UsageStats,
 };
