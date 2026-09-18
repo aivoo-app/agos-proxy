@@ -20,6 +20,7 @@ This document contains the help content for the `agos-proxy` command-line progra
 * [`agos-proxy provider list`↴](#agos-proxy-provider-list)
 * [`agos-proxy provider edit`↴](#agos-proxy-provider-edit)
 * [`agos-proxy provider delete`↴](#agos-proxy-provider-delete)
+* [`agos-proxy provider share`↴](#agos-proxy-provider-share)
 * [`agos-proxy mask`↴](#agos-proxy-mask)
 * [`agos-proxy mask add`↴](#agos-proxy-mask-add)
 * [`agos-proxy mask list`↴](#agos-proxy-mask-list)
@@ -39,6 +40,7 @@ This document contains the help content for the `agos-proxy` command-line progra
 * [`agos-proxy route edit`↴](#agos-proxy-route-edit)
 * [`agos-proxy route delete`↴](#agos-proxy-route-delete)
 * [`agos-proxy route economy`↴](#agos-proxy-route-economy)
+* [`agos-proxy route share`↴](#agos-proxy-route-share)
 * [`agos-proxy route model`↴](#agos-proxy-route-model)
 * [`agos-proxy route model add`↴](#agos-proxy-route-model-add)
 * [`agos-proxy route model remove`↴](#agos-proxy-route-model-remove)
@@ -219,6 +221,7 @@ Manage providers (upstreams + credentials) for a profile
 * `list` — List the providers configured on a profile
 * `edit` — Edit a provider's settings interactively
 * `delete` — Remove a provider
+* `share` — Publish (or unpublish) a provider across every profile on this instance
 
 
 
@@ -238,6 +241,10 @@ Add a provider to a profile (interactive wizard, or flag-driven)
 * `--description <DESCRIPTION>` — Free-text description
 * `--header <HEADERS>` — Extra header sent upstream, as `Name: value` (repeatable)
 * `--mask <MASK>` — Egress mask to bind this key to (see `agos-proxy mask --help`)
+* `--share <SHARE>` — Publish this provider to every profile on this instance. Only the owning profile can edit it; other profiles may route through it
+
+  Possible values: `true`, `false`
+
 
 
 
@@ -276,6 +283,23 @@ Remove a provider
 * `--profile <PROFILE>` — Name of the owning profile
 * `--provider <PROVIDER>` — Name of the provider to remove
 * `--yes` — Skip the confirmation prompt (for scripts/CI)
+
+
+
+## `agos-proxy provider share`
+
+Publish (or unpublish) a provider across every profile on this instance
+
+**Usage:** `agos-proxy provider share [OPTIONS]`
+
+###### **Options:**
+
+* `--profile <PROFILE>` — Name of the owning profile
+* `--provider <PROVIDER>` — Name of the provider to publish
+* `--share <SHARE>` — `--share true` publishes; `--share false` unpublishes. Omit to ask
+
+  Possible values: `true`, `false`
+
 
 
 
@@ -344,6 +368,10 @@ Change a mask's settings
 * `--secret <SECRET>` — New shared secret (empty to keep the current one)
 * `--max-body-bytes <MAX_BODY_BYTES>`
 * `--expected-egress-ip <EXPECTED_EGRESS_IP>` — Expected egress IP; `none` clears the expectation
+* `--share <SHARE>` — Publish (or unpublish) this mask across every profile
+
+  Possible values: `true`, `false`
+
 
 
 
@@ -479,6 +507,7 @@ Manage routes and their ordered model chains
 * `edit` — Edit a route's name, description and routing strategy
 * `delete` — Remove a route and its model chain
 * `economy` — Tune economy limits: max_tokens clamp + exact-cache TTL
+* `share` — Publish (or unpublish) a route so other profiles can add it to their own chains (route-as-model)
 * `model` — Manage the models in a route's fallback chain
 
 
@@ -547,6 +576,24 @@ Tune economy limits: max_tokens clamp + exact-cache TTL
 
 
 
+## `agos-proxy route share`
+
+Publish (or unpublish) a route so other profiles can add it to their own chains (route-as-model)
+
+**Usage:** `agos-proxy route share [OPTIONS]`
+
+###### **Options:**
+
+* `--profile <PROFILE>` — Name of the owning profile
+* `--proxy <PROXY>` — Name of the owning proxy
+* `--route <ROUTE>` — Name of the route (skips the route picker)
+* `--share <SHARE>` — `--share true` publishes; `--share false` unpublishes. Omit to ask
+
+  Possible values: `true`, `false`
+
+
+
+
 ## `agos-proxy route model`
 
 Manage the models in a route's fallback chain
@@ -578,6 +625,7 @@ Add a model to a route's chain
 * `--weight <WEIGHT>` — Weighted-strategy share; defaults to 1.0
 * `--price <PRICE>` — Blended price USD/1M tokens for Economy sorting
 * `--yes` — Skip the capability prompts (defaults to no capabilities; use `route model edit` later if the model supports tools/vision/JSON)
+* `--from-route <FROM_ROUTE>` — Add another route as a model instead of a provider model. Accepts `<proxy>/<route>` (same profile) or `<profile>/<proxy>/<route>` for a shared foreign route. Only another profile's *shared* routes work
 
 
 
