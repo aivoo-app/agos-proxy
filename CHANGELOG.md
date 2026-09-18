@@ -6,6 +6,64 @@ This project adheres to [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and uses the Rust ecosystem convention of a `semver`-compatible version in
 `Cargo.toml` mirrored by `src/lib.rs`.
 
+## [0.1.7] - 2026-09-18
+
+### Added
+
+- **Cross-profile resource sharing:** providers, egress masks, and routes gain
+  a `shared` flag so an owner profile can publish a resource to the whole
+  instance. Any profile may *use* a shared resource at runtime, but only the
+  owner may edit it, and secrets never leave the encrypted store. CLI:
+  `provider add/edit --share`, `mask add/set --share`, `route share`,
+  share-aware pickers that list foreign shared resources, and bootstrap JSON
+  support.
+- **Routes as models:** a route entry may reference another route
+  (`--from-route <proxy>/<route>` or `<profile>/<proxy>/<route>` for shared
+  foreign routes) instead of a provider model. Resolution expands nested
+  chains recursively with cycle detection, a depth cap, and the share check
+  applied at every hop. Capability filtering uses the union of the target
+  route's leaves; health probing skips nested entries (their leaves are
+  probed directly); usage is attributed to the leaf entry; nested entries
+  render as `→ <profile>/<proxy>/<route>` in the CLI.
+- **Provider-native prompt caching:** new route-level `prompt_cache = off |
+  auto` setting. Anthropic requests get ephemeral `cache_control` breakpoints
+  on the system block array and the last user content block (client-supplied
+  `cache_control` is honoured, never double-injected); OpenAI requests get a
+  stable proxy-derived `prompt_cache_key` for cache affinity; Google forwards
+  `cachedContent` when the caller supplies it.
+- **Cached-token accounting:** `usage_log` now records provider-reported
+  cached prompt tokens (Anthropic `cache_read_input_tokens`, OpenAI
+  `cached_tokens`), surfaced through `usage stats` so the economy story can
+  show prompt-cache savings.
+
+### Changed
+
+- Capability flags are now **inferred from the model id at entry creation**,
+  so common tool/vision/JSON-capable families advertise support out of the
+  box instead of defaulting to all-off.
+- The exact-match economy cache now skips image payloads (never hashed into
+  SQLite blobs) and keys on route + prompt-cache mode in addition to the
+  request hash.
+
+### Fixed
+
+- Empty target lists now distinguish their cause: when entries exist but none
+  declares a capability the request needs, the proxy returns
+  `400 capability_unavailable` naming the missing capability instead of the
+  misleading `503 "no healthy providers available for this route"`. Plain
+  503s are kept for genuinely-down providers so clients still back off. This
+  fixes image requests "failing" on healthy routes whose entries under-claimed
+  vision, including one level up when the route is used as a model.
+- An upstream image refusal now marks the entry `vision = false` (a capability
+  miss) instead of `Unhealthy`, so one over-claimed flag never takes a working
+  key dark — the next image request skips the entry without rediscovery.
+- No outbound adapter silently drops image parts: unsupported adapters reject
+  with the capability-skip marker so failover moves on to a capable entry.
+- The old `route_entries` table shape (non-nullable `provider_id`, no
+  `target_route_id`) is rebuilt once on open with foreign keys held off so the
+  `usage_log ON DELETE CASCADE` hazard cannot wipe history; the migration is
+  covered by a regression test asserting usage rows survive.
+
 ## [0.1.3] - 2026-09-16
 
 ### Fixed
