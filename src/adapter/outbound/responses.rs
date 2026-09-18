@@ -220,7 +220,8 @@ mod tests {
         let entry = RouteEntry {
             id: 1,
             route_id: 1,
-            provider_id: 1,
+            provider_id: Some(1),
+            target_route_id: None,
             model_id: model.into(),
             priority: 1,
             weight: 1.0,
@@ -233,6 +234,7 @@ mod tests {
             provider,
             entry,
             identity: None,
+            prompt_cache: Default::default(),
         }
     }
 
