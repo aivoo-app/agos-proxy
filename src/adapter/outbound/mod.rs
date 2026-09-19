@@ -13,6 +13,7 @@
 pub mod anthropic;
 pub mod google;
 pub mod openai;
+pub mod prompt_cache;
 pub mod responses;
 
 use std::collections::BTreeMap;
@@ -130,7 +131,29 @@ pub fn is_supported(_kind: ProviderKind) -> bool {
 
 /// Build the upstream request for a target: URL, headers, and a body already
 /// shaped for the provider. `stream` selects the streaming endpoint variant.
+///
+/// The returned body has the route's prompt-cache policy applied last, so the
+/// translators stay pure and every provider dialect is handled in one place.
 pub fn build_upstream_request(
+    target: &Target,
+    chat_req: &ChatRequest,
+    stream: bool,
+) -> Result<(String, BTreeMap<String, String>, serde_json::Value)> {
+    let (url, headers, mut body) = build_native_request(target, chat_req, stream)?;
+    let markers = prompt_cache::apply(target.provider.kind, target.prompt_cache, &mut body);
+    if markers > 0 {
+        tracing::debug!(
+            provider = %target.provider.name,
+            model = %target.entry.model_id,
+            markers,
+            "applied prompt-cache markers"
+        );
+    }
+    Ok((url, headers, body))
+}
+
+/// Provider-native request building, without the prompt-cache pass.
+fn build_native_request(
     target: &Target,
     chat_req: &ChatRequest,
     stream: bool,

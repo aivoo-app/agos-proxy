@@ -20,8 +20,8 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::crypto::MasterKey;
 
 use crate::domain::{
-    KeyStats, MaskingServer, ModelStatus, Profile, Provider, ProviderKind, Proxy, Route,
-    RouteCapabilities, RouteEntry, RoutingStrategy, UsageRecord, UsageStats,
+    KeyStats, MaskingServer, ModelStatus, Profile, PromptCachePolicy, Provider, ProviderKind, Proxy,
+    Route, RouteCapabilities, RouteEntry, RoutingStrategy, UsageRecord, UsageStats,
 };
 
 /// Intermediate provider row, used to defer decryption out of the rusqlite closure.
@@ -35,6 +35,7 @@ struct RawProvider {
     kind_tag: String,
     extra_json: String,
     masking_server_id: Option<i64>,
+    shared: bool,
 }
 
 /// Intermediate masking-server row, used to defer secret decryption out of the
@@ -52,13 +53,14 @@ struct RawMaskingServer {
     last_verified_asn: Option<String>,
     last_verified_country: Option<String>,
     last_verified_at: Option<i64>,
+    shared: bool,
 }
 
 /// The [`MaskingServer`] column list, optionally qualified with a table alias
 /// (e.g. `"m."`). Kept in one place so every query reads the same shape and the
 /// row indices handed to [`raw_mask_from_row`] stay in sync.
 pub(crate) fn mask_columns(prefix: &str) -> String {
-    const COLS: [&str; 12] = [
+    const COLS: [&str; 13] = [
         "id",
         "profile_id",
         "name",
@@ -71,6 +73,7 @@ pub(crate) fn mask_columns(prefix: &str) -> String {
         "last_verified_asn",
         "last_verified_country",
         "last_verified_at",
+        "shared",
     ];
     COLS.iter()
         .map(|c| format!("{prefix}{c}"))
@@ -102,6 +105,7 @@ fn raw_mask_from_row(
         last_verified_asn: row.get(base + 9)?,
         last_verified_country: row.get(base + 10)?,
         last_verified_at: row.get(base + 11)?,
+        shared: row.get::<_, Option<i64>>(base + 12)?.unwrap_or(0) != 0,
     }))
 }
 
@@ -186,12 +190,12 @@ fn fresh_token() -> Result<String> {
 
 /// Column list for a provider joined to its egress mask.
 ///
-/// Fixed prefix 0..8 is the provider itself (with the binding at 8); index 9
-/// onwards are the mask columns consumed by [`raw_mask_from_row`].
+/// Fixed prefix 0..9 is the provider itself (binding at 8, sharing flag at 9);
+/// index 10 onwards are the mask columns consumed by [`raw_mask_from_row`].
 fn provider_columns() -> String {
     format!(
         "p.id, p.profile_id, p.name, p.description, p.base_url, p.auth_token, \
-         p.kind, p.extra_headers, p.masking_server_id, {}",
+         p.kind, p.extra_headers, p.masking_server_id, p.shared, {}",
         mask_columns("m.")
     )
 }
@@ -223,13 +227,57 @@ fn raw_provider_at(row: &rusqlite::Row<'_>, base: usize) -> rusqlite::Result<Raw
             kind_tag: row.get(base + 6)?,
             extra_json: row.get(base + 7)?,
             masking_server_id: row.get(base + 8)?,
+            shared: row.get::<_, Option<i64>>(base + 9)?.unwrap_or(0) != 0,
         },
-        raw_mask_from_row(row, base + 9)?,
+        raw_mask_from_row(row, base + 10)?,
     ))
 }
 
 fn raw_provider_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawProviderRow> {
     raw_provider_at(row, 0)
+}
+
+/// Read one `routes` row (the nine-column list used by every route query).
+fn map_route_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Route> {
+    let strat_tag: String = row.get(4)?;
+    Ok(Route {
+        id: row.get(0)?,
+        proxy_id: row.get(1)?,
+        name: row.get(2)?,
+        description: row.get(3)?,
+        strategy: strategy_from_tag(&strat_tag).expect("invalid strategy in store"),
+        identity: row.get(5)?,
+        max_tokens: row.get::<_, Option<i64>>(6)?.unwrap_or(0).max(0) as u32,
+        cache_ttl_secs: row.get::<_, Option<i64>>(7)?.unwrap_or(0).max(0),
+        shared: row.get::<_, Option<i64>>(8)?.unwrap_or(0) != 0,
+        prompt_cache: PromptCachePolicy::from_tag(
+            &row.get::<_, Option<String>>(9)?.unwrap_or_default(),
+        ),
+    })
+}
+
+/// Read one `route_entries` row (the eleven-column list used by every
+/// route-entry query).
+fn map_route_entry_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RouteEntry> {
+    let status_tag_owned: String = row.get(7)?;
+    let caps_json: String = row.get(8)?;
+    Ok(RouteEntry {
+        id: row.get(0)?,
+        route_id: row.get(1)?,
+        provider_id: row.get(2)?,
+        target_route_id: row.get(3)?,
+        model_id: row.get(4)?,
+        priority: row.get(5)?,
+        weight: row.get(6)?,
+        status: status_from_tag(&status_tag_owned).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "invalid status in store, defaulting to Unhealthy");
+            ModelStatus::Unhealthy
+        }),
+        capabilities: serde_json::from_str::<RouteCapabilities>(&caps_json)
+            .expect("invalid capabilities in store"),
+        price_per_1m: row.get::<_, Option<f64>>(9)?.unwrap_or(0.0).max(0.0),
+        cooldown_until: row.get::<_, Option<i64>>(10)?.unwrap_or(0),
+    })
 }
 
 fn now_millis() -> i64 {
@@ -266,6 +314,8 @@ pub struct NewProvider {
     pub extra_headers: std::collections::BTreeMap<String, String>,
     /// Egress mask to bind this provider to; `None` = use the profile default.
     pub masking_server_id: Option<i64>,
+    /// Publish this provider to every profile (see [`Provider::shared`]).
+    pub shared: bool,
 }
 
 /// Details needed to register a new [`MaskingServer`] (an egress hop).
@@ -279,6 +329,8 @@ pub struct NewMaskingServer {
     /// Body-size ceiling above which requests skip this hop (0 = no limit).
     pub max_body_bytes: i64,
     pub expected_egress_ip: Option<String>,
+    /// Publish this mask to every profile (see [`MaskingServer::shared`]).
+    pub shared: bool,
 }
 
 /// Details needed to append one request to the usage log.
@@ -293,6 +345,9 @@ pub struct NewUsage {
     pub latency_ms: i64,
     pub prompt_tokens: Option<i64>,
     pub completion_tokens: Option<i64>,
+    /// Input tokens the upstream billed at its cache-read rate, when it reported
+    /// them. `None` means "the upstream did not say", not "nothing was cached".
+    pub cached_prompt_tokens: Option<i64>,
 }
 
 /// Handle to the on-disk store.
@@ -325,9 +380,11 @@ impl Store {
     /// Open the store at `path`, creating the file and schema if needed.
     pub fn open(path: PathBuf) -> Result<Self> {
         let conn = Connection::open(&path).context("opening the database file")?;
-        conn.execute_batch(schema::SCHEMA)
+        conn.execute_batch(schema::schema_sql().as_str())
             .context("applying the database schema")?;
         schema::migrate_columns(&conn).context("migrating the database schema")?;
+        schema::migrate_route_entries(&conn)
+            .context("migrating the route_entries table for nested routes")?;
         let store = Store {
             conn: Mutex::new(conn),
             path,
@@ -340,7 +397,7 @@ impl Store {
     /// Open an in-memory store, useful for tests.
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
-        conn.execute_batch(schema::SCHEMA)?;
+        conn.execute_batch(schema::schema_sql().as_str())?;
         schema::migrate_columns(&conn)?;
         let store = Store {
             conn: Mutex::new(conn),
@@ -646,8 +703,8 @@ impl Store {
         let encrypted_token = crate::crypto::encrypt(&key, &spec.auth_token)?;
         self.conn()
             .execute(
-                "INSERT INTO providers (profile_id, name, description, base_url, auth_token, kind, extra_headers, masking_server_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO providers (profile_id, name, description, base_url, auth_token, kind, extra_headers, masking_server_id, shared)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 (
                     profile_id,
                     spec.name.as_str(),
@@ -657,6 +714,7 @@ impl Store {
                     provider_kind_tag(spec.kind),
                     serde_json::to_string(&spec.extra_headers).expect("BTreeMap<String,String> always serializable"),
                     spec.masking_server_id,
+                    spec.shared as i64,
                 ),
             )
             .context("inserting the provider")?;
@@ -683,6 +741,7 @@ impl Store {
             last_verified_asn: raw.last_verified_asn,
             last_verified_country: raw.last_verified_country,
             last_verified_at: raw.last_verified_at,
+            shared: raw.shared,
         })
     }
 
@@ -708,6 +767,7 @@ impl Store {
             .expect("invalid provider headers in store"),
             masking_server_id: raw.masking_server_id,
             masking_server,
+            shared: raw.shared,
         })
     }
 
@@ -752,6 +812,46 @@ impl Store {
         raws.into_iter()
             .map(|(provider, mask)| self.build_provider(provider, mask))
             .collect()
+    }
+
+    /// Every provider a profile may route through: its own providers plus every
+    /// provider another profile has shared. Owned providers come first, then
+    /// shared ones ordered by name, so pickers read naturally.
+    pub fn list_providers_for(&self, profile_id: &str) -> Result<Vec<Provider>> {
+        let raws: Vec<RawProviderRow> = {
+            let conn = self.conn();
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {} FROM providers p {}
+                 WHERE p.profile_id = ?1 OR p.shared = 1
+                 ORDER BY (p.profile_id = ?1) DESC, p.name",
+                provider_columns(),
+                mask_join()
+            ))?;
+            let rows = stmt.query_map((profile_id,), raw_provider_from_row)?;
+            let mut out = Vec::new();
+            for item in rows {
+                out.push(item?);
+            }
+            out
+        };
+        raws.into_iter()
+            .map(|(provider, mask)| self.build_provider(provider, mask))
+            .collect()
+    }
+
+    /// Publish (or unpublish) a provider across the instance.
+    pub fn set_provider_shared(&self, provider_id: i64, shared: bool) -> Result<()> {
+        let changed = self
+            .conn()
+            .execute(
+                "UPDATE providers SET shared = ?1 WHERE id = ?2",
+                (shared as i64, provider_id),
+            )
+            .context("updating the provider's sharing flag")?;
+        if changed == 0 {
+            bail!("no provider matches id {provider_id}");
+        }
+        Ok(())
     }
 
     /// A single provider by id.
@@ -804,8 +904,8 @@ impl Store {
         self.conn()
             .execute(
                 "INSERT INTO masking_servers
-                    (profile_id, name, kind, endpoint_url, secret, max_body_bytes, expected_egress_ip)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    (profile_id, name, kind, endpoint_url, secret, max_body_bytes, expected_egress_ip, shared)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 (
                     profile_id,
                     spec.name.as_str(),
@@ -814,6 +914,7 @@ impl Store {
                     enc_secret,
                     spec.max_body_bytes.max(0),
                     spec.expected_egress_ip.as_deref(),
+                    spec.shared as i64,
                 ),
             )
             .context("inserting the masking server")?;
@@ -840,6 +941,44 @@ impl Store {
             out
         };
         raws.into_iter().map(|raw| self.build_mask(raw)).collect()
+    }
+
+    /// Every mask a profile may bind a shared provider through: its own masks
+    /// plus masks other profiles have shared. Owned masks come first.
+    pub fn list_masking_servers_for(&self, profile_id: &str) -> Result<Vec<MaskingServer>> {
+        let raws: Vec<RawMaskingServer> = {
+            let conn = self.conn();
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {} FROM masking_servers
+                 WHERE profile_id = ?1 OR shared = 1
+                 ORDER BY (profile_id = ?1) DESC, name",
+                mask_columns("")
+            ))?;
+            let rows = stmt.query_map((profile_id,), |row| {
+                raw_mask_from_row(row, 0).and_then(|m| m.ok_or(rusqlite::Error::InvalidQuery))
+            })?;
+            let mut out = Vec::new();
+            for item in rows {
+                out.push(item?);
+            }
+            out
+        };
+        raws.into_iter().map(|raw| self.build_mask(raw)).collect()
+    }
+
+    /// Publish (or unpublish) a mask across the instance.
+    pub fn set_mask_shared(&self, mask_id: i64, shared: bool) -> Result<()> {
+        let changed = self
+            .conn()
+            .execute(
+                "UPDATE masking_servers SET shared = ?1 WHERE id = ?2",
+                (shared as i64, mask_id),
+            )
+            .context("updating the mask's sharing flag")?;
+        if changed == 0 {
+            bail!("no masking server matches id {mask_id}");
+        }
+        Ok(())
     }
 
     /// A single mask by id.
@@ -899,8 +1038,8 @@ impl Store {
             .execute(
                 "UPDATE masking_servers
                  SET name = ?1, kind = ?2, endpoint_url = ?3, secret = ?4,
-                     max_body_bytes = ?5, expected_egress_ip = ?6
-                 WHERE id = ?7",
+                     max_body_bytes = ?5, expected_egress_ip = ?6, shared = ?7
+                 WHERE id = ?8",
                 (
                     spec.name.as_str(),
                     spec.kind.as_str(),
@@ -908,6 +1047,7 @@ impl Store {
                     enc_secret,
                     spec.max_body_bytes.max(0),
                     spec.expected_egress_ip.as_deref(),
+                    spec.shared as i64,
                     id,
                 ),
             )
@@ -991,7 +1131,7 @@ impl Store {
         let changed = self
             .conn()
             .execute(
-                "UPDATE providers SET name = ?1, description = ?2, base_url = ?3, auth_token = ?4, kind = ?5, extra_headers = ?6, masking_server_id = ?7 WHERE id = ?8",
+                "UPDATE providers SET name = ?1, description = ?2, base_url = ?3, auth_token = ?4, kind = ?5, extra_headers = ?6, masking_server_id = ?7, shared = ?8 WHERE id = ?9",
                 (
                     spec.name.as_str(),
                     spec.description.as_deref(),
@@ -1000,6 +1140,7 @@ impl Store {
                     provider_kind_tag(spec.kind),
                     serde_json::to_string(&spec.extra_headers).expect("BTreeMap<String,String> always serializable"),
                     spec.masking_server_id,
+                    spec.shared as i64,
                     id,
                 ),
             )
@@ -1140,7 +1281,75 @@ impl Store {
             identity: identity.map(|i| i.to_string()),
             max_tokens: 0,
             cache_ttl_secs: 0,
+            shared: false,
+            prompt_cache: PromptCachePolicy::default(),
         })
+    }
+
+    /// Publish (or unpublish) a route across the instance, so other profiles
+    /// may add it to their own chains (route-as-model).
+    pub fn set_route_shared(&self, route_id: i64, shared: bool) -> Result<()> {
+        let changed = self
+            .conn()
+            .execute(
+                "UPDATE routes SET shared = ?1 WHERE id = ?2",
+                (shared as i64, route_id),
+            )
+            .context("updating the route's sharing flag")?;
+        if changed == 0 {
+            bail!("no route matches id {route_id}");
+        }
+        Ok(())
+    }
+
+    /// Set a route's prompt-cache policy (`auto` | `off`).
+    pub fn set_route_prompt_cache(&self, route_id: i64, policy: PromptCachePolicy) -> Result<()> {
+        let changed = self
+            .conn()
+            .execute(
+                "UPDATE routes SET prompt_cache = ?1 WHERE id = ?2",
+                (policy.tag(), route_id),
+            )
+            .context("updating the route's prompt-cache policy")?;
+        if changed == 0 {
+            bail!("no route matches id {route_id}");
+        }
+        Ok(())
+    }
+
+    /// Clear (or restore) the `vision` flag on a route entry.
+    ///
+    /// Used when an upstream answers that it cannot serve images *at all*: the
+    /// entry is not sick — it serves text fine — so instead of parking a working
+    /// key the router records the missing capability here. That entry is then
+    /// skipped for image requests while every other request keeps routing to it.
+    pub fn set_route_entry_vision(&self, entry_id: i64, vision: bool) -> Result<()> {
+        let conn = self.conn();
+        let caps_json: Option<String> = conn
+            .query_row(
+                "SELECT capabilities FROM route_entries WHERE id = ?1",
+                (entry_id,),
+                |row| row.get(0),
+            )
+            .optional()
+            .context("reading the route model capabilities")?;
+        let Some(caps_json) = caps_json else {
+            return Ok(());
+        };
+        let mut caps: RouteCapabilities = serde_json::from_str(&caps_json).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "invalid capabilities in store, resetting to defaults");
+            RouteCapabilities::default()
+        });
+        if caps.vision == vision {
+            return Ok(());
+        }
+        caps.vision = vision;
+        conn.execute(
+            "UPDATE route_entries SET capabilities = ?1 WHERE id = ?2",
+            (serde_json::to_string(&caps)?, entry_id),
+        )
+        .context("updating the route model capabilities")?;
+        Ok(())
     }
 
     /// Remove a route and its model chain.
@@ -1193,21 +1402,9 @@ impl Store {
     pub fn list_routes(&self, proxy_id: i64) -> Result<Vec<Route>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT id, proxy_id, name, description, strategy, identity, max_tokens, cache_ttl_secs FROM routes WHERE proxy_id = ?1 ORDER BY name",
+            "SELECT id, proxy_id, name, description, strategy, identity, max_tokens, cache_ttl_secs, shared, prompt_cache FROM routes WHERE proxy_id = ?1 ORDER BY name",
         )?;
-        let rows = stmt.query_map((proxy_id,), |row| {
-            let strat_tag: String = row.get(4)?;
-            Ok(Route {
-                id: row.get(0)?,
-                proxy_id: row.get(1)?,
-                name: row.get(2)?,
-                description: row.get(3)?,
-                strategy: strategy_from_tag(&strat_tag).expect("invalid strategy in store"),
-                identity: row.get(5)?,
-                max_tokens: row.get::<_, Option<i64>>(6)?.unwrap_or(0).max(0) as u32,
-                cache_ttl_secs: row.get::<_, Option<i64>>(7)?.unwrap_or(0).max(0),
-            })
-        })?;
+        let rows = stmt.query_map((proxy_id,), map_route_row)?;
         let mut out = Vec::new();
         for item in rows {
             out.push(item?);
@@ -1219,21 +1416,37 @@ impl Store {
     pub fn get_route_named(&self, proxy_id: i64, name: &str) -> Result<Option<Route>> {
         self.conn()
             .query_row(
-                "SELECT id, proxy_id, name, description, strategy, identity, max_tokens, cache_ttl_secs FROM routes WHERE proxy_id = ?1 AND name = ?2",
+                "SELECT id, proxy_id, name, description, strategy, identity, max_tokens, cache_ttl_secs, shared, prompt_cache FROM routes WHERE proxy_id = ?1 AND name = ?2",
                 (proxy_id, name),
-                |row| {
-                    let strat_tag: String = row.get(4)?;
-                    Ok(Route {
-                        id: row.get(0)?,
-                        proxy_id: row.get(1)?,
-                        name: row.get(2)?,
-                        description: row.get(3)?,
-                        strategy: strategy_from_tag(&strat_tag).expect("invalid strategy in store"),
-                        identity: row.get(5)?,
-                        max_tokens: row.get::<_, Option<i64>>(6)?.unwrap_or(0).max(0) as u32,
-                        cache_ttl_secs: row.get::<_, Option<i64>>(7)?.unwrap_or(0).max(0),
-                    })
-                },
+                map_route_row,
+            )
+            .optional()
+            .map_err(|e| e.into())
+    }
+
+    /// Find a route by id, regardless of which profile owns it.
+    ///
+    /// Callers doing cross-profile work (route-as-model expansion) must still
+    /// verify the owning proxy's profile through [`Store::get_proxy`]; this
+    /// lookup deliberately does not scope by profile.
+    pub fn get_route_by_id(&self, id: i64) -> Result<Option<Route>> {
+        self.conn()
+            .query_row(
+                "SELECT id, proxy_id, name, description, strategy, identity, max_tokens, cache_ttl_secs, shared, prompt_cache FROM routes WHERE id = ?1",
+                (id,),
+                map_route_row,
+            )
+            .optional()
+            .map_err(|e| e.into())
+    }
+
+    /// The profile that owns a route (through its proxy).
+    pub fn route_owner_profile(&self, route_id: i64) -> Result<Option<String>> {
+        self.conn()
+            .query_row(
+                "SELECT p.profile_id FROM proxies p JOIN routes r ON r.proxy_id = p.id WHERE r.id = ?1",
+                (route_id,),
+                |row| row.get(0),
             )
             .optional()
             .map_err(|e| e.into())
@@ -1251,8 +1464,8 @@ impl Store {
     ) -> Result<RouteEntry> {
         let _ = self.conn()
             .execute(
-                "INSERT INTO route_entries (route_id, provider_id, model_id, priority, weight, status, capabilities, price_per_1m)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO route_entries (route_id, provider_id, target_route_id, model_id, priority, weight, status, capabilities, price_per_1m)
+                 VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8)",
                 (
                     route_id,
                     provider_id,
@@ -1268,13 +1481,57 @@ impl Store {
         Ok(RouteEntry {
             id: self.conn().last_insert_rowid(),
             route_id,
-            provider_id,
+            provider_id: Some(provider_id),
+            target_route_id: None,
             model_id: model_id.to_string(),
             priority,
             weight,
             status: ModelStatus::Healthy,
             capabilities,
             price_per_1m: default_price_for(model_id),
+            cooldown_until: 0,
+        })
+    }
+
+    /// Append a nested route to a route's fallback chain (route-as-model).
+    ///
+    /// `label` is the display name recorded in `model_id`, e.g.
+    /// `programmer/php-dev`; the router ignores it during expansion.
+    pub fn add_route_entry_ref(
+        &self,
+        route_id: i64,
+        target_route_id: i64,
+        label: &str,
+        priority: i32,
+        weight: f64,
+    ) -> Result<RouteEntry> {
+        let caps = RouteCapabilities::default();
+        let _ = self.conn()
+            .execute(
+                "INSERT INTO route_entries (route_id, provider_id, target_route_id, model_id, priority, weight, status, capabilities, price_per_1m)
+                 VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
+                (
+                    route_id,
+                    target_route_id,
+                    label,
+                    priority,
+                    weight,
+                    status_tag(ModelStatus::Healthy),
+                    serde_json::to_string(&caps).expect("RouteCapabilities always serializable"),
+                ),
+            )
+            .context("inserting the nested route entry")?;
+        Ok(RouteEntry {
+            id: self.conn().last_insert_rowid(),
+            route_id,
+            provider_id: None,
+            target_route_id: Some(target_route_id),
+            model_id: label.to_string(),
+            priority,
+            weight,
+            status: ModelStatus::Healthy,
+            capabilities: caps,
+            price_per_1m: 0.0,
             cooldown_until: 0,
         })
     }
@@ -1294,29 +1551,10 @@ impl Store {
     pub fn route_entries(&self, route_id: i64) -> Result<Vec<RouteEntry>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT id, route_id, provider_id, model_id, priority, weight, status, capabilities, price_per_1m, cooldown_until
+            "SELECT id, route_id, provider_id, target_route_id, model_id, priority, weight, status, capabilities, price_per_1m, cooldown_until
              FROM route_entries WHERE route_id = ?1 ORDER BY priority",
         )?;
-        let rows = stmt.query_map((route_id,), |row| {
-            let status_tag_owned: String = row.get(6)?;
-            let caps_json: String = row.get(7)?;
-            Ok(RouteEntry {
-                id: row.get(0)?,
-                route_id: row.get(1)?,
-                provider_id: row.get(2)?,
-                model_id: row.get(3)?,
-                priority: row.get(4)?,
-                weight: row.get(5)?,
-                status: status_from_tag(&status_tag_owned).unwrap_or_else(|e| {
-                    tracing::warn!(error = %e, "invalid status in store, defaulting to Unhealthy");
-                    ModelStatus::Unhealthy
-                }),
-                capabilities: serde_json::from_str::<RouteCapabilities>(&caps_json)
-                    .expect("invalid capabilities in store"),
-                price_per_1m: row.get::<_, Option<f64>>(8)?.unwrap_or(0.0).max(0.0),
-                cooldown_until: row.get::<_, Option<i64>>(9)?.unwrap_or(0),
-            })
-        })?;
+        let rows = stmt.query_map((route_id,), map_route_entry_row)?;
         let mut out = Vec::new();
         for item in rows {
             out.push(item?);
@@ -1408,14 +1646,15 @@ impl Store {
         let raws: Vec<(RouteEntry, RawProviderRow)> = {
             let conn = self.conn();
             let mut stmt = conn.prepare(&format!(
-                "SELECT e.id, e.route_id, e.provider_id, e.model_id, e.priority,
+                "SELECT e.id, e.route_id, e.provider_id, e.target_route_id, e.model_id, e.priority,
                         e.weight, e.status, e.capabilities, e.price_per_1m,
                         e.cooldown_until,
                         {}
                  FROM route_entries e
                  JOIN providers p ON p.id = e.provider_id
                  {}
-                 WHERE e.status != ?1 AND e.status != ?2",
+                 WHERE e.status != ?1 AND e.status != ?2
+                   AND e.provider_id IS NOT NULL",
                 provider_columns(),
                 mask_join()
             ))?;
@@ -1425,25 +1664,8 @@ impl Store {
                     status_tag(ModelStatus::Disabled),
                 ],
                 |row| {
-                    let status_tag_owned: String = row.get(6)?;
-                    let caps_json: String = row.get(7)?;
-                    let entry = RouteEntry {
-                        id: row.get(0)?,
-                        route_id: row.get(1)?,
-                        provider_id: row.get(2)?,
-                        model_id: row.get(3)?,
-                        priority: row.get(4)?,
-                        weight: row.get(5)?,
-                        status: status_from_tag(&status_tag_owned).unwrap_or_else(|e| {
-                            tracing::warn!(error = %e, "invalid status in store, defaulting to Unhealthy");
-                            ModelStatus::Unhealthy
-                        }),
-                        capabilities: serde_json::from_str::<RouteCapabilities>(&caps_json)
-                            .expect("invalid capabilities in store"),
-                        price_per_1m: row.get::<_, Option<f64>>(8)?.unwrap_or(0.0).max(0.0),
-                        cooldown_until: row.get::<_, Option<i64>>(9)?.unwrap_or(0),
-                    };
-                    Ok((entry, raw_provider_at(row, 10)?))
+                    let entry = map_route_entry_row(row)?;
+                    Ok((entry, raw_provider_at(row, 11)?))
                 },
             )?;
             let mut out = Vec::new();
@@ -1467,8 +1689,8 @@ impl Store {
             "INSERT INTO usage_log
                 (profile_id, route_entry_id, model_id, streamed, success,
                  status_code, error_message, latency_ms, prompt_tokens,
-                 completion_tokens, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 completion_tokens, cached_prompt_tokens, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             rusqlite::params![
                 rec.profile_id,
                 rec.route_entry_id,
@@ -1480,6 +1702,7 @@ impl Store {
                 rec.latency_ms,
                 rec.prompt_tokens,
                 rec.completion_tokens,
+                rec.cached_prompt_tokens,
                 now,
             ],
         )?;
@@ -1496,6 +1719,7 @@ impl Store {
             latency_ms: rec.latency_ms,
             prompt_tokens: rec.prompt_tokens,
             completion_tokens: rec.completion_tokens,
+            cached_prompt_tokens: rec.cached_prompt_tokens,
             created_at: now,
         })
     }
@@ -1506,7 +1730,7 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT id, profile_id, route_entry_id, model_id, streamed, success,
                     status_code, error_message, latency_ms, prompt_tokens,
-                    completion_tokens, created_at
+                    completion_tokens, cached_prompt_tokens, created_at
              FROM usage_log
              WHERE profile_id = ?1
              ORDER BY created_at DESC, id DESC
@@ -1525,7 +1749,8 @@ impl Store {
                 latency_ms: row.get(8)?,
                 prompt_tokens: row.get(9)?,
                 completion_tokens: row.get(10)?,
-                created_at: row.get(11)?,
+                cached_prompt_tokens: row.get(11)?,
+                created_at: row.get(12)?,
             })
         })?;
         let mut out = Vec::new();
@@ -1536,6 +1761,12 @@ impl Store {
     }
 
     /// Per-model aggregates (calls, failures, latency, tokens) for a profile.
+    ///
+    /// `cached_prompt_tokens` / `cached_calls` come from the upstream's own cache
+    /// accounting (`cache_read_input_tokens`, `prompt_tokens_details.cached_tokens`,
+    /// `cachedContentTokenCount`), so they measure *provider-side* cache reuse —
+    /// distinct from the proxy's own exact-match `response_cache`, which never
+    /// reaches an upstream and is reported separately.
     pub fn usage_stats(&self, profile_id: &str) -> Result<Vec<UsageStats>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
@@ -1544,7 +1775,9 @@ impl Store {
                     SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) AS failures,
                     AVG(latency_ms),
                     COALESCE(SUM(prompt_tokens), 0),
-                    COALESCE(SUM(completion_tokens), 0)
+                    COALESCE(SUM(completion_tokens), 0),
+                    COALESCE(SUM(cached_prompt_tokens), 0) AS cached_tokens,
+                    COALESCE(SUM(CASE WHEN cached_prompt_tokens > 0 THEN 1 ELSE 0 END), 0) AS cached_calls
              FROM usage_log
              WHERE profile_id = ?1
              GROUP BY model_id
@@ -1558,6 +1791,8 @@ impl Store {
                 avg_latency_ms: row.get(3)?,
                 prompt_tokens: row.get(4)?,
                 completion_tokens: row.get(5)?,
+                cached_prompt_tokens: row.get(6)?,
+                cached_calls: row.get(7)?,
                 est_cost_usd: 0.0,
             })
         })?;
@@ -1727,6 +1962,7 @@ mod tests {
                     kind: *kind,
                     extra_headers: Default::default(),
                     masking_server_id: None,
+                    shared: false,
                 },
             )?;
             let listed = store.list_providers(profile.id.as_str())?;
@@ -1788,6 +2024,7 @@ mod tests {
                 kind: ProviderKind::OpenAI,
                 extra_headers: headers,
                 masking_server_id: None,
+                shared: false,
             },
         )?;
         let listed = store.list_providers(profile.id.as_str())?;
@@ -1839,6 +2076,7 @@ mod tests {
                 kind: ProviderKind::OpenAI,
                 extra_headers: std::collections::BTreeMap::new(),
                 masking_server_id: None,
+                shared: false,
             },
         )?;
         store.update_provider(
@@ -1851,6 +2089,7 @@ mod tests {
                 kind: ProviderKind::Anthropic,
                 extra_headers: std::collections::BTreeMap::new(),
                 masking_server_id: None,
+                shared: false,
             },
         )?;
         let updated = store.get_provider(provider.id)?.unwrap();
@@ -1932,6 +2171,7 @@ mod tests {
                 kind: ProviderKind::OpenAI,
                 extra_headers: std::collections::BTreeMap::new(),
                 masking_server_id: None,
+                shared: false,
             },
         )?;
         let provider_b = store.create_provider(
@@ -1944,6 +2184,7 @@ mod tests {
                 kind: ProviderKind::OpenAI,
                 extra_headers: std::collections::BTreeMap::new(),
                 masking_server_id: None,
+                shared: false,
             },
         )?;
 
@@ -1975,9 +2216,9 @@ mod tests {
 
         let chain = store.route_entries(route.id)?;
         // Insertion order was reversed, but the chain must surface priority order.
-        assert_eq!(chain[0].provider_id, provider_a.id);
+        assert_eq!(chain[0].provider_id, Some(provider_a.id));
         assert_eq!(chain[0].id, first.id);
-        assert_eq!(chain[1].provider_id, provider_b.id);
+        assert_eq!(chain[1].provider_id, Some(provider_b.id));
         assert_eq!(chain[1].id, second.id);
 
         store.set_route_entry_status(first.id, ModelStatus::Unhealthy)?;
@@ -2000,6 +2241,7 @@ mod tests {
                 kind: ProviderKind::OpenAI,
                 extra_headers: std::collections::BTreeMap::new(),
                 masking_server_id: None,
+                shared: false,
             },
         )?;
         let proxy = store.create_proxy(profile.id.as_str(), "prog", None)?;
@@ -2060,6 +2302,7 @@ mod tests {
             secret: format!("secret-for-{name}"),
             max_body_bytes: 0,
             expected_egress_ip: None,
+            shared: false,
         }
     }
 
@@ -2072,7 +2315,63 @@ mod tests {
             kind: ProviderKind::OpenAI,
             extra_headers: Default::default(),
             masking_server_id: mask_id,
+            shared: false,
         }
+    }
+
+    #[test]
+    fn a_shared_provider_is_visible_to_other_profiles() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let owner = store.create_profile("owner", None, None)?;
+        let other = store.create_profile("other", None, None)?;
+        let provider = store.create_provider(owner.id.as_str(), new_provider("shared-key", None))?;
+
+        // Not shared yet: only the owner sees it.
+        assert_eq!(store.list_providers(owner.id.as_str())?.len(), 1);
+        assert!(store.list_providers_for(other.id.as_str())?.is_empty());
+
+        store.set_provider_shared(provider.id, true)?;
+        let visible = store.list_providers_for(other.id.as_str())?;
+        assert_eq!(visible.len(), 1, "shared provider must be visible");
+        assert!(visible[0].shared);
+        assert_eq!(visible[0].name, "shared-key");
+
+        // The owner's own listing is unchanged (it never gained a duplicate).
+        assert_eq!(store.list_providers(owner.id.as_str())?.len(), 1);
+
+        // Unpublishing hides it again.
+        store.set_provider_shared(provider.id, false)?;
+        assert!(store.list_providers_for(other.id.as_str())?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn sharing_flag_survives_provider_update_and_roundtrips_export() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let profile = store.create_profile("p", None, None)?;
+        let provider = store.create_provider(profile.id.as_str(), new_provider("k", None))?;
+        assert!(!provider.shared);
+
+        store.update_provider(
+            provider.id,
+            NewProvider {
+                shared: true,
+                ..new_provider("k", None)
+            },
+        )?;
+        assert!(store.get_provider(provider.id)?.unwrap().shared);
+
+        // A mask follows the same pattern.
+        let mask = store.create_masking_server(
+            profile.id.as_str(),
+            crate::storage::NewMaskingServer {
+                shared: true,
+                ..new_mask("edge")
+            },
+        )?;
+        assert!(mask.shared);
+        assert_eq!(store.list_masking_servers_for(profile.id.as_str())?.len(), 1);
+        Ok(())
     }
 
     #[test]

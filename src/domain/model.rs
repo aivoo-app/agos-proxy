@@ -77,6 +77,12 @@ pub struct Provider {
     /// [`Provider::masking_server_id`] for the explicit binding alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub masking_server: Option<MaskingServer>,
+    /// Whether this provider is published to the whole instance. A shared
+    /// provider can be referenced from any profile's route chain (the owning
+    /// profile's credentials are used, never exposed), while only its owner can
+    /// edit or delete it.
+    #[serde(default)]
+    pub shared: bool,
 }
 
 /// An HTTP egress hop ("mask") that upstream requests are relayed through.
@@ -121,6 +127,11 @@ pub struct MaskingServer {
     pub last_verified_country: Option<String>,
     /// Unix millis of the last successful probe.
     pub last_verified_at: Option<i64>,
+    /// Whether this mask is published to the whole instance. A shared mask may
+    /// carry egress for shared providers used by other profiles; its secret
+    /// still never leaves the store.
+    #[serde(default)]
+    pub shared: bool,
 }
 
 /// A named group of routes a profile exposes, e.g. `Programmer`.
@@ -167,6 +178,60 @@ pub struct Route {
     /// Economy tuning: exact-cache TTL in seconds (0 = disabled).
     #[serde(default)]
     pub cache_ttl_secs: i64,
+    /// Whether other profiles may add this route to their own chains
+    /// (route-as-model). Sharing a route implicitly lets the referencing route
+    /// run its leaf providers; credentials still never leave the store.
+    #[serde(default)]
+    pub shared: bool,
+    /// Whether the proxy may add provider-native prompt-cache markers to
+    /// requests that go through this route.
+    #[serde(default)]
+    pub prompt_cache: PromptCachePolicy,
+}
+
+/// How aggressively the proxy marks up requests for provider-native prompt
+/// caching.
+///
+/// Upstream caching only pays off when the cached prefix is *stable*, and the
+/// two providers bill it very differently, so this is a per-route decision
+/// rather than a global switch: a route fronting a long fixed system prompt
+/// wants markers, while a route that rewrites its prompt every call only pays
+/// the write premium for a cache that is never read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCachePolicy {
+    /// Add cache breakpoints where the upstream supports them (default). A
+    /// client that supplies its own markers always wins — see
+    /// `crate::adapter::outbound::anthropic::translate_request`.
+    #[default]
+    Auto,
+    /// Never add markers, and strip none: the request reaches the upstream
+    /// exactly as the client wrote it.
+    Off,
+}
+
+impl PromptCachePolicy {
+    /// Stable tag used in the database.
+    pub fn tag(self) -> &'static str {
+        match self {
+            PromptCachePolicy::Auto => "auto",
+            PromptCachePolicy::Off => "off",
+        }
+    }
+
+    /// Parse a stored tag; unknown values fall back to the default so a store
+    /// written by a newer build still opens.
+    pub fn from_tag(tag: &str) -> Self {
+        match tag {
+            "off" => PromptCachePolicy::Off,
+            _ => PromptCachePolicy::Auto,
+        }
+    }
+
+    /// Whether the adapter may add markers under this policy.
+    pub fn enabled(self) -> bool {
+        matches!(self, PromptCachePolicy::Auto)
+    }
 }
 
 /// Automated health state of a route entry.
@@ -182,14 +247,28 @@ pub enum ModelStatus {
     Disabled,
 }
 
-/// One rung of a route's fallback chain: a real model on one configured provider.
+/// One rung of a route's fallback chain.
+///
+/// An entry points at exactly one of two things:
+/// - a **direct** target: a real model on one configured provider
+///   (`provider_id` set, `target_route_id` `None`);
+/// - a **nested** target: another route treated as a model
+///   (`target_route_id` set, `provider_id` `None`). The referenced route may
+///   belong to a different profile when it (and the providers it resolves to)
+///   has been shared. [`RouteEntry::model_id`] then carries a display label
+///   like `programmer/php-dev` rather than an upstream model id.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteEntry {
     pub id: i64,
     pub route_id: i64,
-    /// The configured provider used to reach this model.
-    pub provider_id: i64,
+    /// The configured provider used to reach this model. `None` for nested
+    /// entries, which forward to another route instead.
+    pub provider_id: Option<i64>,
+    /// The referenced route when this entry is a nested route. `None` for
+    /// direct entries.
+    pub target_route_id: Option<i64>,
     /// The model string the underlying provider expects, e.g. `my-model-v2`.
+    /// For nested entries: a display label, e.g. `programmer/php-dev`.
     pub model_id: String,
     /// Order in the fallback chain; 1 is tried first.
     pub priority: i32,
@@ -197,7 +276,8 @@ pub struct RouteEntry {
     pub weight: f64,
     pub status: ModelStatus,
     /// Optional capability flags used to skip models that cannot serve a request
-    /// (e.g. no tool calling when the request needs it).
+    /// (e.g. no tool calling when the request needs it). For nested entries the
+    /// router recomputes these from the referenced chain, so they are advisory.
     pub capabilities: RouteCapabilities,
     /// Blended price in USD per 1M tokens (input+output average). Used only by
     /// `Economy` strategy to sort cheapest-first. 0.0 = unknown (last).
@@ -213,6 +293,13 @@ pub struct RouteEntry {
     pub cooldown_until: i64,
 }
 
+impl RouteEntry {
+    /// Whether this entry forwards to another route rather than a provider.
+    pub fn is_nested(&self) -> bool {
+        self.target_route_id.is_some()
+    }
+}
+
 /// Optional feature flags on a route entry, used to avoid routing a request to a
 /// model that cannot actually serve it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -225,6 +312,84 @@ pub struct RouteCapabilities {
     pub json_mode: bool,
     /// Maximum context window in tokens; `None` if unknown.
     pub max_context: Option<u32>,
+}
+
+/// Model-id fragments that name a *utility* endpoint rather than a chat model:
+/// embeddings, speech, image generation, moderation and reranking. Such an id
+/// can never serve a chat completion with tools, images or JSON output.
+const NON_CHAT_MODEL_MARKERS: [&str; 17] = [
+    "embed",
+    "rerank",
+    "whisper",
+    "tts",
+    "-audio",
+    "audio-",
+    "dall-e",
+    "dalle",
+    "stable-diffusion",
+    "imagen",
+    "moderation",
+    "text-davinci",
+    "babbage",
+    "curie",
+    "bge-",
+    "/bge",
+    "e5-",
+];
+
+impl RouteCapabilities {
+    /// Best-effort capability guess from an upstream model id.
+    ///
+    /// The two mistakes here are not symmetric, so the guess deliberately errs
+    /// towards **over**-claiming:
+    ///
+    /// - over-claiming costs a single refusal: the upstream answers "image
+    ///   input not supported", the router clears the flag on that entry (see
+    ///   `set_route_entry_vision`) and fails over to the next model, so the
+    ///   guess corrects itself on first contact;
+    /// - under-claiming is silent and permanent: an entry claiming no tools,
+    ///   vision or JSON is *never selected* for such requests, so the route
+    ///   answers `capability_unavailable` forever with nothing to try and no
+    ///   hint about why.
+    ///
+    /// Only ids that name a non-chat endpoint are marked incapable; everything
+    /// else is assumed to be a normal chat model.
+    pub fn infer_from_model_id(model_id: &str) -> Self {
+        let lower = model_id.to_ascii_lowercase();
+        let utility = NON_CHAT_MODEL_MARKERS
+            .iter()
+            .any(|marker| lower.contains(marker));
+        Self {
+            tools: !utility,
+            vision: !utility,
+            json_mode: !utility,
+            max_context: None,
+        }
+    }
+
+    /// Roll several entries up into the capability set a *nested* (route-as-model)
+    /// entry can advertise: a flag survives if **any** member can serve it.
+    ///
+    /// This is the union rather than the intersection because the nested entry is
+    /// a route, not a model — selection happens again inside the target chain, so
+    /// a request only needs *some* member to accept it. `max_context` keeps the
+    /// largest window any member offers.
+    pub fn union<'a, I>(caps: I) -> Self
+    where
+        I: IntoIterator<Item = &'a RouteCapabilities>,
+    {
+        let mut out = Self::default();
+        for c in caps {
+            out.tools |= c.tools;
+            out.vision |= c.vision;
+            out.json_mode |= c.json_mode;
+            out.max_context = match (out.max_context, c.max_context) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            };
+        }
+        out
+    }
 }
 
 /// Per-key aggregate: how a profile's traffic spread across the upstream
@@ -264,6 +429,17 @@ pub struct UsageRecord {
     pub latency_ms: i64,
     pub prompt_tokens: Option<i64>,
     pub completion_tokens: Option<i64>,
+    /// Input tokens the upstream billed at its *cache-read* rate, i.e. a prefix
+    /// the provider already had cached (Anthropic `cache_read_input_tokens`,
+    /// OpenAI `prompt_tokens_details.cached_tokens`, Google
+    /// `cachedContentTokenCount`).
+    ///
+    /// Tracked separately from `prompt_tokens` because it is the only direct
+    /// evidence that prompt caching is actually paying off: a route can look
+    /// perfectly healthy while every call re-writes the cache instead of reading
+    /// it, and the two are indistinguishable in a plain token total.
+    #[serde(default)]
+    pub cached_prompt_tokens: Option<i64>,
     pub created_at: i64,
 }
 
@@ -276,6 +452,12 @@ pub struct UsageStats {
     pub avg_latency_ms: f64,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
+    /// Input tokens served from the provider's prompt cache, across calls.
+    #[serde(default)]
+    pub cached_prompt_tokens: i64,
+    /// Calls that read at least one cached token, i.e. real cache hits.
+    #[serde(default)]
+    pub cached_calls: i64,
     /// Estimated cost in USD derived from `RouteEntry::price_per_1m`.
     #[serde(default)]
     pub est_cost_usd: f64,

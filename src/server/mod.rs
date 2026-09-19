@@ -357,10 +357,14 @@ fn collect_provider_health(store: &Store) -> anyhow::Result<Vec<serde_json::Valu
             let routes = store.list_routes(proxy.id)?;
             for route in &routes {
                 for entry in store.route_entries(route.id)? {
-                    let provider_name = store
-                        .get_provider(entry.provider_id)?
-                        .map(|provider| provider.name)
-                        .unwrap_or_default();
+                    let provider_name = match entry.provider_id {
+                        Some(id) => store.get_provider(id)?.map(|provider| provider.name).unwrap_or_default(),
+                        None => entry
+                            .target_route_id
+                            .and_then(|tid| store.get_route_by_id(tid).ok().flatten())
+                            .map(|r| format!("→ {}", r.name))
+                            .unwrap_or_default(),
+                    };
                     entries.push(serde_json::json!({
                         "entry_id": entry.id,
                         "profile": profile.name,

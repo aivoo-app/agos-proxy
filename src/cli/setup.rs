@@ -189,6 +189,7 @@ fn add_provider(store: &Store, theme: &ColorfulTheme, profile: &Profile) -> Resu
             kind,
             extra_headers,
             masking_server_id: None,
+            shared: false,
         },
     )?;
     println!(
@@ -472,10 +473,16 @@ fn print_proxies(store: &Store, profile: &Profile) -> Result<()> {
                     ModelStatus::Unhealthy => "unhealthy".to_string(),
                     ModelStatus::Disabled => "disabled".to_string(),
                 };
-                let provider = store.get_provider(e.provider_id)?;
+                let provider = e.provider_id.and_then(|id| store.get_provider(id).ok().flatten());
                 let provider_name = match provider {
                     Some(pr) => pr.name.clone(),
-                    None => "(unknown)".into(),
+                    None => if let Some(tid) = e.target_route_id {
+                        store.get_route_by_id(tid)?
+                            .map(|r| format!("→ {}", r.name))
+                            .unwrap_or_else(|| "(unknown)".into())
+                    } else {
+                        "(unknown)".into()
+                    },
                 };
                 println!(
                     "          - {}  (via {}, priority {}, {status})",

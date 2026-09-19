@@ -78,6 +78,9 @@ pub struct ProviderSpec {
     /// Extra headers sent with every upstream request.
     #[serde(default)]
     pub extra_headers: std::collections::BTreeMap<String, String>,
+    /// Publish this provider to every profile on the instance.
+    #[serde(default)]
+    pub shared: Option<bool>,
 }
 
 /// One proxy and the routes under it.
@@ -118,10 +121,19 @@ pub struct RouteSpec {
 /// One model entry inside a route chain.
 #[derive(Debug, Deserialize)]
 pub struct ModelSpec {
-    /// Provider `name` the entry points at.
-    pub provider: String,
-    /// Upstream model identifier, e.g. `provider/model`.
-    pub model: String,
+    /// Provider `name` the entry points at. Required unless [`ModelSpec::route`]
+    /// names another route (route-as-model).
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Set instead of `provider`/`model` to chain another route: either
+    /// `<proxy>/<route>` (same profile) or `<profile>/<proxy>/<route>` for a
+    /// shared foreign route.
+    #[serde(default)]
+    pub route: Option<String>,
+    /// Upstream model identifier, e.g. `provider/model`. Required unless
+    /// [`ModelSpec::route`] is set.
+    #[serde(default)]
+    pub model: Option<String>,
     /// Lower wins; defaults to declaration order.
     #[serde(default)]
     pub priority: Option<i32>,
@@ -231,6 +243,9 @@ fn seed(
     println!("profile: {}", profile.name);
 
     let mut provider_ids = std::collections::BTreeMap::new();
+    // Route-as-model entries are resolved in a second pass so a document can
+    // reference routes defined later in the same file (or foreign shared ones).
+    let mut pending_refs: Vec<(i64, String, i32, f64)> = Vec::new();
     for spec in &setup.providers {
         let provider = store.create_provider(
             &profile.id,
@@ -242,6 +257,7 @@ fn seed(
                 kind: parse_kind(spec.kind.as_deref())?,
                 extra_headers: spec.extra_headers.clone(),
                 masking_server_id: None,
+                shared: spec.shared.unwrap_or(false),
             },
         )?;
         provider_ids.insert(spec.name.clone(), provider.id);
@@ -275,7 +291,18 @@ fn seed(
             println!("route: {}/{}", proxy.name, route.name);
 
             for (index, model_spec) in route_spec.models.iter().enumerate() {
-                let provider_id = *provider_ids.get(&model_spec.provider).ok_or_else(|| {
+                let priority = model_spec.priority.unwrap_or(index as i32);
+                let weight = model_spec.weight.unwrap_or(1.0);
+                if let Some(route_ref) = &model_spec.route {
+                    // Route-as-model: resolve `<profile>/<proxy>/<route>` or
+                    // `<proxy>/<route>` after the fact; foreign routes must be
+                    // shared. Deferred below so self-references inside the same
+                    // document are visible too.
+                    pending_refs.push((route.id, route_ref.clone(), priority, weight));
+                    continue;
+                }
+                let provider = model_spec.provider.as_deref().unwrap_or_default();
+                let provider_id = *provider_ids.get(provider).ok_or_else(|| {
                     anyhow::anyhow!(
                         "route {}/{} references unknown provider {:?}",
                         proxy.name,
@@ -283,12 +310,19 @@ fn seed(
                         model_spec.provider
                     )
                 })?;
+                let model = model_spec.model.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "route {}/{}: entry for provider {provider:?} needs a `model` (or use `route` to chain another route)",
+                        proxy.name,
+                        route.name
+                    )
+                })?;
                 let entry = store.add_route_entry(
                     route.id,
                     provider_id,
-                    &model_spec.model,
-                    model_spec.priority.unwrap_or(index as i32),
-                    model_spec.weight.unwrap_or(1.0),
+                    model,
+                    priority,
+                    weight,
                     RouteCapabilities {
                         tools: model_spec.capabilities.tools,
                         vision: model_spec.capabilities.vision,
@@ -299,14 +333,36 @@ fn seed(
                 if let Some(p) = model_spec.price_per_1m {
                     let _ = store.set_route_entry_price(entry.id, p);
                 }
-                println!(
-                    "  model: {} (provider {}, priority {})",
-                    model_spec.model,
-                    model_spec.provider,
-                    model_spec.priority.unwrap_or(index as i32)
-                );
+                println!("  model: {model} (provider {provider}, priority {priority})");
             }
         }
+    }
+
+    // Second pass: resolve nested-route references.
+    for (route_id, route_ref, priority, weight) in pending_refs {
+        let parts: Vec<&str> = route_ref.split('/').collect();
+        let (profile_name, proxy_name, route_name) = match parts.as_slice() {
+            [proxy, route] => (profile.name.as_str(), *proxy, *route),
+            [profile, proxy, route] => (*profile, *proxy, *route),
+            _ => anyhow::bail!("route reference {route_ref:?} must be <proxy>/<route> or <profile>/<proxy>/<route>"),
+        };
+        let owner = store
+            .get_profile_by_name(profile_name)?
+            .with_context(|| format!("route reference {route_ref:?}: no profile {profile_name:?}"))?;
+        let owner_proxy = store
+            .get_proxy_named(owner.id.as_str(), proxy_name)?
+            .with_context(|| format!("route reference {route_ref:?}: no proxy {proxy_name:?}"))?;
+        let target = store
+            .get_route_named(owner_proxy.id, route_name)?
+            .with_context(|| format!("route reference {route_ref:?}: no route {route_name:?}"))?;
+        if owner.id != profile.id {
+            anyhow::ensure!(
+                target.shared,
+                "route reference {route_ref:?} is not shared with this profile"
+            );
+        }
+        store.add_route_entry_ref(route_id, target.id, &route_ref, priority, weight)?;
+        println!("  model: {route_ref} (nested route, priority {priority})");
     }
     Ok(())
 }

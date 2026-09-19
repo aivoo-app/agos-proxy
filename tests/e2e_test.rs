@@ -210,6 +210,7 @@ fn setup_store_inner(base_url: &str, kind: ProviderKind, vision: bool) -> (Store
                 kind,
                 extra_headers: std::collections::BTreeMap::new(),
                 masking_server_id: None,
+                shared: false,
             },
         )
         .expect("create provider");
@@ -670,6 +671,7 @@ async fn economy_routes_cheap_first_caches_and_escalates() {
                 kind: ProviderKind::OpenAI,
                 extra_headers: std::collections::BTreeMap::new(),
                 masking_server_id: None,
+                shared: false,
             },
         )
         .expect("provider");
@@ -939,6 +941,7 @@ async fn responses_upstream_failure_fails_over_to_next_entry() {
                 kind: ProviderKind::OpenAI,
                 extra_headers: std::collections::BTreeMap::new(),
                 masking_server_id: None,
+                shared: false,
             },
         )
         .expect("create fallback provider");

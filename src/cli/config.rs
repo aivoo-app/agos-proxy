@@ -73,6 +73,9 @@ pub struct PortableProvider {
     pub extra_headers: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub masking_server: Option<String>,
+    /// Sharing flag; `false` when the bundle predates sharing.
+    #[serde(default)]
+    pub shared: bool,
 }
 
 /// An egress mask, exported with its secret (the whole file is sealed).
@@ -86,6 +89,9 @@ pub struct PortableMask {
     pub max_body_bytes: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_egress_ip: Option<String>,
+    /// Sharing flag; `false` when the bundle predates sharing.
+    #[serde(default)]
+    pub shared: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -110,7 +116,9 @@ pub struct PortableRoute {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PortableEntry {
-    /// References `PortableProvider::name` inside the same bundle.
+    /// References `PortableProvider::name` inside the same bundle. Empty for a
+    /// nested entry, which instead sets [`PortableEntry::route`].
+    #[serde(default)]
     pub provider_name: String,
     pub model_id: String,
     pub priority: i32,
@@ -118,6 +126,10 @@ pub struct PortableEntry {
     pub capabilities: RouteCapabilities,
     #[serde(default)]
     pub price_per_1m: f64,
+    /// A nested entry (route-as-model): `<proxy>/<route>` when the target is in
+    /// the same bundle, `<profile>/<proxy>/<route>` for a shared foreign route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
 }
 
 /// Entry point for `agos-proxy config ...`.
@@ -198,6 +210,7 @@ pub fn export_bundle(store: &Store, profile: &crate::domain::Profile) -> Result<
             secret: m.secret.clone(),
             max_body_bytes: m.max_body_bytes,
             expected_egress_ip: m.expected_egress_ip.clone(),
+            shared: m.shared,
         })
         .collect();
     let default_masking_server = profile
@@ -215,6 +228,7 @@ pub fn export_bundle(store: &Store, profile: &crate::domain::Profile) -> Result<
             kind: p.kind,
             extra_headers: p.extra_headers.clone(),
             masking_server: p.masking_server.as_ref().map(|m| m.name.clone()),
+            shared: p.shared,
         })
         .collect();
 
@@ -226,10 +240,38 @@ pub fn export_bundle(store: &Store, profile: &crate::domain::Profile) -> Result<
                 .route_entries(route.id)?
                 .into_iter()
                 .map(|e| {
-                    let provider_name = store
-                        .get_provider(e.provider_id)?
+                    if let Some(target_route_id) = e.target_route_id {
+                        let target = store
+                            .get_route_by_id(target_route_id)?
+                            .with_context(|| format!("route {target_route_id} missing"))?;
+                        let proxy = store
+                            .get_proxy(target.proxy_id)?
+                            .with_context(|| format!("proxy {} missing", target.proxy_id))?;
+                        let owner = proxy.profile_id.clone();
+                        let label = if owner == profile.id {
+                            format!("{}/{}", proxy.name, target.name)
+                        } else {
+                            let owner_name = store
+                                .get_profile_by_id(&owner)?
+                                .map(|p| p.name)
+                                .unwrap_or_else(|| owner.clone());
+                            format!("{owner_name}/{}/{}", proxy.name, target.name)
+                        };
+                        return Ok(PortableEntry {
+                            provider_name: String::new(),
+                            model_id: e.model_id,
+                            priority: e.priority,
+                            weight: e.weight,
+                            capabilities: e.capabilities,
+                            price_per_1m: e.price_per_1m,
+                            route: Some(label),
+                        });
+                    }
+                    let provider_name = e
+                        .provider_id
+                        .and_then(|id| store.get_provider(id).ok().flatten())
                         .map(|p| p.name)
-                        .with_context(|| format!("provider {} missing", e.provider_id))?;
+                        .with_context(|| format!("provider {:?} missing", e.provider_id))?;
                     Ok(PortableEntry {
                         provider_name,
                         model_id: e.model_id,
@@ -237,6 +279,7 @@ pub fn export_bundle(store: &Store, profile: &crate::domain::Profile) -> Result<
                         weight: e.weight,
                         capabilities: e.capabilities,
                         price_per_1m: e.price_per_1m,
+                        route: None,
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -321,6 +364,7 @@ pub fn import_bundle(store: &Store, bundle: &PortableProfile, name: &str) -> Res
                 secret: m.secret.clone(),
                 max_body_bytes: m.max_body_bytes,
                 expected_egress_ip: m.expected_egress_ip.clone(),
+                shared: m.shared,
             },
         )?;
         mask_ids.insert(created.name.clone(), created.id);
@@ -333,6 +377,8 @@ pub fn import_bundle(store: &Store, bundle: &PortableProfile, name: &str) -> Res
 
     // Providers next; entries reference them by name.
     let mut provider_ids: BTreeMap<String, i64> = BTreeMap::new();
+    // Nested-entry references resolved after all bundle routes exist.
+    let mut pending_refs: Vec<(i64, String, i32, f64, String)> = Vec::new();
     for p in &bundle.providers {
         let masking_server_id = p
             .masking_server
@@ -348,6 +394,7 @@ pub fn import_bundle(store: &Store, bundle: &PortableProfile, name: &str) -> Res
                 kind: p.kind,
                 extra_headers: p.extra_headers.clone(),
                 masking_server_id,
+                shared: p.shared,
             },
         )?;
         provider_ids.insert(created.name.clone(), created.id);
@@ -375,6 +422,26 @@ pub fn import_bundle(store: &Store, bundle: &PortableProfile, name: &str) -> Res
                 );
             }
             for entry in &route.entries {
+                if let Some(route_ref) = &entry.route {
+                    // Nested entry (route-as-model). Same-bundle references are
+                    // resolved after all routes exist, in a second pass below.
+                    let target = match route_ref.split('/').count() {
+                        2 => route_ref.clone(),
+                        _ => anyhow::bail!(
+                            "nested entry {:?} references route {route_ref:?}; cross-profile \
+                             imports must be re-linked after both profiles exist",
+                            entry.model_id
+                        ),
+                    };
+                    pending_refs.push((
+                        created_route.id,
+                        target,
+                        entry.priority,
+                        entry.weight,
+                        entry.model_id.clone(),
+                    ));
+                    continue;
+                }
                 let provider_id = provider_ids.get(&entry.provider_name).with_context(|| {
                     format!(
                         "entry references unknown provider {:?}",
@@ -394,6 +461,29 @@ pub fn import_bundle(store: &Store, bundle: &PortableProfile, name: &str) -> Res
                 }
             }
         }
+    }
+
+    // Second pass: resolve nested-entry route references now that every route
+    // in the bundle exists.
+    for (route_id, target_label, priority, weight, model_label) in pending_refs {
+        let (proxy_name, route_name) = target_label
+            .split_once('/')
+            .with_context(|| format!("bad route reference {target_label:?}"))?;
+        let target = store
+            .list_proxies(profile.id.as_str())?
+            .into_iter()
+            .find(|p| p.name == proxy_name)
+            .with_context(|| format!("nested entry references unknown proxy {proxy_name:?}"))?;
+        let target_route = store
+            .get_route_named(target.id, route_name)?
+            .with_context(|| format!("nested entry references unknown route {route_name:?}"))?;
+        store.add_route_entry_ref(
+            route_id,
+            target_route.id,
+            &model_label,
+            priority,
+            weight,
+        )?;
     }
     Ok(profile.id)
 }
@@ -418,6 +508,7 @@ mod tests {
                     kind: ProviderKind::OpenAI,
                     extra_headers: BTreeMap::new(),
                     masking_server_id: None,
+                    shared: false,
                 },
             )
             .unwrap();
@@ -458,6 +549,7 @@ mod tests {
                     secret: "s3cret".into(),
                     max_body_bytes: 0,
                     expected_egress_ip: None,
+                    shared: false,
                 },
             )
             .unwrap();
@@ -473,6 +565,7 @@ mod tests {
                     kind: providers[0].kind,
                     extra_headers: providers[0].extra_headers.clone(),
                     masking_server_id: Some(mask.id),
+                    shared: false,
                 },
             )
             .unwrap();

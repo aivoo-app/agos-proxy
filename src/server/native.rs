@@ -22,8 +22,7 @@ use crate::adapter::{ApiKind, StreamRenderer};
 use crate::router::Target;
 use crate::router::{execute_with_failover, resolve_targets_with_strategy, RequestNeeds};
 use crate::server::handlers::{
-    bad_request, inject_identity_into_messages, log_attempt, not_found, service_unavailable,
-    AppState,
+    bad_request, inject_identity_into_messages, log_attempt, no_targets, not_found, AppState,
 };
 use crate::translator::{ChatRequest, StreamEvent};
 use anyhow;
@@ -124,9 +123,7 @@ async fn chat_non_stream(
         needs,
         &state.routing_state,
     ) {
-        Ok(t) if t.is_empty() => {
-            return service_unavailable("no healthy providers available for this route")
-        }
+        Ok(t) if t.is_empty() => return no_targets(needs),
         Ok(t) => t,
         Err(e) => {
             let msg = e.to_string();
@@ -213,9 +210,7 @@ async fn chat_stream(
     // Try each upstream in sequence to establish a successful HTTP connection
     let targets =
         match resolve_targets_with_strategy(&store, &profile_id, &model, needs, &routing_state) {
-            Ok(t) if t.is_empty() => {
-                return service_unavailable("no healthy providers available for this route");
-            }
+            Ok(t) if t.is_empty() => return no_targets(needs),
             Ok(t) => t,
             Err(e) => {
                 return bad_request(format!("route resolution failed: {e}"));

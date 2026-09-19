@@ -182,6 +182,7 @@ mod tests {
             last_verified_asn: None,
             last_verified_country: None,
             last_verified_at: None,
+            shared: false,
         }
     }
 

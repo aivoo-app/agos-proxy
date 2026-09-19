@@ -88,6 +88,7 @@ async fn live_responses_list_models_and_chat() {
                 kind: ProviderKind::OpenAIResponses,
                 extra_headers: Default::default(),
                 masking_server_id: None,
+                shared: false,
             },
         )
         .expect("provider");

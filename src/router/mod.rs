@@ -10,7 +10,7 @@ use anyhow::{bail, Context as _, Result};
 use rand::Rng;
 use tokio::time::{timeout, Duration};
 
-use crate::domain::{ModelStatus, Provider, RouteEntry, RoutingStrategy};
+use crate::domain::{ModelStatus, PromptCachePolicy, Provider, RouteEntry, RoutingStrategy};
 use crate::storage::Store;
 
 /// Per-route mutable routing state (round-robin counters, etc.).
@@ -112,10 +112,40 @@ impl RequestNeeds {
     /// Whether an entry's capabilities can serve a request with these needs.
     /// An entry with unknown/unset capabilities is assumed unable; the CLI
     /// wizard writes explicit flags at creation time.
-    fn satisfies(&self, caps: crate::domain::RouteCapabilities) -> bool {
+    pub fn satisfies(&self, caps: &crate::domain::RouteCapabilities) -> bool {
         (!self.tools || caps.tools)
             && (!self.vision || caps.vision)
             && (!self.json_mode || caps.json_mode)
+    }
+
+    /// Whether this request needs nothing beyond a plain text chat completion.
+    pub fn is_empty(&self) -> bool {
+        !self.tools && !self.vision && !self.json_mode
+    }
+
+    /// The needed capabilities as stable machine-readable labels, for error
+    /// bodies and logs.
+    pub fn as_labels(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.tools {
+            out.push("tools");
+        }
+        if self.vision {
+            out.push("vision");
+        }
+        if self.json_mode {
+            out.push("json_mode");
+        }
+        out
+    }
+
+    /// Human-readable list of what this request needs, for an error message.
+    pub fn missing_list(&self) -> String {
+        let labels = self.as_labels();
+        if labels.is_empty() {
+            return "none".to_string();
+        }
+        labels.join(", ")
     }
 }
 
@@ -128,12 +158,33 @@ pub struct Target {
     /// injects a system message into the request so the model adopts this
     /// identity and hides its original one.
     pub identity: Option<String>,
+    /// Prompt-cache policy of the *outermost* route the caller named. Nested
+    /// routes inherit it rather than overriding it: the caller's choice should
+    /// govern the whole chain, and a shared foreign route must not silently
+    /// change caching behavior for the profiles that reference it.
+    pub prompt_cache: PromptCachePolicy,
 }
 
 /// Resolve a model string to an ordered list of healthy targets, scoped to the
 /// given profile. The caller's profile id comes from the bearer token, so a
-/// caller can only ever reach proxies under their own profile.
+/// caller can only ever reach proxies under their own profile — plus shared
+/// resources other profiles have published.
 pub fn resolve_targets(store: &Store, profile_id: &str, model: &str) -> Result<Vec<Target>> {
+    let route = resolve_route(store, profile_id, model)?;
+    let mut targets = expand_route_targets(store, profile_id, route.id, RequestNeeds::default(), 0)?;
+    for target in &mut targets {
+        target.identity = route.identity.clone();
+        target.prompt_cache = route.prompt_cache;
+    }
+    Ok(warm_first(
+        targets,
+        |t| t.entry.cooldown_until,
+        now_millis(),
+    ))
+}
+
+/// Look up the proxy + route a model string names, enforcing profile scope.
+fn resolve_route(store: &Store, profile_id: &str, model: &str) -> Result<crate::domain::Route> {
     let (proxy_name, route_name) = model
         .split_once('/')
         .with_context(|| format!("model {model:?} must be in `<proxy>/<route>` format"))?;
@@ -142,31 +193,100 @@ pub fn resolve_targets(store: &Store, profile_id: &str, model: &str) -> Result<V
         .get_proxy_named(profile_id, proxy_name)?
         .with_context(|| format!("no proxy named {proxy_name:?}"))?;
 
-    let route = store
+    store
         .get_route_named(proxy.id, route_name)?
-        .with_context(|| format!("no route named {route_name:?} under proxy {proxy_name:?}"))?;
+        .with_context(|| format!("no route named {route_name:?} under proxy {proxy_name:?}"))
+}
 
-    let identity = route.identity.clone();
-    let entries = store.route_entries(route.id)?;
+/// How deep a route may reference other routes before the proxy refuses.
+const MAX_ROUTE_DEPTH: usize = 8;
+
+/// Expand a route's entries into concrete leaf targets.
+///
+/// Direct entries contribute themselves; nested entries (route-as-model)
+/// recurse into the referenced route and splice its leaf targets in at that
+/// position. Every hop re-checks sharing: a provider may only be used when the
+/// caller owns it or it is shared, and a foreign route may only be entered when
+/// it is shared. Depth and the DFS `visited` path bound nesting so a circular
+/// reference fails the request instead of looping forever.
+fn expand_route_targets(
+    store: &Store,
+    caller_profile: &str,
+    route_id: i64,
+    needs: RequestNeeds,
+    depth: usize,
+) -> Result<Vec<Target>> {
+    expand_inner(store, caller_profile, route_id, needs, depth, &mut Vec::new())
+}
+
+fn expand_inner(
+    store: &Store,
+    caller_profile: &str,
+    route_id: i64,
+    needs: RequestNeeds,
+    depth: usize,
+    visited: &mut Vec<i64>,
+) -> Result<Vec<Target>> {
+    anyhow::ensure!(
+        depth < MAX_ROUTE_DEPTH,
+        "route chain nests deeper than {MAX_ROUTE_DEPTH} levels; refusing to expand"
+    );
+    anyhow::ensure!(
+        !visited.contains(&route_id),
+        "circular route reference: route {route_id} appears in its own chain"
+    );
+    visited.push(route_id);
+
     let mut targets = Vec::new();
-    for entry in entries {
+    for entry in store.route_entries(route_id)? {
         if !matches!(entry.status, ModelStatus::Healthy | ModelStatus::Degraded) {
             continue;
         }
-        if let Some(provider) = store.get_provider(entry.provider_id)? {
+        if !needs.satisfies(&entry.capabilities) {
+            continue;
+        }
+        if let Some(provider_id) = entry.provider_id {
+            let provider = store
+                .get_provider(provider_id)?
+                .with_context(|| format!("provider {provider_id} missing"))?;
+            anyhow::ensure!(
+                provider.profile_id == caller_profile || provider.shared,
+                "provider {:?} belongs to another profile and is not shared",
+                provider.name
+            );
             targets.push(Target {
                 provider,
                 entry,
-                identity: identity.clone(),
+                identity: None,
+                // Overwritten by the caller-facing resolution entry point with
+                // the outermost route's policy; nested routes never leak theirs.
+                prompt_cache: PromptCachePolicy::default(),
             });
+        } else if let Some(target_route_id) = entry.target_route_id {
+            let owner = store
+                .route_owner_profile(target_route_id)?
+                .with_context(|| format!("route {target_route_id} missing"))?;
+            let shared = store
+                .get_route_by_id(target_route_id)?
+                .map(|r| r.shared)
+                .unwrap_or(false);
+            anyhow::ensure!(
+                shared || owner == caller_profile,
+                "route {target_route_id} belongs to another profile and is not shared"
+            );
+            targets.extend(expand_inner(
+                store,
+                caller_profile,
+                target_route_id,
+                needs,
+                depth + 1,
+                visited,
+            )?);
         }
     }
-    // Same cool-down handling as the strategy-aware path below.
-    Ok(warm_first(
-        targets,
-        |t| t.entry.cooldown_until,
-        now_millis(),
-    ))
+
+    visited.pop();
+    Ok(targets)
 }
 
 /// Like [`resolve_targets`], but also reorders the list according to the
@@ -184,36 +304,15 @@ pub fn resolve_targets_with_strategy(
     needs: RequestNeeds,
     routing_state: &RoutingState,
 ) -> Result<Vec<Target>> {
-    let (proxy_name, route_name) = model
-        .split_once('/')
-        .with_context(|| format!("model {model:?} must be in `<proxy>/<route>` format"))?;
+    let route = resolve_route(store, profile_id, model)?;
 
-    let proxy = store
-        .get_proxy_named(profile_id, proxy_name)?
-        .with_context(|| format!("no proxy named {proxy_name:?}"))?;
-
-    let route = store
-        .get_route_named(proxy.id, route_name)?
-        .with_context(|| format!("no route named {route_name:?} under proxy {proxy_name:?}"))?;
-
+    // Identity is a caller-facing property: the outermost route wins, so a
+    // nested route's own identity is ignored when it is used as a model.
     let identity = route.identity.clone();
-    let entries = store.route_entries(route.id)?;
-    let targets: Vec<Target> = entries
-        .into_iter()
-        .filter(|e| matches!(e.status, ModelStatus::Healthy | ModelStatus::Degraded))
-        .filter(|e| needs.satisfies(e.capabilities.clone()))
-        .filter_map(|entry| {
-            store
-                .get_provider(entry.provider_id)
-                .ok()
-                .flatten()
-                .map(|provider| Target {
-                    provider,
-                    entry,
-                    identity: identity.clone(),
-                })
-        })
-        .collect();
+    let mut targets = expand_route_targets(store, profile_id, route.id, needs, 0)?;
+    for target in &mut targets {
+        target.identity = identity.clone();
+    }
 
     // Entries parked by an upstream rate limit sit out while any warm entry
     // remains, so a single exhausted key cannot absorb the round-robin turns
@@ -367,17 +466,13 @@ where
         }
     }
 
-    // Demote per failure classification (see [`demote_status_for`]): only
-    // provider-side failures (5xx, transport errors, timeouts, 429 as
-    // Degraded) take an entry out of rotation. Client-side 4xx that originate
-    // from the translated request body would otherwise take a perfectly
-    // healthy chain dark on a single malformed request — unless the upstream
-    // names images in its rejection, which means the upstream cannot serve
-    // vision requests at all and it should be skipped for them.
+    // Classify each failure (see [`classify_failure`]) and apply the matching
+    // action. The three outcomes are deliberately distinct: provider-side
+    // failures take the entry out of rotation, an image refusal only clears that
+    // entry's `vision` flag (it still serves text — parking it would waste a
+    // working key), and request-side/mask failures leave health untouched.
     for (target, status_code, message, retry_after) in &failures {
-        if let Some(status) = demote_status_for(*status_code, message) {
-            let _ = store.set_route_entry_status(target.entry.id, status);
-        }
+        apply_failure_action(&store, target, *status_code, message);
         // A quota refusal needs more than `Degraded`: degraded entries stay
         // selectable, so the entry is explicitly parked until the upstream's
         // window (or our fallback) expires. This is what keeps several keys
@@ -395,35 +490,94 @@ where
     }
 }
 
-/// Classify a failure status into a demotion decision. Provider-side failures
-/// demote the entry (429 only Degraded, everything else Unhealthy); client-side
-/// 4xx that originates from the translated request body itself never demotes —
-/// except a 4xx whose error message refuses images/vision, meaning the upstream
-/// cannot serve image requests at all. Local adapter capability rejections
-/// (tools/vision/JSON/stream unsupported by the adapter, marked with
-/// `ADAPTER_CAPABILITY_SKIP`) also never demote: the request needs a different
-/// entry, not a sicker one. Failures without a known status
-/// (transport errors, timeouts) are treated as provider-side.
-pub(crate) fn demote_status_for(status_code: Option<i64>, message: &str) -> Option<ModelStatus> {
+/// What to do with the route entry that produced a failure.
+///
+/// Three outcomes, deliberately distinguished, because conflating them is what
+/// used to take a perfectly good key out of rotation whenever a client sent an
+/// image to a model that does not accept images.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureAction {
+    /// The upstream refused *this kind of request* (images), not the key. Clear
+    /// the entry's `vision` flag and leave its health alone: it keeps serving
+    /// text, tools and JSON exactly as before, and future image requests skip it
+    /// instead of rediscovering the refusal on every call.
+    ClearVision,
+    /// Provider-side failure: take the entry out of rotation.
+    Demote(ModelStatus),
+    /// Request-side failure, or a resource-side skip that says nothing about the
+    /// entry's health. Leave it untouched and fail over.
+    Ignore,
+}
+
+/// Classify a failure into a [`FailureAction`].
+///
+/// Provider-side failures demote the entry (429 only `Degraded`, everything else
+/// `Unhealthy`). Client-side 4xx that originates from the translated request body
+/// itself never demotes — except a 4xx whose error message refuses images, which
+/// clears the entry's vision flag rather than demoting it. Local adapter
+/// capability rejections (tools/vision/JSON/stream unsupported by the adapter,
+/// marked with `ADAPTER_CAPABILITY_SKIP`) and mask failures are ignored: the
+/// request needs a different entry, not a sicker one. Failures without a known
+/// status (transport errors, timeouts) are treated as provider-side.
+pub(crate) fn classify_failure(status_code: Option<i64>, message: &str) -> FailureAction {
     // A mask that refused the request, or one that cannot carry this payload,
-    // says nothing about the provider's health: try the next target instead of
-    // taking a working key out of rotation.
+    // says nothing about the provider's health.
     if message.contains(crate::mask::MASK_SKIP) || message.contains(crate::mask::MASK_FAILED) {
-        return None;
+        return FailureAction::Ignore;
     }
     if message.contains(crate::adapter::outbound::responses::ADAPTER_CAPABILITY_SKIP) {
-        return None;
+        return FailureAction::Ignore;
     }
     match status_code {
-        Some(429) => Some(ModelStatus::Degraded),
+        Some(429) => FailureAction::Demote(ModelStatus::Degraded),
         Some(c) if (400..500).contains(&c) => {
             if image_rejection(message) {
-                Some(ModelStatus::Unhealthy)
+                FailureAction::ClearVision
             } else {
-                None
+                FailureAction::Ignore
             }
         }
-        _ => Some(ModelStatus::Unhealthy),
+        _ => FailureAction::Demote(ModelStatus::Unhealthy),
+    }
+}
+
+/// Classify a failure and apply the resulting action to `target`'s entry.
+///
+/// Shared by the buffered failover loop and the streaming path so both surfaces
+/// treat an image refusal the same way: clear `vision`, never park the key.
+pub fn apply_failure_action(
+    store: &Store,
+    target: &Target,
+    status_code: Option<i64>,
+    message: &str,
+) -> FailureAction {
+    let action = classify_failure(status_code, message);
+    match action {
+        FailureAction::ClearVision => {
+            if target.entry.capabilities.vision {
+                let _ = store.set_route_entry_vision(target.entry.id, false);
+                tracing::info!(
+                    provider = %target.provider.name,
+                    model = %target.entry.model_id,
+                    "upstream rejects image input; cleared vision capability for this entry"
+                );
+            }
+        }
+        FailureAction::Demote(status) => {
+            let _ = store.set_route_entry_status(target.entry.id, status);
+        }
+        FailureAction::Ignore => {}
+    }
+    action
+}
+
+/// Classify a failure status into a demotion decision, ignoring the
+/// vision-specific outcome. Retained for callers that only care about health.
+#[cfg(test)]
+pub(crate) fn demote_status_for(status_code: Option<i64>, message: &str) -> Option<ModelStatus> {
+    match classify_failure(status_code, message) {
+        FailureAction::Demote(status) => Some(status),
+        FailureAction::ClearVision | FailureAction::Ignore => None,
     }
 }
 
@@ -581,7 +735,7 @@ fn contains_phrase(message: &str, phrase: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{ProviderKind, RoutingStrategy};
+    use crate::domain::{ProviderKind, RouteCapabilities, RoutingStrategy};
     use crate::storage::NewProvider;
     use crate::translator::content_text;
     use std::collections::BTreeMap;
@@ -600,6 +754,7 @@ mod tests {
                     kind: ProviderKind::OpenAI,
                     extra_headers: BTreeMap::new(),
                     masking_server_id: None,
+                    shared: false,
                 },
             )
             .unwrap();
@@ -609,8 +764,17 @@ mod tests {
         let route = store
             .create_route(proxy.id, "r1", None, RoutingStrategy::Priority, None)
             .unwrap();
+        // Capabilities as the CLI/bootstrap would infer them, so this fixture
+        // exercises the same entries an operator would actually create.
         store
-            .add_route_entry(route.id, provider.id, "m1", 1, 1.0, Default::default())
+            .add_route_entry(
+                route.id,
+                provider.id,
+                "m1",
+                1,
+                1.0,
+                RouteCapabilities::infer_from_model_id("m1"),
+            )
             .unwrap();
         let targets = resolve_targets(&store, &profile.id, "prog/r1").unwrap();
         assert_eq!(targets.len(), 1);
@@ -660,6 +824,7 @@ mod tests {
                     kind: ProviderKind::OpenAI,
                     extra_headers: BTreeMap::new(),
                     masking_server_id: None,
+                    shared: false,
                 },
             )
             .unwrap();
@@ -674,6 +839,7 @@ mod tests {
                     kind: ProviderKind::OpenAI,
                     extra_headers: BTreeMap::new(),
                     masking_server_id: None,
+                    shared: false,
                 },
             )
             .unwrap();
@@ -749,6 +915,7 @@ mod tests {
                     kind: ProviderKind::OpenAI,
                     extra_headers: BTreeMap::new(),
                     masking_server_id: None,
+                    shared: false,
                 },
             )
             .unwrap();
@@ -763,6 +930,7 @@ mod tests {
                     kind: ProviderKind::OpenAI,
                     extra_headers: BTreeMap::new(),
                     masking_server_id: None,
+                    shared: false,
                 },
             )
             .unwrap();
@@ -837,6 +1005,7 @@ mod tests {
                         kind: ProviderKind::OpenAI,
                         extra_headers: BTreeMap::new(),
                         masking_server_id: None,
+                        shared: false,
                     },
                 )
                 .unwrap()
@@ -1026,8 +1195,8 @@ mod tests {
             r#"{"message":"vision is not supported"}"#,
         ] {
             assert_eq!(
-                demote_status_for(Some(400), message),
-                Some(ModelStatus::Unhealthy),
+                classify_failure(Some(400), message),
+                FailureAction::ClearVision,
                 "{message}"
             );
         }
@@ -1037,37 +1206,37 @@ mod tests {
     fn image_rejection_handles_real_upstream_error_envelopes() {
         // Anthropic: {"type":"error","error":{"type":…,"message":…}}
         assert_eq!(
-            demote_status_for(
+            classify_failure(
                 Some(400),
                 r#"{"type":"error","error":{"type":"invalid_request_error","message":"This model does not support image input."}}"#
             ),
-            Some(ModelStatus::Unhealthy)
+            FailureAction::ClearVision
         );
         // Google/Gemini: refusal wording is "unable to process".
         assert_eq!(
-            demote_status_for(
+            classify_failure(
                 Some(400),
                 r#"{"error":{"code":400,"message":"Unable to process the provided image input.","status":"INVALID_ARGUMENT"}}"#
             ),
-            Some(ModelStatus::Unhealthy)
+            FailureAction::ClearVision
         );
         // `message` as an array of content blocks.
         assert_eq!(
-            demote_status_for(
+            classify_failure(
                 Some(400),
                 r#"{"error":{"message":[{"type":"text","text":"images are not supported"}]}}"#
             ),
-            Some(ModelStatus::Unhealthy)
+            FailureAction::ClearVision
         );
         // A bare JSON string body.
         assert_eq!(
-            demote_status_for(Some(400), r#""images are not supported""#),
-            Some(ModelStatus::Unhealthy)
+            classify_failure(Some(400), r#""images are not supported""#),
+            FailureAction::ClearVision
         );
         // Non-standard top-level `detail` field.
         assert_eq!(
-            demote_status_for(Some(400), r#"{"detail":"images are not supported"}"#),
-            Some(ModelStatus::Unhealthy)
+            classify_failure(Some(400), r#"{"detail":"images are not supported"}"#),
+            FailureAction::ClearVision
         );
         // An array with no extractable text is not evidence of a capability gap.
         assert_eq!(
@@ -1093,14 +1262,14 @@ mod tests {
     }
 
     #[test]
-    fn image_rejecting_4xx_demotes_but_plain_4xx_does_not() {
-        // Explicit capability refusals still demote the whole route entry.
+    fn image_rejecting_4xx_clears_vision_but_plain_4xx_does_not() {
+        // Explicit capability refusals clear the entry vision flag, not its health.
         assert_eq!(
-            demote_status_for(
+            classify_failure(
                 Some(400),
                 r#"{"error":{"message":"image input not supported"}}"#
             ),
-            Some(ModelStatus::Unhealthy)
+            FailureAction::ClearVision
         );
         assert_eq!(
             demote_status_for(Some(415), "unsupported media type for vision input"),
@@ -1108,8 +1277,8 @@ mod tests {
         );
         // Matching is ASCII-case-insensitive.
         assert_eq!(
-            demote_status_for(Some(404), "Model does not support IMAGE input"),
-            Some(ModelStatus::Unhealthy)
+            classify_failure(Some(404), "Model does not support IMAGE input"),
+            FailureAction::ClearVision
         );
         // A refusal phrase and the image term must actually pair up: a 4xx that
         // echoes the request payload (whose parts carry `image_url` keys) next
@@ -1302,6 +1471,7 @@ mod tests {
                     kind: ProviderKind::OpenAI,
                     extra_headers: BTreeMap::new(),
                     masking_server_id: None,
+                    shared: false,
                 },
             )
             .unwrap();
@@ -1328,5 +1498,130 @@ mod tests {
         let _ = b_route;
         let still_empty = resolve_targets(&store, &_b.id, "prog/r1").unwrap();
         assert!(still_empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_image_refusal_clears_vision_instead_of_parking_the_key() {
+        // The regression this guards: an image sent to a text-only model used to
+        // mark the entry Unhealthy, so *every* later request — text included —
+        // was served by nothing until an operator intervened.
+        let (store, targets) = setup();
+        let entry_id = targets[0].entry.id;
+        let route_id = targets[0].entry.route_id;
+        let store = Arc::new(store);
+        assert!(targets[0].entry.capabilities.vision);
+
+        let result =
+            execute_with_failover(store.clone(), targets, Duration::from_secs(5), |_| async {
+                Err(anyhow::Error::new(
+                    crate::adapter::outbound::ProviderError {
+                        status: reqwest::StatusCode::BAD_REQUEST,
+                        body: r#"{"error":{"message":"This model does not support image input."}}"#
+                            .to_string(),
+                        retry_after: None,
+                    },
+                ))
+            })
+            .await;
+        assert!(result.is_err(), "the refusal still surfaces to the caller");
+
+        let entry = store
+            .route_entries(route_id)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.id == entry_id)
+            .unwrap();
+        assert_eq!(entry.status, ModelStatus::Healthy, "the key is not sick");
+        assert!(!entry.capabilities.vision, "vision must be cleared");
+        assert!(entry.capabilities.tools, "other capabilities are untouched");
+        assert_eq!(entry.cooldown_until, 0, "no cooldown for a capability gap");
+
+        // Text traffic still resolves to the entry...
+        let profile_id = pid(&store);
+        let text = resolve_targets_with_strategy(
+            &store,
+            &profile_id,
+            "prog/r1",
+            RequestNeeds::default(),
+            &RoutingState::default(),
+        )
+        .unwrap();
+        assert_eq!(text.len(), 1, "text requests must keep working");
+
+        // ...while image traffic now skips it instead of retrying the refusal.
+        let images = resolve_targets_with_strategy(
+            &store,
+            &profile_id,
+            "prog/r1",
+            RequestNeeds {
+                vision: true,
+                ..Default::default()
+            },
+            &RoutingState::default(),
+        )
+        .unwrap();
+        assert!(images.is_empty(), "image requests skip the entry");
+    }
+
+    #[test]
+    fn nested_route_entries_expand_to_the_target_routes_leaves() {
+        let store = Store::open_in_memory().unwrap();
+        let profile = store.create_profile("coder1", None, None).unwrap();
+        let p = store
+            .create_provider(
+                profile.id.as_str(),
+                NewProvider {
+                    name: "p".into(),
+                    description: None,
+                    base_url: "https://a.example".into(),
+                    auth_token: "tok".into(),
+                    kind: ProviderKind::OpenAI,
+                    extra_headers: BTreeMap::new(),
+                    masking_server_id: None,
+                    shared: false,
+                },
+            )
+            .unwrap();
+        let proxy = store.create_proxy(profile.id.as_str(), "prog", None).unwrap();
+        // A leaf route holding the real model...
+        let leaf = store
+            .create_route(proxy.id, "leaf", None, RoutingStrategy::Priority, None)
+            .unwrap();
+        store
+            .add_route_entry(leaf.id, p.id, "m1", 1, 1.0, Default::default())
+            .unwrap();
+        // ...and a parent route that selects the leaf as a model.
+        let parent = store
+            .create_route(proxy.id, "parent", None, RoutingStrategy::Priority, None)
+            .unwrap();
+        store
+            .add_route_entry_ref(parent.id, leaf.id, "prog/leaf", 1, 1.0)
+            .unwrap();
+
+        let targets = resolve_targets(&store, &profile.id, "prog/parent").unwrap();
+        assert_eq!(targets.len(), 1, "the leaf's targets are spliced in");
+        assert_eq!(targets[0].entry.model_id, "m1");
+        assert_eq!(targets[0].provider.name, "p");
+    }
+
+    #[test]
+    fn a_circular_route_chain_is_refused_rather_than_looped() {
+        let store = Store::open_in_memory().unwrap();
+        let profile = store.create_profile("coder1", None, None).unwrap();
+        let proxy = store.create_proxy(profile.id.as_str(), "prog", None).unwrap();
+        let a = store
+            .create_route(proxy.id, "a", None, RoutingStrategy::Priority, None)
+            .unwrap();
+        let b = store
+            .create_route(proxy.id, "b", None, RoutingStrategy::Priority, None)
+            .unwrap();
+        store.add_route_entry_ref(a.id, b.id, "prog/b", 1, 1.0).unwrap();
+        store.add_route_entry_ref(b.id, a.id, "prog/a", 1, 1.0).unwrap();
+
+        let err = resolve_targets(&store, &profile.id, "prog/a").unwrap_err();
+        assert!(
+            err.to_string().contains("circular route reference"),
+            "got: {err}"
+        );
     }
 }

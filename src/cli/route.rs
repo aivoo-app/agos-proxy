@@ -55,6 +55,22 @@ pub enum RouteArgs {
         #[arg(long)]
         cache_ttl: Option<i64>,
     },
+    /// Publish (or unpublish) a route so other profiles can add it to their
+    /// own chains (route-as-model).
+    Share {
+        /// Name of the owning profile.
+        #[arg(long)]
+        profile: Option<String>,
+        /// Name of the owning proxy.
+        #[arg(long)]
+        proxy: Option<String>,
+        /// Name of the route (skips the route picker).
+        #[arg(long)]
+        route: Option<String>,
+        /// `--share true` publishes; `--share false` unpublishes. Omit to ask.
+        #[arg(long, default_missing_value = "true", num_args = 0..=1)]
+        share: Option<bool>,
+    },
     /// Manage the models in a route's fallback chain.
     #[command(subcommand)]
     Model(ModelArgs),
@@ -90,6 +106,11 @@ pub enum ModelArgs {
         /// `route model edit` later if the model supports tools/vision/JSON).
         #[arg(long)]
         yes: bool,
+        /// Add another route as a model instead of a provider model. Accepts
+        /// `<proxy>/<route>` (same profile) or `<profile>/<proxy>/<route>` for
+        /// a shared foreign route. Only another profile's *shared* routes work.
+        #[arg(long = "from-route")]
+        from_route: Option<String>,
     },
     /// Remove a model from a route's chain.
     Remove {
@@ -162,6 +183,12 @@ pub fn run(args: RouteArgs) -> Result<()> {
             max_tokens,
             cache_ttl,
         } => economy(&store, profile, proxy, route, max_tokens, cache_ttl),
+        RouteArgs::Share {
+            profile,
+            proxy,
+            route,
+            share,
+        } => route_share(&store, profile, proxy, route, share),
         RouteArgs::Model(ModelArgs::Add {
             profile,
             proxy,
@@ -171,8 +198,9 @@ pub fn run(args: RouteArgs) -> Result<()> {
             weight,
             price,
             yes,
+            from_route,
         }) => model_add(
-            &store, profile, proxy, route, provider, model_id, weight, price, yes,
+            &store, profile, proxy, route, provider, model_id, weight, price, yes, from_route,
         ),
         RouteArgs::Model(ModelArgs::Remove {
             profile,
@@ -385,15 +413,38 @@ fn model_add(
     weight: Option<f64>,
     price: Option<f64>,
     yes: bool,
+    from_route: Option<String>,
 ) -> Result<()> {
     let theme = ColorfulTheme::default();
     let (profile, proxy) = resolve_proxy(store, profile_name, proxy_name)?;
     ensure_password_ok(&profile)?;
     let route = resolve_route(store, &proxy, route_name, "Route")?;
 
+    // Route-as-model: point this entry at another route instead of a provider.
+    if let Some(target) = from_route.filter(|t| !t.is_empty()) {
+        let (target_route, label) = resolve_route_ref(store, &profile, &target)?;
+        let existing = store.route_entries(route.id)?;
+        let next_priority = existing.len() as i32 + 1;
+        let entry = store.add_route_entry_ref(
+            route.id,
+            target_route.id,
+            &label,
+            next_priority,
+            weight.unwrap_or(1.0),
+        )?;
+        if let Some(p) = price {
+            store.set_route_entry_price(entry.id, p)?;
+        }
+        println!(
+            "Added route {label} to route {:?} at priority {next_priority}.",
+            route.name
+        );
+        return Ok(());
+    }
+
     // Fully flag-driven: `--model` + (provider resolved or `--provider`).
     if let Some(model) = model_id {
-        let providers = store.list_providers(profile.id.as_str())?;
+        let providers = store.list_providers_for(profile.id.as_str())?;
         let provider =
             match provider_name {
                 Some(n) if !n.is_empty() => providers
@@ -564,7 +615,7 @@ fn pick_entry(
     }
     let mut labels: Vec<String> = vec![];
     for e in &entries {
-        let pname = provider_name(store, e.provider_id)?;
+        let pname = provider_name(store, e)?;
         labels.push(format!(
             "pos {}: {}  (provider {})",
             e.priority, e.model_id, pname
@@ -577,8 +628,19 @@ fn pick_entry(
     Ok(entries[idx].clone())
 }
 
-fn provider_label(store: &crate::storage::Store, id: i64) -> Result<String> {
-    match store.get_provider(id)? {
+/// A human label for where an entry routes: the provider (plus kind) for
+/// direct entries, or the referenced route for nested ones.
+fn provider_label(store: &crate::storage::Store, entry: &crate::domain::RouteEntry) -> Result<String> {
+    if let Some(target_route_id) = entry.target_route_id {
+        if let Some(route) = store.get_route_by_id(target_route_id)? {
+            if let Some(proxy) = store.get_proxy(route.proxy_id)? {
+                return Ok(format!("→ {}/{}", proxy.name, route.name));
+            }
+            return Ok(format!("→ {}", route.name));
+        }
+        return Ok("(missing route)".to_string());
+    }
+    match entry.provider_id.and_then(|id| store.get_provider(id).ok().flatten()) {
         Some(p) => Ok(format!(
             "{} ({})",
             p.name,
@@ -588,8 +650,17 @@ fn provider_label(store: &crate::storage::Store, id: i64) -> Result<String> {
     }
 }
 
-fn provider_name(store: &crate::storage::Store, id: i64) -> Result<String> {
-    match store.get_provider(id)? {
+fn provider_name(store: &crate::storage::Store, entry: &crate::domain::RouteEntry) -> Result<String> {
+    if let Some(target_route_id) = entry.target_route_id {
+        if let Some(route) = store.get_route_by_id(target_route_id)? {
+            if let Some(proxy) = store.get_proxy(route.proxy_id)? {
+                return Ok(format!("→ {}/{}", proxy.name, route.name));
+            }
+            return Ok(format!("→ {}", route.name));
+        }
+        return Ok("(missing route)".to_string());
+    }
+    match entry.provider_id.and_then(|id| store.get_provider(id).ok().flatten()) {
         Some(p) => Ok(p.name.clone()),
         None => Ok("(unknown)".to_string()),
     }
@@ -681,6 +752,75 @@ fn pick_strategy(theme: &ColorfulTheme) -> Result<RoutingStrategy> {
         2 => RoutingStrategy::Weighted,
         _ => RoutingStrategy::Economy,
     })
+}
+
+/// Resolve a `--from-route` reference to its route plus the display label.
+///
+/// Accepts `<proxy>/<route>` (same profile) and `<profile>/<proxy>/<route>`.
+/// A foreign route must be shared; the entry is rejected otherwise.
+fn resolve_route_ref(
+    store: &crate::storage::Store,
+    caller: &crate::domain::Profile,
+    target: &str,
+) -> Result<(crate::domain::Route, String)> {
+    let parts: Vec<&str> = target.split('/').collect();
+    let (profile_name, proxy_name, route_name) = match parts.as_slice() {
+        [proxy, route] => (caller.name.as_str(), *proxy, *route),
+        [profile, proxy, route] => (*profile, *proxy, *route),
+        _ => anyhow::bail!(
+            "route reference {target:?} must be <proxy>/<route> or <profile>/<proxy>/<route>"
+        ),
+    };
+    let owner_profile = crate::cli::util::require_profile(store, profile_name)?;
+    let owner_proxy = store
+        .get_proxy_named(owner_profile.id.as_str(), proxy_name)?
+        .with_context(|| format!("no proxy named {proxy_name:?} under profile {profile_name:?}"))?;
+    let route = store
+        .get_route_named(owner_proxy.id, route_name)?
+        .with_context(|| format!("no route named {route_name:?} under proxy {proxy_name:?}"))?;
+    if owner_profile.id != caller.id {
+        anyhow::ensure!(
+            route.shared,
+            "route {target:?} is not shared; its owner must run `route share --share true` first"
+        );
+    }
+    let label = if owner_profile.id == caller.id {
+        format!("{proxy_name}/{route_name}")
+    } else {
+        format!("{profile_name}/{proxy_name}/{route_name}")
+    };
+    Ok((route, label))
+}
+
+/// Publish (or unpublish) a route across the instance (route-as-model).
+fn route_share(
+    store: &crate::storage::Store,
+    profile_name: Option<String>,
+    proxy_name: Option<String>,
+    route_name: Option<String>,
+    share: Option<bool>,
+) -> Result<()> {
+    let theme = ColorfulTheme::default();
+    let (profile, proxy) = resolve_proxy(store, profile_name, proxy_name)?;
+    ensure_password_ok(&profile)?;
+    let route = resolve_route(store, &proxy, route_name, "Route to share")?;
+    let shared = match share {
+        Some(s) => s,
+        None => Confirm::with_theme(&theme)
+            .with_prompt(format!("Share route {:?} with every profile?", route.name))
+            .default(!route.shared)
+            .interact()?,
+    };
+    store.set_route_shared(route.id, shared)?;
+    if shared {
+        println!(
+            "Route {:?} is now shared: every profile may add it to its chains.",
+            route.name
+        );
+    } else {
+        println!("Route {:?} is no longer shared.", route.name);
+    }
+    Ok(())
 }
 
 /// Tune a route's economy limits (non-interactive flags or wizard).
@@ -786,7 +926,7 @@ fn status(store: &crate::storage::Store, route_name: Option<String>) -> Result<(
         "PRI", "ID", "STATUS", "MODEL", "PROVIDER", "WEIGHT"
     );
     for e in entries {
-        let provider_name = provider_label(store, e.provider_id)?;
+        let provider_name = provider_label(store, &e)?;
         println!(
             "{:<5} {:<6} {:<8} {:<24} {:<40} {:<8} ${}/1M",
             e.priority,

@@ -435,11 +435,13 @@ mod tests {
                 extra_headers: extra,
                 masking_server_id: None,
                 masking_server: None,
+                shared: false,
             },
             entry: RouteEntry {
                 id: 1,
                 route_id: 1,
-                provider_id: 1,
+                provider_id: Some(1),
+                target_route_id: None,
                 model_id: "example-model".into(),
                 priority: 1,
                 weight: 1.0,
@@ -449,6 +451,7 @@ mod tests {
                 cooldown_until: 0,
             },
             identity: None,
+            prompt_cache: Default::default(),
         }
     }
 

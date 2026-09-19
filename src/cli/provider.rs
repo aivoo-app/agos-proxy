@@ -41,6 +41,10 @@ pub enum ProviderArgs {
         /// Egress mask to bind this key to (see `agos-proxy mask --help`).
         #[arg(long)]
         mask: Option<String>,
+        /// Publish this provider to every profile on this instance. Only the
+        /// owning profile can edit it; other profiles may route through it.
+        #[arg(long, default_missing_value = "true", num_args = 0..=1)]
+        share: Option<bool>,
     },
     /// List the providers configured on a profile.
     List {
@@ -66,6 +70,18 @@ pub enum ProviderArgs {
         #[arg(long)]
         yes: bool,
     },
+    /// Publish (or unpublish) a provider across every profile on this instance.
+    Share {
+        /// Name of the owning profile.
+        #[arg(long)]
+        profile: Option<String>,
+        /// Name of the provider to publish.
+        #[arg(long)]
+        provider: Option<String>,
+        /// `--share true` publishes; `--share false` unpublishes. Omit to ask.
+        #[arg(long, default_missing_value = "true", num_args = 0..=1)]
+        share: Option<bool>,
+    },
 }
 
 /// Entry point for `agos-proxy provider ...`.
@@ -81,6 +97,7 @@ pub fn run(args: ProviderArgs) -> Result<()> {
             description,
             headers,
             mask,
+            share,
         } => add(
             &store,
             profile,
@@ -91,6 +108,7 @@ pub fn run(args: ProviderArgs) -> Result<()> {
             description,
             headers,
             mask,
+            share,
         ),
         ProviderArgs::List { profile } => list(&store, profile),
         ProviderArgs::Edit { profile } => edit(&store, profile),
@@ -99,6 +117,11 @@ pub fn run(args: ProviderArgs) -> Result<()> {
             provider,
             yes,
         } => delete(&store, profile, provider, yes),
+        ProviderArgs::Share {
+            profile,
+            provider,
+            share,
+        } => share_cmd(&store, profile, provider, share),
     }
 }
 
@@ -110,7 +133,7 @@ fn resolve_mask_id(
     given: Option<String>,
     theme: &dialoguer::theme::ColorfulTheme,
 ) -> Result<Option<i64>> {
-    let masks = store.list_masking_servers(profile.id.as_str())?;
+    let masks = store.list_masking_servers_for(profile.id.as_str())?;
     if let Some(name) = given.filter(|n| !n.is_empty()) {
         if name == "none" {
             return Ok(None);
@@ -160,6 +183,7 @@ fn add(
     description: Option<String>,
     headers: Vec<String>,
     mask: Option<String>,
+    share: Option<bool>,
 ) -> Result<()> {
     let theme = ColorfulTheme::default();
     let profile = resolve_profile(store, profile)?;
@@ -178,6 +202,7 @@ fn add(
             extra_headers.insert(k.trim().to_string(), v.trim().to_string());
         }
         let masking_server_id = resolve_mask_id(store, &profile, mask, &theme)?;
+        let shared = share.unwrap_or(false);
         let provider = store.create_provider(
             profile.id.as_str(),
             NewProvider {
@@ -188,12 +213,14 @@ fn add(
                 kind,
                 extra_headers,
                 masking_server_id,
+                shared,
             },
         )?;
         println!(
-            "Added provider {:?} ({}) under profile {:?}.",
+            "Added provider {:?} ({}){} under profile {:?}.",
             provider.name,
             kind_label(&provider.kind),
+            if shared { " [shared]" } else { "" },
             profile.name
         );
         return Ok(());
@@ -217,6 +244,13 @@ fn add(
         .interact_text()?;
     let extra_headers = prompt_headers()?;
     let masking_server_id = resolve_mask_id(store, &profile, mask, &theme)?;
+    let shared = match share {
+        Some(s) => s,
+        None => Confirm::with_theme(&theme)
+            .with_prompt("Share this provider with every profile?")
+            .default(false)
+            .interact()?,
+    };
 
     let provider = store.create_provider(
         profile.id.as_str(),
@@ -232,12 +266,14 @@ fn add(
             kind,
             extra_headers,
             masking_server_id,
+            shared,
         },
     )?;
     println!(
-        "Added provider {:?} ({}) under profile {:?}.",
+        "Added provider {:?} ({}){} under profile {:?}.",
         provider.name,
         kind_label(&provider.kind),
+        if shared { " [shared]" } else { "" },
         profile.name
     );
     Ok(())
@@ -254,12 +290,12 @@ fn list(store: &crate::storage::Store, profile: Option<String>) -> Result<()> {
         return Ok(());
     }
     println!(
-        "{:<16} {:<14} {:<24} {:<40} BASE URL",
-        "ID", "KIND", "NAME", "MASK"
+        "{:<16} {:<14} {:<24} {:<40} {:<7} BASE URL",
+        "ID", "KIND", "NAME", "MASK", "SHARED"
     );
     for p in providers {
         println!(
-            "{:<16} {:<14} {:<24} {:<40} {}",
+            "{:<16} {:<14} {:<24} {:<40} {:<7} {}",
             p.id,
             kind_label(&p.kind),
             p.name,
@@ -267,6 +303,7 @@ fn list(store: &crate::storage::Store, profile: Option<String>) -> Result<()> {
                 .as_ref()
                 .map(|m| m.name.as_str())
                 .unwrap_or("-"),
+            if p.shared { "yes" } else { "no" },
             p.base_url
         );
     }
@@ -312,6 +349,10 @@ fn edit(store: &crate::storage::Store, profile: Option<String>) -> Result<()> {
     // Keep the existing egress mask unless the user picks a different one.
     let masking_server_id = resolve_mask_id(store, &profile, None, &theme)?
         .or(provider.masking_server.as_ref().map(|m| m.id));
+    let shared = Confirm::with_theme(&theme)
+        .with_prompt("Share this provider with every profile?")
+        .default(provider.shared)
+        .interact()?;
 
     store.update_provider(
         provider.id,
@@ -327,6 +368,7 @@ fn edit(store: &crate::storage::Store, profile: Option<String>) -> Result<()> {
             kind,
             extra_headers,
             masking_server_id,
+            shared,
         },
     )?;
     println!(
@@ -369,6 +411,46 @@ fn delete(
     }
     store.delete_provider(provider.id)?;
     println!("Deleted provider {:?}.", provider.name);
+    Ok(())
+}
+
+/// Publish (or unpublish) a provider across the instance.
+fn share_cmd(
+    store: &crate::storage::Store,
+    profile: Option<String>,
+    provider_name: Option<String>,
+    share: Option<bool>,
+) -> Result<()> {
+    let theme = ColorfulTheme::default();
+    let profile = resolve_profile(store, profile)?;
+    ensure_password_ok(&profile)?;
+    let provider = match provider_name {
+        Some(n) if !n.is_empty() => store
+            .list_providers(profile.id.as_str())?
+            .into_iter()
+            .find(|p| p.name == n)
+            .with_context(|| format!("no provider named {n:?} under profile {:?}", profile.name))?,
+        _ => pick_provider(store, &profile, "Provider to share")?,
+    };
+    let shared = match share {
+        Some(s) => s,
+        None => Confirm::with_theme(&theme)
+            .with_prompt(format!(
+                "Share provider {:?} with every profile?",
+                provider.name
+            ))
+            .default(!provider.shared)
+            .interact()?,
+    };
+    store.set_provider_shared(provider.id, shared)?;
+    if shared {
+        println!(
+            "Provider {:?} is now shared: every profile may route through it.",
+            provider.name
+        );
+    } else {
+        println!("Provider {:?} is no longer shared.", provider.name);
+    }
     Ok(())
 }
 
