@@ -4,9 +4,6 @@
 # Local planning notes — never shared
 AGENT.md
 /plan
-# Local agent rules — never shared
-.clinerules
-.agostmp/
 
 # Generated docs artifacts of `make docs` (regenerated per release, not
 # reviewed in diffs); docs/CLI.md and docs/reference/ stay tracked.
