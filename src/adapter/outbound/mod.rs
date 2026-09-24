@@ -153,37 +153,85 @@ pub fn build_upstream_request(
 }
 
 /// Provider-native request building, without the prompt-cache pass.
+/// Responses fields that have a defined translation in the canonical request
+/// and may therefore cross to a non-Responses upstream.
+const CROSS_PROTOCOL_RESPONSES_FIELDS: [&str; 7] = [
+    "tools",
+    "tool_choice",
+    "parallel_tool_calls",
+    "temperature",
+    "top_p",
+    "max_output_tokens",
+    "text",
+];
+
+fn validate_cross_protocol_fields(target: &Target, chat_req: &ChatRequest) -> Result<()> {
+    if target.provider.kind == ProviderKind::OpenAIResponses {
+        return Ok(());
+    }
+    let Some(fields) = chat_req
+        .extra
+        .get(crate::adapter::inbound::responses::RESPONSES_KEY)
+        .and_then(|v| v.as_object())
+    else {
+        return Ok(());
+    };
+    for (key, value) in fields {
+        if key == "store" && value == &serde_json::Value::Bool(false) {
+            continue;
+        }
+        if !CROSS_PROTOCOL_RESPONSES_FIELDS.contains(&key.as_str()) {
+            anyhow::bail!(
+                "{adapter_marker}: Responses field {key:?} has no cross-protocol representation",
+                adapter_marker = responses::ADAPTER_CAPABILITY_SKIP
+            );
+        }
+    }
+    Ok(())
+}
+
 fn build_native_request(
     target: &Target,
     chat_req: &ChatRequest,
     stream: bool,
 ) -> Result<(String, BTreeMap<String, String>, serde_json::Value)> {
-    match target.provider.kind {
+    validate_cross_protocol_fields(target, chat_req)?;
+    let (url, mut headers, body) = match target.provider.kind {
         ProviderKind::Anthropic => {
-            let url = anthropic::build_url(target);
-            let headers = anthropic::build_headers(target);
-            let body = anthropic::translate_request(chat_req, &target.entry.model_id);
-            Ok((url, headers, body))
+            let body = anthropic::translate_request(chat_req, &target.entry.model_id)?;
+            (
+                anthropic::build_url(target),
+                anthropic::build_headers(target),
+                body,
+            )
         }
         ProviderKind::Google => {
-            let url = google::build_url(target, stream);
-            let headers = google::build_headers(target);
-            let body = google::translate_request(chat_req);
-            Ok((url, headers, body))
+            let body = google::translate_request(chat_req)?;
+            (
+                google::build_url(target, stream),
+                google::build_headers(target),
+                body,
+            )
         }
         // The Responses endpoint is only served non-streamed in v1; the
         // streaming handler wraps the full answer into an SSE response.
         ProviderKind::OpenAIResponses => {
-            let url = responses::build_url(target);
-            let headers = responses::build_headers(target);
             let body = responses::translate_request(chat_req, &target.entry.model_id)?;
-            Ok((url, headers, body))
+            (
+                responses::build_url(target),
+                responses::build_headers(target),
+                body,
+            )
         }
         // OpenAI and custom providers share the passthrough adapter.
         ProviderKind::OpenAI | ProviderKind::Custom => {
-            openai::build_upstream_request(target, chat_req, stream)
+            openai::build_upstream_request(target, chat_req, stream)?
         }
+    };
+    if let Some(request_id) = &chat_req.request_id {
+        headers.insert("X-Request-ID".to_string(), request_id.clone());
     }
+    Ok((url, headers, body))
 }
 
 /// Reshape a successful upstream response into OpenAI JSON bytes.

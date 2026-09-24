@@ -78,6 +78,12 @@ pub struct RequestNeeds {
     pub tools: bool,
     /// The request carries image (vision) parts.
     pub vision: bool,
+    /// The request carries audio input.
+    pub audio: bool,
+    /// The request carries video input.
+    pub video: bool,
+    /// The request carries a generic file/PDF.
+    pub files: bool,
     /// The request asks for structured JSON output.
     pub json_mode: bool,
 }
@@ -92,19 +98,30 @@ impl RequestNeeds {
         let json_mode = body
             .pointer("/response_format/type")
             .and_then(|v| v.as_str())
-            .is_some_and(|t| t == "json_object");
-        let mut vision = false;
+            .is_some_and(|t| t == "json_object" || t == "json_schema");
+        let (mut vision, mut audio, mut video, mut files) = (false, false, false, false);
         if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
-            for msg in messages {
-                if msg.get("content").is_some_and(|c| c.is_array()) {
-                    vision = true;
-                    break;
+            for message in messages {
+                let Some(content) = message.get("content") else {
+                    continue;
+                };
+                for part in crate::translator::content_parts(content) {
+                    match part {
+                        crate::translator::ContentPart::Image { .. } => vision = true,
+                        crate::translator::ContentPart::Audio { .. } => audio = true,
+                        crate::translator::ContentPart::Video { .. } => video = true,
+                        crate::translator::ContentPart::File { .. } => files = true,
+                        crate::translator::ContentPart::Text(_) => {}
+                    }
                 }
             }
         }
         Self {
             tools,
             vision,
+            audio,
+            video,
+            files,
             json_mode,
         }
     }
@@ -115,12 +132,15 @@ impl RequestNeeds {
     pub fn satisfies(&self, caps: &crate::domain::RouteCapabilities) -> bool {
         (!self.tools || caps.tools)
             && (!self.vision || caps.vision)
+            && (!self.audio || caps.audio)
+            && (!self.video || caps.video)
+            && (!self.files || caps.files)
             && (!self.json_mode || caps.json_mode)
     }
 
     /// Whether this request needs nothing beyond a plain text chat completion.
     pub fn is_empty(&self) -> bool {
-        !self.tools && !self.vision && !self.json_mode
+        !self.tools && !self.vision && !self.audio && !self.video && !self.files && !self.json_mode
     }
 
     /// The needed capabilities as stable machine-readable labels, for error
@@ -132,6 +152,15 @@ impl RequestNeeds {
         }
         if self.vision {
             out.push("vision");
+        }
+        if self.audio {
+            out.push("audio");
+        }
+        if self.video {
+            out.push("video");
+        }
+        if self.files {
+            out.push("files");
         }
         if self.json_mode {
             out.push("json_mode");
@@ -171,7 +200,8 @@ pub struct Target {
 /// resources other profiles have published.
 pub fn resolve_targets(store: &Store, profile_id: &str, model: &str) -> Result<Vec<Target>> {
     let route = resolve_route(store, profile_id, model)?;
-    let mut targets = expand_route_targets(store, profile_id, route.id, RequestNeeds::default(), 0)?;
+    let mut targets =
+        expand_route_targets(store, profile_id, route.id, RequestNeeds::default(), 0)?;
     for target in &mut targets {
         target.identity = route.identity.clone();
         target.prompt_cache = route.prompt_cache;
@@ -216,7 +246,14 @@ fn expand_route_targets(
     needs: RequestNeeds,
     depth: usize,
 ) -> Result<Vec<Target>> {
-    expand_inner(store, caller_profile, route_id, needs, depth, &mut Vec::new())
+    expand_inner(
+        store,
+        caller_profile,
+        route_id,
+        needs,
+        depth,
+        &mut Vec::new(),
+    )
 }
 
 fn expand_inner(
@@ -525,7 +562,9 @@ pub(crate) fn classify_failure(status_code: Option<i64>, message: &str) -> Failu
     if message.contains(crate::mask::MASK_SKIP) || message.contains(crate::mask::MASK_FAILED) {
         return FailureAction::Ignore;
     }
-    if message.contains(crate::adapter::outbound::responses::ADAPTER_CAPABILITY_SKIP) {
+    if message.contains(crate::adapter::outbound::responses::ADAPTER_CAPABILITY_SKIP)
+        || message.contains(crate::adapter::outbound::anthropic::ADAPTER_CAPABILITY_SKIP)
+    {
         return FailureAction::Ignore;
     }
     match status_code {
@@ -1108,7 +1147,7 @@ mod tests {
     }
 
     #[test]
-    fn needs_from_body_detects_tools_vision_and_json() {
+    fn needs_from_body_detects_all_supported_modalities_and_json() {
         let tools = serde_json::json!({
             "model": "m",
             "messages": [{"role": "user", "content": "hi"}],
@@ -1129,6 +1168,18 @@ mod tests {
         let n = RequestNeeds::from_body(&vision);
         assert!(n.vision);
         assert!(!n.tools);
+
+        let media = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": [
+                {"type": "input_audio", "input_audio": {"data": "QQ==", "format": "wav"}},
+                {"type": "video_url", "video_url": {"url": "https://x/clip.mp4"}},
+                {"type": "input_file", "file_url": "https://x/doc.pdf"}
+            ]}]
+        });
+        let media_needs = RequestNeeds::from_body(&media);
+        assert!(media_needs.audio && media_needs.video && media_needs.files);
+        assert!(!media_needs.vision);
 
         let json = serde_json::json!({
             "model": "m",
@@ -1582,7 +1633,9 @@ mod tests {
                 },
             )
             .unwrap();
-        let proxy = store.create_proxy(profile.id.as_str(), "prog", None).unwrap();
+        let proxy = store
+            .create_proxy(profile.id.as_str(), "prog", None)
+            .unwrap();
         // A leaf route holding the real model...
         let leaf = store
             .create_route(proxy.id, "leaf", None, RoutingStrategy::Priority, None)
@@ -1608,15 +1661,21 @@ mod tests {
     fn a_circular_route_chain_is_refused_rather_than_looped() {
         let store = Store::open_in_memory().unwrap();
         let profile = store.create_profile("coder1", None, None).unwrap();
-        let proxy = store.create_proxy(profile.id.as_str(), "prog", None).unwrap();
+        let proxy = store
+            .create_proxy(profile.id.as_str(), "prog", None)
+            .unwrap();
         let a = store
             .create_route(proxy.id, "a", None, RoutingStrategy::Priority, None)
             .unwrap();
         let b = store
             .create_route(proxy.id, "b", None, RoutingStrategy::Priority, None)
             .unwrap();
-        store.add_route_entry_ref(a.id, b.id, "prog/b", 1, 1.0).unwrap();
-        store.add_route_entry_ref(b.id, a.id, "prog/a", 1, 1.0).unwrap();
+        store
+            .add_route_entry_ref(a.id, b.id, "prog/b", 1, 1.0)
+            .unwrap();
+        store
+            .add_route_entry_ref(b.id, a.id, "prog/a", 1, 1.0)
+            .unwrap();
 
         let err = resolve_targets(&store, &profile.id, "prog/a").unwrap_err();
         assert!(

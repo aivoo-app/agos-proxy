@@ -405,7 +405,10 @@ Each surface authenticates with the same profile token, presented the way its
 native client expects: `Authorization: Bearer <token>` (OpenAI), `x-api-key
 <token>` (Anthropic), or `?key=<token>` (Gemini). Streaming responses are
 translated into the caller's own SSE format regardless of which provider is
-upstream.
+upstream. Tool calls/results and roleplay instructions are translated across
+OpenAI, Responses, Anthropic, and Gemini; image, audio, video, and file parts
+are routed only to entries declaring the matching capability. `X-Request-ID` is
+echoed, forwarded upstream, and stored with each usage attempt.
 
 Full reference: [API Reference](docs/api-reference.md)
 

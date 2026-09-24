@@ -7,6 +7,7 @@
 
 use crate::adapter::inbound::InboundAdapter;
 use crate::adapter::ApiKind;
+
 use crate::translator::{CanonicalResponse, ChatRequest, Message, StreamEvent};
 
 /// The Google native inbound surface.
@@ -43,53 +44,66 @@ fn part_field<'a>(
 /// native shape: `inlineData` re-encodes as a `data:<mime>;base64,<data>` URL
 /// and `fileData` becomes an `image_url` part referencing the `fileUri`.
 fn google_content(parts: &serde_json::Value) -> serde_json::Value {
-    let has_image = parts.as_array().is_some_and(|arr| {
+    let has_media = parts.as_array().is_some_and(|arr| {
         arr.iter().any(|p| {
             part_field(p, "inlineData", "inline_data").is_some()
                 || part_field(p, "fileData", "file_data").is_some()
         })
     });
-    if !has_image {
+    if !has_media {
         return serde_json::Value::String(parts_text(parts));
     }
-
     let canonical: Vec<serde_json::Value> = parts
         .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|p| {
-                    if let Some(inline) = part_field(p, "inlineData", "inline_data") {
-                        let mime = inline
-                            .get("mimeType")
-                            .or_else(|| inline.get("mime_type"))
-                            .and_then(|m| m.as_str())
-                            .unwrap_or("image/png");
-                        let data = inline
-                            .get("data")
-                            .and_then(|d| d.as_str())
-                            .unwrap_or_default();
-                        return Some(serde_json::json!({
-                            "type": "image_url",
-                            "image_url": { "url": format!("data:{mime};base64,{data}") },
-                        }));
-                    }
-                    if let Some(file) = part_field(p, "fileData", "file_data") {
-                        let uri = file
-                            .get("fileUri")
-                            .or_else(|| file.get("file_uri"))
-                            .and_then(|u| u.as_str())?;
-                        return Some(serde_json::json!({
-                            "type": "image_url",
-                            "image_url": { "url": uri },
-                        }));
-                    }
-                    let text = p.get("text").and_then(|t| t.as_str())?;
-                    Some(serde_json::json!({ "type": "text", "text": text }))
-                })
-                .collect()
-        })
+        .map(|arr| arr.iter().filter_map(google_part).collect())
         .unwrap_or_default();
     serde_json::Value::Array(canonical)
+}
+
+fn google_part(part: &serde_json::Value) -> Option<serde_json::Value> {
+    if let Some(inline) = part_field(part, "inlineData", "inline_data") {
+        let mime = inline
+            .get("mimeType")
+            .or_else(|| inline.get("mime_type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("application/octet-stream");
+        let data = inline
+            .get("data")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        return Some(if mime.starts_with("image/") {
+            serde_json::json!({ "type": "image_url", "image_url": { "url": format!("data:{mime};base64,{data}") } })
+        } else if mime.starts_with("audio/") {
+            serde_json::json!({ "type": "input_audio", "input_audio": { "data": data, "format": mime.trim_start_matches("audio/") } })
+        } else if mime.starts_with("video/") {
+            serde_json::json!({ "type": "video_url", "video_url": { "url": format!("data:{mime};base64,{data}") } })
+        } else {
+            serde_json::json!({ "type": "file", "file": { "file_data": data, "filename": "upload" } })
+        });
+    }
+    if let Some(file) = part_field(part, "fileData", "file_data") {
+        let mime = file
+            .get("mimeType")
+            .or_else(|| file.get("mime_type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("application/octet-stream");
+        let uri = file
+            .get("fileUri")
+            .or_else(|| file.get("file_uri"))
+            .and_then(|v| v.as_str())?;
+        return Some(if mime.starts_with("image/") {
+            serde_json::json!({ "type": "image_url", "image_url": { "url": uri } })
+        } else if mime.starts_with("audio/") {
+            serde_json::json!({ "type": "audio_url", "audio_url": { "url": uri } })
+        } else if mime.starts_with("video/") {
+            serde_json::json!({ "type": "video_url", "video_url": { "url": uri } })
+        } else {
+            serde_json::json!({ "type": "file", "file": { "file_url": uri } })
+        });
+    }
+    part.get("text")
+        .and_then(|text| text.as_str())
+        .map(|text| serde_json::json!({ "type": "text", "text": text }))
 }
 
 /// Map a Google finish reason onto our canonical finish reason.
@@ -137,8 +151,38 @@ impl InboundAdapter for GoogleAdapter {
                     Some("model") => "assistant",
                     _ => "user",
                 };
-                let content = google_content(c.get("parts").unwrap_or(&serde_json::Value::Null));
-                messages.push(Message::new(role, content));
+                let parts = c.get("parts").cloned().unwrap_or(serde_json::Value::Null);
+                let mut message = Message::new(role, google_content(&parts));
+                let calls: Vec<_> = parts.as_array().into_iter().flat_map(|parts| parts.iter()).filter_map(|part| {
+                    let call = part.get("functionCall")?;
+                    Some(serde_json::json!({
+                        "id": call.get("id").and_then(|v| v.as_str()).unwrap_or_default(),
+                        "type": "function",
+                        "function": { "name": call.get("name").and_then(|v| v.as_str()).unwrap_or_default(), "arguments": call.get("args").map(|v| if v.is_string() { v.clone() } else { serde_json::Value::String(v.to_string()) }).unwrap_or_else(|| serde_json::Value::String("{}".into())) }
+                    }))
+                }).collect();
+                if !calls.is_empty() {
+                    message.extra = serde_json::json!({ "tool_calls": calls });
+                }
+                let responses: Vec<_> = parts
+                    .as_array()
+                    .into_iter()
+                    .flat_map(|parts| parts.iter())
+                    .filter_map(|part| part.get("functionResponse"))
+                    .collect();
+                if let Some(response) = responses.first() {
+                    message.role = "tool".to_string();
+                    let name = response
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("tool");
+                    message.content = response
+                        .get("response")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    message.extra = serde_json::json!({ "tool_call_id": name, "name": name });
+                }
+                messages.push(message);
             }
         }
 
@@ -163,6 +207,37 @@ impl InboundAdapter for GoogleAdapter {
                     obj.insert(mapped.to_string(), v);
                 }
             }
+            if let Some(tools) = obj.remove("tools") {
+                let declarations = tools
+                    .pointer("/0/functionDeclarations")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let converted: Vec<_> = declarations
+                    .into_iter()
+                    .map(|function| {
+                        serde_json::json!({
+                            "type": "function", "function": function
+                        })
+                    })
+                    .collect();
+                obj.insert("tools".into(), serde_json::Value::Array(converted));
+            }
+            if let Some(config) = obj.remove("toolConfig") {
+                if let Some(mode) = config
+                    .pointer("/functionCallingConfig/mode")
+                    .and_then(|v| v.as_str())
+                {
+                    obj.insert(
+                        "tool_choice".into(),
+                        serde_json::json!(match mode {
+                            "ANY" => "required",
+                            "NONE" => "none",
+                            _ => "auto",
+                        }),
+                    );
+                }
+            }
         }
 
         Ok(ChatRequest {
@@ -170,17 +245,33 @@ impl InboundAdapter for GoogleAdapter {
             messages,
             stream,
             extra,
+            request_id: None,
         })
     }
 
-    fn render_response(&self, resp: &CanonicalResponse) -> serde_json::Value {
-        serde_json::json!({
+    fn render_response(&self, resp: &CanonicalResponse) -> anyhow::Result<serde_json::Value> {
+        let mut parts = Vec::new();
+        if !resp.text.is_empty() {
+            parts.extend(resp.media.iter().map(|part| match part {
+            crate::translator::ContentPart::Text(text) => serde_json::json!({ "text": text }),
+            crate::translator::ContentPart::Image { url } | crate::translator::ContentPart::Audio { url } | crate::translator::ContentPart::Video { url } | crate::translator::ContentPart::File { url } => {
+                if let Some(data) = crate::translator::parse_data_url(url) {
+                    serde_json::json!({ "inlineData": { "mimeType": data.mime, "data": data.data } })
+                } else {
+                    serde_json::json!({ "fileData": { "mimeType": "application/octet-stream", "fileUri": url } })
+                }
+            }
+        }));
+
+            parts.push(serde_json::json!({ "text": resp.text }));
+        }
+        parts.extend(resp.tool_calls.iter().map(|call| serde_json::json!({
+            "functionCall": { "name": call.name, "args": serde_json::from_str::<serde_json::Value>(&call.arguments).unwrap_or(serde_json::json!({})) }
+        })));
+        Ok(serde_json::json!({
             "candidates": [{
-                "content": {
-                    "parts": [{ "text": resp.text }],
-                    "role": "model",
-                },
-                "finishReason": google_finish(&resp.finish_reason),
+                "content": { "parts": parts, "role": "model" },
+                "finishReason": if resp.tool_calls.is_empty() { google_finish(&resp.finish_reason) } else { "STOP" },
                 "index": 0,
             }],
             "usageMetadata": {
@@ -189,7 +280,7 @@ impl InboundAdapter for GoogleAdapter {
                 "totalTokenCount": resp.total_tokens(),
             },
             "modelVersion": resp.model,
-        })
+        }))
     }
 
     fn render_stream_event(&self, ev: &StreamEvent, _id: &str) -> Option<String> {
@@ -199,11 +290,13 @@ impl InboundAdapter for GoogleAdapter {
             "role".to_string(),
             serde_json::Value::String("model".to_string()),
         );
-        let parts = if ev.delta.is_empty() {
-            Vec::new()
-        } else {
-            vec![serde_json::json!({ "text": ev.delta })]
-        };
+        let mut parts = Vec::new();
+        if !ev.delta.is_empty() {
+            parts.push(serde_json::json!({ "text": ev.delta }));
+        }
+        parts.extend(ev.tool_call_deltas.iter().map(|call| serde_json::json!({
+            "functionCall": { "name": call.name.clone().unwrap_or_default(), "args": serde_json::from_str::<serde_json::Value>(call.arguments_delta.as_deref().unwrap_or("{}")).unwrap_or(serde_json::json!({})) }
+        })));
         content.insert("parts".to_string(), serde_json::Value::Array(parts));
         candidate.insert("content".to_string(), serde_json::Value::Object(content));
         if let Some(reason) = &ev.finish_reason {

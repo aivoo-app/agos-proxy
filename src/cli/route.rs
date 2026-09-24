@@ -467,6 +467,9 @@ fn model_add(
             RouteCapabilities {
                 tools: false,
                 vision: false,
+                audio: false,
+                video: false,
+                files: false,
                 json_mode: false,
                 max_context: None,
             }
@@ -630,7 +633,10 @@ fn pick_entry(
 
 /// A human label for where an entry routes: the provider (plus kind) for
 /// direct entries, or the referenced route for nested ones.
-fn provider_label(store: &crate::storage::Store, entry: &crate::domain::RouteEntry) -> Result<String> {
+fn provider_label(
+    store: &crate::storage::Store,
+    entry: &crate::domain::RouteEntry,
+) -> Result<String> {
     if let Some(target_route_id) = entry.target_route_id {
         if let Some(route) = store.get_route_by_id(target_route_id)? {
             if let Some(proxy) = store.get_proxy(route.proxy_id)? {
@@ -640,7 +646,10 @@ fn provider_label(store: &crate::storage::Store, entry: &crate::domain::RouteEnt
         }
         return Ok("(missing route)".to_string());
     }
-    match entry.provider_id.and_then(|id| store.get_provider(id).ok().flatten()) {
+    match entry
+        .provider_id
+        .and_then(|id| store.get_provider(id).ok().flatten())
+    {
         Some(p) => Ok(format!(
             "{} ({})",
             p.name,
@@ -650,7 +659,10 @@ fn provider_label(store: &crate::storage::Store, entry: &crate::domain::RouteEnt
     }
 }
 
-fn provider_name(store: &crate::storage::Store, entry: &crate::domain::RouteEntry) -> Result<String> {
+fn provider_name(
+    store: &crate::storage::Store,
+    entry: &crate::domain::RouteEntry,
+) -> Result<String> {
     if let Some(target_route_id) = entry.target_route_id {
         if let Some(route) = store.get_route_by_id(target_route_id)? {
             if let Some(proxy) = store.get_proxy(route.proxy_id)? {
@@ -660,7 +672,10 @@ fn provider_name(store: &crate::storage::Store, entry: &crate::domain::RouteEntr
         }
         return Ok("(missing route)".to_string());
     }
-    match entry.provider_id.and_then(|id| store.get_provider(id).ok().flatten()) {
+    match entry
+        .provider_id
+        .and_then(|id| store.get_provider(id).ok().flatten())
+    {
         Some(p) => Ok(p.name.clone()),
         None => Ok("(unknown)".to_string()),
     }
@@ -722,6 +737,18 @@ fn prompt_capabilities(theme: &ColorfulTheme) -> Result<RouteCapabilities> {
         .with_prompt("Supports image (vision) input?")
         .default(false)
         .interact()?;
+    let audio = Confirm::with_theme(theme)
+        .with_prompt("Supports audio input?")
+        .default(false)
+        .interact()?;
+    let video = Confirm::with_theme(theme)
+        .with_prompt("Supports video input?")
+        .default(false)
+        .interact()?;
+    let files = Confirm::with_theme(theme)
+        .with_prompt("Supports file/PDF input?")
+        .default(false)
+        .interact()?;
     let json_mode = Confirm::with_theme(theme)
         .with_prompt("Supports structured JSON output?")
         .default(false)
@@ -729,6 +756,9 @@ fn prompt_capabilities(theme: &ColorfulTheme) -> Result<RouteCapabilities> {
     Ok(RouteCapabilities {
         tools,
         vision,
+        audio,
+        video,
+        files,
         json_mode,
         max_context: None,
     })

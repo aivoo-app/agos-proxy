@@ -16,6 +16,11 @@ use uuid::Uuid;
 /// server-generated one.
 pub const REQUEST_ID_HEADER: &str = "X-Request-ID";
 
+/// Request metadata carried through extensions without colliding with the
+/// authenticated profile token, which auth middleware also stores as `String`.
+#[derive(Clone, Debug)]
+pub struct RequestId(pub String);
+
 /// Generate or propagate a request ID, attach it to the request extensions for
 /// handlers to read, echo it back in the response, and log the request on
 /// completion with method, path, status and latency.
@@ -36,7 +41,9 @@ pub async fn request_id_and_logging(request: Request, next: Next) -> Response {
 
     // Stash the id so handlers can reference it in their own log lines.
     let mut request = request;
-    request.extensions_mut().insert(request_id.clone());
+    request
+        .extensions_mut()
+        .insert(RequestId(request_id.clone()));
 
     let mut response = next.run(request).await;
 

@@ -6,7 +6,7 @@
 
 use crate::adapter::inbound::InboundAdapter;
 use crate::adapter::ApiKind;
-use crate::translator::{CanonicalResponse, ChatRequest, Message, StreamEvent};
+use crate::translator::{CanonicalResponse, ChatRequest, ContentPart, Message, StreamEvent};
 
 /// The Anthropic native inbound surface.
 pub struct AnthropicAdapter;
@@ -37,12 +37,15 @@ fn anthropic_content_text(content: &serde_json::Value) -> String {
 /// - `source.type = "base64"` → an `image_url` part holding the payload
 ///   re-encoded as a `data:<media_type>;base64,<data>` URL.
 fn anthropic_content(content: &serde_json::Value) -> serde_json::Value {
-    let has_image = content.as_array().is_some_and(|blocks| {
-        blocks
-            .iter()
-            .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("image"))
+    let has_media = content.as_array().is_some_and(|blocks| {
+        blocks.iter().any(|b| {
+            matches!(
+                b.get("type").and_then(|t| t.as_str()),
+                Some("image" | "document")
+            )
+        })
     });
-    if !has_image {
+    if !has_media {
         return serde_json::Value::String(anthropic_content_text(content));
     }
 
@@ -53,6 +56,7 @@ fn anthropic_content(content: &serde_json::Value) -> serde_json::Value {
                 .iter()
                 .filter_map(|b| match b.get("type").and_then(|t| t.as_str()) {
                     Some("image") => anthropic_image_part(b),
+                    Some("document") => anthropic_document_part(b),
                     _ => {
                         let text = b.get("text").and_then(|t| t.as_str()).unwrap_or_default();
                         if text.is_empty() {
@@ -95,6 +99,25 @@ fn anthropic_image_part(block: &serde_json::Value) -> Option<serde_json::Value> 
         "type": "image_url",
         "image_url": { "url": url },
     }))
+}
+fn anthropic_document_part(block: &serde_json::Value) -> Option<serde_json::Value> {
+    let source = block.get("source")?;
+    let url = match source.get("type").and_then(|t| t.as_str())? {
+        "url" => source.get("url").and_then(|v| v.as_str())?.to_string(),
+        "base64" => format!(
+            "data:{};base64,{}",
+            source
+                .get("media_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("application/pdf"),
+            source
+                .get("data")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+        ),
+        _ => return None,
+    };
+    Some(serde_json::json!({ "type": "file", "file": { "file_url": url } }))
 }
 
 /// Map an Anthropic finish reason onto our canonical finish reason.
@@ -140,14 +163,41 @@ impl InboundAdapter for AnthropicAdapter {
         }
         if let Some(arr) = body.get("messages").and_then(|m| m.as_array()) {
             for m in arr {
-                let role = m
-                    .get("role")
-                    .and_then(|r| r.as_str())
-                    .unwrap_or("user")
-                    .to_string();
-                let content =
-                    anthropic_content(m.get("content").unwrap_or(&serde_json::Value::Null));
-                messages.push(Message::new(role, content));
+                let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+                let raw_content = m.get("content").cloned().unwrap_or(serde_json::Value::Null);
+                let calls: Vec<_> = raw_content
+                    .as_array()
+                    .into_iter()
+                    .flat_map(|blocks| blocks.iter())
+                    .filter(|block| block.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+                    .map(|block| serde_json::json!({
+                        "id": block.get("id").and_then(|v| v.as_str()).unwrap_or_default(),
+                        "type": "function",
+                        "function": { "name": block.get("name").and_then(|v| v.as_str()).unwrap_or_default(), "arguments": block.get("input").map(|v| if v.is_string() { v.clone() } else { serde_json::Value::String(v.to_string()) }).unwrap_or_else(|| serde_json::Value::String("{}".into())) }
+                    }))
+                    .collect();
+                let result = raw_content.as_array().and_then(|blocks| {
+                    blocks.iter().find(|block| {
+                        block.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+                    })
+                });
+                if let Some(result) = result {
+                    let mut msg = Message::new(
+                        "tool",
+                        result
+                            .get("content")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                    );
+                    msg.extra = serde_json::json!({ "tool_call_id": result.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or_default(), "name": calls.first().and_then(|v| v.pointer("/function/name").cloned()).unwrap_or_default() });
+                    messages.push(msg);
+                } else {
+                    let mut msg = Message::new(role, anthropic_content(&raw_content));
+                    if !calls.is_empty() {
+                        msg.extra = serde_json::json!({ "tool_calls": calls });
+                    }
+                    messages.push(msg);
+                }
             }
         }
 
@@ -161,6 +211,24 @@ impl InboundAdapter for AnthropicAdapter {
             if let Some(v) = obj.remove("stop_sequences") {
                 obj.insert("stop".to_string(), v);
             }
+            if let Some(tools) = obj.remove("tools") {
+                let converted: Vec<_> = tools.as_array().into_iter().flat_map(|tools| tools.iter()).map(|tool| serde_json::json!({
+                    "type": "function",
+                    "function": { "name": tool.get("name").cloned().unwrap_or_default(), "description": tool.get("description").cloned().unwrap_or_default(), "parameters": tool.get("input_schema").cloned().unwrap_or(serde_json::json!({ "type": "object", "properties": {} })) }
+                })).collect();
+                obj.insert("tools".into(), serde_json::Value::Array(converted));
+            }
+            if let Some(choice) = obj.remove("tool_choice") {
+                let choice = match choice.get("type").and_then(|v| v.as_str()) {
+                    Some("any") => serde_json::json!("required"),
+                    Some("none") => serde_json::json!("none"),
+                    Some("tool") => {
+                        serde_json::json!({ "type": "function", "function": { "name": choice.get("name").cloned().unwrap_or_default() } })
+                    }
+                    _ => serde_json::json!("auto"),
+                };
+                obj.insert("tool_choice".into(), choice);
+            }
         }
 
         Ok(ChatRequest {
@@ -168,49 +236,77 @@ impl InboundAdapter for AnthropicAdapter {
             messages,
             stream,
             extra,
+            request_id: None,
         })
     }
 
-    fn render_response(&self, resp: &CanonicalResponse) -> serde_json::Value {
-        serde_json::json!({
+    fn render_response(&self, resp: &CanonicalResponse) -> anyhow::Result<serde_json::Value> {
+        if let Some(ContentPart::Audio { .. } | ContentPart::Video { .. }) = resp
+            .media
+            .iter()
+            .find(|part| matches!(part, ContentPart::Audio { .. } | ContentPart::Video { .. }))
+        {
+            anyhow::bail!("Anthropic responses cannot represent audio/video output")
+        }
+        let mut content = if resp.text.is_empty() {
+            Vec::new()
+        } else {
+            vec![serde_json::json!({ "type": "text", "text": resp.text })]
+        };
+        content.extend(resp.media.iter().filter_map(|part| match part {
+            ContentPart::Text(text) => Some(serde_json::json!({ "type": "text", "text": text })),
+            ContentPart::Image { url } => Some(
+                serde_json::json!({ "type": "image", "source": { "type": "url", "url": url } }),
+            ),
+            ContentPart::File { url } => Some(
+                serde_json::json!({ "type": "document", "source": { "type": "url", "url": url } }),
+            ),
+            ContentPart::Audio { .. } | ContentPart::Video { .. } => None,
+        }));
+        content.extend(resp.tool_calls.iter().map(|call| serde_json::json!({
+            "type": "tool_use", "id": call.wire_id(), "name": call.name,
+            "input": serde_json::from_str::<serde_json::Value>(&call.arguments).unwrap_or(serde_json::json!({})),
+        })));
+        Ok(serde_json::json!({
             "id": resp.id,
             "type": "message",
             "role": "assistant",
             "model": resp.model,
-            "content": [{ "type": "text", "text": resp.text }],
+            "content": content,
             "stop_reason": anthropic_stop_reason(&resp.finish_reason),
             "stop_sequence": null,
             "usage": {
                 "input_tokens": resp.prompt_tokens,
                 "output_tokens": resp.completion_tokens,
             },
-        })
+        }))
     }
 
     fn render_stream_event(&self, ev: &StreamEvent, _id: &str) -> Option<String> {
         if ev.done {
             return Some("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string());
         }
+        let mut frames = String::new();
         if !ev.delta.is_empty() {
-            let payload = serde_json::json!({
-                "type": "content_block_delta",
-                "index": 0,
-                "delta": { "type": "text_delta", "text": ev.delta },
-            });
-            return Some(format!("event: content_block_delta\ndata: {}\n\n", payload));
+            let payload = serde_json::json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": ev.delta } });
+            frames.push_str(&format!("event: content_block_delta\ndata: {payload}\n\n"));
+        }
+        for call in &ev.tool_call_deltas {
+            let index = call.index + 1;
+            if call.id.is_some() || call.name.is_some() {
+                let payload = serde_json::json!({ "type": "content_block_start", "index": index, "content_block": { "type": "tool_use", "id": call.id.clone().unwrap_or_default(), "name": call.name.clone().unwrap_or_default(), "input": {} } });
+                frames.push_str(&format!("event: content_block_start\ndata: {payload}\n\n"));
+            }
+            if let Some(arguments) = &call.arguments_delta {
+                let payload = serde_json::json!({ "type": "content_block_delta", "index": index, "delta": { "type": "input_json_delta", "partial_json": arguments } });
+                frames.push_str(&format!("event: content_block_delta\ndata: {payload}\n\n"));
+            }
         }
         if let Some(reason) = &ev.finish_reason {
-            let payload = serde_json::json!({
-                "type": "message_delta",
-                "delta": {
-                    "stop_reason": anthropic_stop_reason(reason),
-                    "stop_sequence": null,
-                },
-                "usage": { "output_tokens": ev.completion_tokens.unwrap_or(0) },
-            });
-            return Some(format!("event: message_delta\ndata: {}\n\n", payload));
+            let payload = serde_json::json!({ "type": "message_delta", "delta": { "stop_reason": anthropic_stop_reason(reason), "stop_sequence": null }, "usage": { "output_tokens": ev.completion_tokens.unwrap_or(0) } });
+            frames.push_str(&format!("event: message_delta\ndata: {payload}\n\n"));
         }
-        None
+        (!frames.is_empty()).then_some(frames)
     }
 
     fn stream_end_marker(&self) -> Option<String> {

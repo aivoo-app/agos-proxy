@@ -234,6 +234,9 @@ fn setup_store_inner(base_url: &str, kind: ProviderKind, vision: bool) -> (Store
             RouteCapabilities {
                 tools: true,
                 vision,
+                audio: false,
+                video: false,
+                files: false,
                 json_mode: false,
                 max_context: None,
             },

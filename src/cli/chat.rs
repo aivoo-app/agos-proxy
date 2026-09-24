@@ -273,6 +273,7 @@ pub(crate) async fn send_turn(
         messages,
         stream: false,
         extra: serde_json::Value::Null,
+        request_id: None,
     };
 
     let bytes: Vec<u8> = execute_with_failover(store.clone(), targets, attempt_timeout, |target| {

@@ -57,6 +57,10 @@ pub async fn codex_responses(State(state): State<AppState>, req: Request) -> Res
 
 async fn native_chat(state: AppState, kind: ApiKind, req: Request) -> Response {
     let (parts, body) = req.into_parts();
+    let request_id = parts
+        .extensions
+        .get::<crate::server::middleware::RequestId>()
+        .map(|id| id.0.clone());
     let profile_id = match parts.extensions.get::<String>() {
         Some(id) => id.clone(),
         None => return bad_request("unauthenticated"),
@@ -80,10 +84,11 @@ async fn native_chat(state: AppState, kind: ApiKind, req: Request) -> Response {
         }
     }
 
-    let chat_req = match state.adapter.parse_request(kind, &body_value) {
+    let mut chat_req = match state.adapter.parse_request(kind, &body_value) {
         Ok(r) => r,
         Err(e) => return bad_request(format!("invalid request body: {e}")),
     };
+    chat_req.request_id = request_id;
     // Derive capability needs from the canonical request (after native parsing),
     // so Anthropic/Google text arrays are not mistaken for vision content.
     let canonical_value = serde_json::to_value(&chat_req).unwrap_or(serde_json::Value::Null);
@@ -160,6 +165,7 @@ async fn chat_non_stream(
                     false,
                     &outcome,
                     started.elapsed().as_millis() as i64,
+                    req.request_id.as_deref(),
                 )
                 .await;
                 outcome
@@ -175,14 +181,16 @@ async fn chat_non_stream(
             // own native shape. If the payload is not parseable, fall back to
             // sending the OpenAI-shaped bytes through unchanged.
             match outbound::parse_canonical(&bytes) {
-                Ok(canon) => {
-                    let native = state.adapter.render_response(kind, &canon);
-                    Response::builder()
+                Ok(canon) => match state.adapter.render_response(kind, &canon) {
+                    Ok(native) => Response::builder()
                         .status(200)
                         .header("Content-Type", "application/json")
                         .body(axum::body::Body::from(native.to_string()))
-                        .unwrap()
-                }
+                        .unwrap(),
+                    Err(e) => bad_request(format!(
+                        "response cannot be represented on this API surface: {e}"
+                    )),
+                },
                 Err(_) => Response::builder()
                     .status(200)
                     .header("Content-Type", "application/json")
@@ -206,6 +214,7 @@ async fn chat_stream(
     let attempt_timeout = state.attempt_timeout;
     let client = state.http_client.clone();
     let routing_state = state.routing_state.clone();
+    let request_id = chat_req.request_id.clone();
 
     // Try each upstream in sequence to establish a successful HTTP connection
     let targets =
@@ -275,6 +284,7 @@ async fn chat_stream(
                     true,
                     &Err(anyhow::anyhow!("{msg}")),
                     started_at.elapsed().as_millis() as i64,
+                    request_id.clone().as_deref(),
                 )
                 .await;
             }
@@ -287,6 +297,7 @@ async fn chat_stream(
                     true,
                     &Err(anyhow::anyhow!("upstream failed: {e}")),
                     started_at.elapsed().as_millis() as i64,
+                    request_id.clone().as_deref(),
                 )
                 .await;
             }
@@ -299,6 +310,7 @@ async fn chat_stream(
                     true,
                     &Err(anyhow::anyhow!("upstream timeout")),
                     started_at.elapsed().as_millis() as i64,
+                    request_id.clone().as_deref(),
                 )
                 .await;
             }
@@ -326,6 +338,7 @@ async fn chat_stream(
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(16);
     let store_clone = store.clone();
     let profile_id_clone = profile_id.clone();
+    let request_id_clone = request_id.clone();
 
     tokio::spawn(async move {
         let mut renderer = state.adapter.stream_renderer(kind);
@@ -375,6 +388,7 @@ async fn chat_stream(
             true,
             &Ok(Vec::new()),
             started.elapsed().as_millis() as i64,
+            request_id_clone.as_deref(),
         )
         .await;
     });

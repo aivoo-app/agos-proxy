@@ -173,6 +173,9 @@ Defaults: `strategy` = `priority`.
   "capabilities": {
     "tools": true,
     "vision": false,
+    "audio": false,
+    "video": false,
+    "files": false,
     "json_mode": true,
     "max_context": 128000
   }
@@ -185,10 +188,12 @@ Defaults: `strategy` = `priority`.
 | `model`        | yes      | string | Model string the provider expects.                       |
 | `priority`     | no       | number | Position in the chain; defaults to declaration order.   |
 | `weight`       | no       | number | Relative weight; defaults to `1.0`.                     |
-| `capabilities` | no       | object | Feature flags. Defaults to all-true when omitted.       |
+| `capabilities` | no       | object | Feature flags; omitted flags are disabled.          |
 
-`capabilities` fields default to `true` when omitted (the conservative choice
-for bootstrap — you can always restrict later with `route model` commands).
+Each capability flag (`tools`, `vision`, `audio`, `video`, `files`, and
+`json_mode`) is independent. Configure every modality a model actually accepts;
+requests requiring an undeclared capability are rejected before an incompatible
+upstream is called.
 
 ### Example
 

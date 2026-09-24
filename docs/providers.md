@@ -166,12 +166,13 @@ Route entry:
   logs what the provider reports; the numbers are what Anthropic returns.
 - System prompts are mapped into the `messages` array appropriately for
   Anthropic.
-- Tool/function calling is supported through the translator where the provider
-  supports it.
-- **Vision:** image parts in message content are forwarded as Anthropic `image`
-  blocks — `source.type = "url"` for `http(s)` references and
-  `source.type = "base64"` for `data:` URLs. Images inside `system` prompts are
-  dropped (Anthropic system prompts are text-only).
+- Tool/function definitions, assistant tool calls, and tool-result messages
+  are translated to Anthropic `tools`, `tool_use`, and `tool_result` blocks.
+  Streaming tool deltas are translated as well.
+- **Vision/files:** image parts become Anthropic `image` blocks and PDF/file
+  parts become `document` blocks. `source.type = "url"` is used for HTTP(S)
+  references and `source.type = "base64"` for inline data. Audio/video requests
+  are rejected for this destination and can fail over to a compatible entry.
 
 ## Google Gemini
 
@@ -207,11 +208,12 @@ Route entry:
   when the base URL and provider kind indicate Google.
 - Streaming is supported through the Gemini streaming endpoint.
 - Token usage is reported as Google returns it.
-- **Vision:** image parts in message content are forwarded as Gemini parts —
-  `fileData` (`fileUri` + MIME type inferred from the URL's file extension,
-  `image/jpeg` default) for `http(s)` references and `inlineData` for `data:`
-  URLs. Images inside `systemInstruction` are dropped (Gemini system
-  instructions are text-only).
+- Tool/function definitions, assistant function calls, and function responses are
+  translated to Gemini `functionDeclarations`, `functionCall`, and
+  `functionResponse` parts. Streaming function calls are translated too.
+- **Media:** image, audio, video, and file references use Gemini `fileData`
+  (`fileUri` + MIME type) or `inlineData` for inline data. The route must declare
+  the corresponding `vision`, `audio`, `video`, or `files` capability.
 
 ## OpenAI Responses upstreams
 
@@ -223,18 +225,22 @@ repeatable `--header` support as `openai`).
 
 How a chat request is served:
 
-- The transcript is flattened into a single `input` string
-  (`role: content` lines, in order).
-- `temperature` and `top_p` are passed through; `max_tokens` /
-  `max_completion_tokens` map to `max_output_tokens`.
-- `tools`, `tool_choice` and `response_format` are dropped with a debug log
-  (tool calling over Responses is a future feature).
-- The reply's `output[]` items are walked for `message` entries and the
-  `output_text`/`text` parts are joined into the assistant message. If the
-  reply carries no assistant text (e.g. reasoning-only output), the attempt
-  fails and the router falls over to the next chain entry.
-- Token usage is reported only when the upstream sends `input_tokens` /
-  `output_tokens`; nothing is fabricated.
+- The ordered transcript becomes Responses `input` items; system/developer
+  messages become `instructions`, and user/assistant turns remain distinct
+  messages rather than `role: content` text.
+- `tools`, `tool_choice`, `parallel_tool_calls`, and structured
+  `response_format` are translated to Responses-native function tools and
+  `text.format`.
+- Images, inline audio, and files become `input_image`, `input_audio`, and
+  `input_file`; video or unsupported provider-specific parts fail over rather
+  than being flattened.
+- Assistant function calls and function-call outputs become
+  `function_call` / `function_call_output` items, including tool history.
+- The reply's `output[]` items recover both assistant text and function calls.
+  Reasoning-only or otherwise empty replies fail over instead of returning an
+  empty answer.
+- Responses-native fields such as `store`, `reasoning`, `include`, and
+  `prompt_cache_key` are restored when the selected entry is Responses-compatible.
 
 **Streaming:** the Responses adapter serves `stream: true` requests from the
 non-streamed answer, wrapped into a minimal OpenAI SSE stream (content chunk,

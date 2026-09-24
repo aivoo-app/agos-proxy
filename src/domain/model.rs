@@ -305,12 +305,25 @@ impl RouteEntry {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RouteCapabilities {
     /// Supports tool / function calling.
+    #[serde(default)]
     pub tools: bool,
     /// Supports image (vision) input.
+    #[serde(default)]
     pub vision: bool,
+    /// Supports audio input.
+    #[serde(default)]
+    pub audio: bool,
+    /// Supports video input.
+    #[serde(default)]
+    pub video: bool,
+    /// Supports generic file/PDF input.
+    #[serde(default)]
+    pub files: bool,
     /// Supports structured JSON output (`response_format`).
+    #[serde(default)]
     pub json_mode: bool,
     /// Maximum context window in tokens; `None` if unknown.
+    #[serde(default)]
     pub max_context: Option<u32>,
 }
 
@@ -362,6 +375,9 @@ impl RouteCapabilities {
         Self {
             tools: !utility,
             vision: !utility,
+            audio: !utility,
+            video: !utility,
+            files: !utility,
             json_mode: !utility,
             max_context: None,
         }
@@ -382,6 +398,9 @@ impl RouteCapabilities {
         for c in caps {
             out.tools |= c.tools;
             out.vision |= c.vision;
+            out.audio |= c.audio;
+            out.video |= c.video;
+            out.files |= c.files;
             out.json_mode |= c.json_mode;
             out.max_context = match (out.max_context, c.max_context) {
                 (Some(a), Some(b)) => Some(a.max(b)),
@@ -420,6 +439,9 @@ pub struct KeyStats {
 pub struct UsageRecord {
     pub id: i64,
     pub profile_id: String,
+    /// Stable request correlation id shared by every failover attempt.
+    #[serde(default)]
+    pub request_id: Option<String>,
     pub route_entry_id: i64,
     pub model_id: String,
     pub streamed: bool,

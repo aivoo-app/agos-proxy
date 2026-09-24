@@ -477,13 +477,7 @@ pub fn import_bundle(store: &Store, bundle: &PortableProfile, name: &str) -> Res
         let target_route = store
             .get_route_named(target.id, route_name)?
             .with_context(|| format!("nested entry references unknown route {route_name:?}"))?;
-        store.add_route_entry_ref(
-            route_id,
-            target_route.id,
-            &model_label,
-            priority,
-            weight,
-        )?;
+        store.add_route_entry_ref(route_id, target_route.id, &model_label, priority, weight)?;
     }
     Ok(profile.id)
 }

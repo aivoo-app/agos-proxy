@@ -20,8 +20,8 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::crypto::MasterKey;
 
 use crate::domain::{
-    KeyStats, MaskingServer, ModelStatus, Profile, PromptCachePolicy, Provider, ProviderKind, Proxy,
-    Route, RouteCapabilities, RouteEntry, RoutingStrategy, UsageRecord, UsageStats,
+    KeyStats, MaskingServer, ModelStatus, Profile, PromptCachePolicy, Provider, ProviderKind,
+    Proxy, Route, RouteCapabilities, RouteEntry, RoutingStrategy, UsageRecord, UsageStats,
 };
 
 /// Intermediate provider row, used to defer decryption out of the rusqlite closure.
@@ -336,6 +336,8 @@ pub struct NewMaskingServer {
 /// Details needed to append one request to the usage log.
 pub struct NewUsage {
     pub profile_id: String,
+    /// Stable inbound `X-Request-ID` shared by every attempt in the failover chain.
+    pub request_id: Option<String>,
     pub route_entry_id: i64,
     pub model_id: String,
     pub streamed: bool,
@@ -1687,12 +1689,13 @@ impl Store {
         let conn = self.conn();
         conn.execute(
             "INSERT INTO usage_log
-                (profile_id, route_entry_id, model_id, streamed, success,
+                (profile_id, request_id, route_entry_id, model_id, streamed, success,
                  status_code, error_message, latency_ms, prompt_tokens,
                  completion_tokens, cached_prompt_tokens, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             rusqlite::params![
                 rec.profile_id,
+                rec.request_id,
                 rec.route_entry_id,
                 rec.model_id,
                 rec.streamed as i64,
@@ -1710,6 +1713,7 @@ impl Store {
         Ok(UsageRecord {
             id,
             profile_id: rec.profile_id,
+            request_id: rec.request_id,
             route_entry_id: rec.route_entry_id,
             model_id: rec.model_id,
             streamed: rec.streamed,
@@ -1728,7 +1732,7 @@ impl Store {
     pub fn list_usage(&self, profile_id: &str, limit: u32) -> Result<Vec<UsageRecord>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT id, profile_id, route_entry_id, model_id, streamed, success,
+            "SELECT id, profile_id, request_id, route_entry_id, model_id, streamed, success,
                     status_code, error_message, latency_ms, prompt_tokens,
                     completion_tokens, cached_prompt_tokens, created_at
              FROM usage_log
@@ -1740,17 +1744,18 @@ impl Store {
             Ok(UsageRecord {
                 id: row.get(0)?,
                 profile_id: row.get(1)?,
-                route_entry_id: row.get(2)?,
-                model_id: row.get(3)?,
-                streamed: row.get::<_, i64>(4)? != 0,
-                success: row.get::<_, i64>(5)? != 0,
-                status_code: row.get(6)?,
-                error_message: row.get(7)?,
-                latency_ms: row.get(8)?,
-                prompt_tokens: row.get(9)?,
-                completion_tokens: row.get(10)?,
-                cached_prompt_tokens: row.get(11)?,
-                created_at: row.get(12)?,
+                request_id: row.get(2)?,
+                route_entry_id: row.get(3)?,
+                model_id: row.get(4)?,
+                streamed: row.get::<_, i64>(5)? != 0,
+                success: row.get::<_, i64>(6)? != 0,
+                status_code: row.get(7)?,
+                error_message: row.get(8)?,
+                latency_ms: row.get(9)?,
+                prompt_tokens: row.get(10)?,
+                completion_tokens: row.get(11)?,
+                cached_prompt_tokens: row.get(12)?,
+                created_at: row.get(13)?,
             })
         })?;
         let mut out = Vec::new();
@@ -2324,7 +2329,8 @@ mod tests {
         let store = Store::open_in_memory()?;
         let owner = store.create_profile("owner", None, None)?;
         let other = store.create_profile("other", None, None)?;
-        let provider = store.create_provider(owner.id.as_str(), new_provider("shared-key", None))?;
+        let provider =
+            store.create_provider(owner.id.as_str(), new_provider("shared-key", None))?;
 
         // Not shared yet: only the owner sees it.
         assert_eq!(store.list_providers(owner.id.as_str())?.len(), 1);
@@ -2370,7 +2376,10 @@ mod tests {
             },
         )?;
         assert!(mask.shared);
-        assert_eq!(store.list_masking_servers_for(profile.id.as_str())?.len(), 1);
+        assert_eq!(
+            store.list_masking_servers_for(profile.id.as_str())?.len(),
+            1
+        );
         Ok(())
     }
 

@@ -20,19 +20,20 @@
 //! the turn if the stream closes before `response.completed`. Both facts drive
 //! the renderer below.
 
+use anyhow::{bail, Result};
 use serde_json::{json, Map, Value};
-use tracing::{debug, warn};
 
 use crate::adapter::inbound::{InboundAdapter, StreamRenderer};
 use crate::adapter::ApiKind;
+
 use crate::translator::{
-    CanonicalResponse, ChatRequest, Message, StreamEvent, ToolCall, ToolCallDelta,
+    CanonicalResponse, ChatRequest, ContentPart, Message, StreamEvent, ToolCall, ToolCallDelta,
 };
 
 /// The `extra` key holding Responses-only request fields that have no
 /// chat-completions equivalent. The outbound adapters strip it before
 /// forwarding, so a strict provider never sees these parameters.
-const RESPONSES_KEY: &str = "agos_responses";
+pub(crate) const RESPONSES_KEY: &str = "agos_responses";
 
 /// Responses-native inbound surface.
 pub struct ResponsesAdapter;
@@ -42,40 +43,45 @@ pub struct ResponsesAdapter;
 /// Plain text becomes a JSON string so it is not mistaken for vision content
 /// downstream; an item carrying images becomes the OpenAI parts array, which is
 /// what the capability filter looks for.
-fn message_content(content: Option<&Value>) -> Value {
-    // The Responses wire format allows `content` to be a plain string.
-    if let Some(s) = content.and_then(|c| c.as_str()) {
-        return Value::String(s.to_string());
+fn message_content(content: Option<&Value>) -> Result<Value> {
+    if let Some(text) = content.and_then(|c| c.as_str()) {
+        return Ok(Value::String(text.to_string()));
     }
     let Some(parts) = content.and_then(|c| c.as_array()) else {
-        return Value::String(String::new());
+        return Ok(Value::String(String::new()));
     };
-
-    let has_image = parts
-        .iter()
-        .any(|p| p.get("type").and_then(|t| t.as_str()) == Some("input_image"));
-
-    if !has_image {
-        return Value::String(join_text_parts(parts));
+    let has_media = parts.iter().any(|part| {
+        !matches!(
+            part.get("type").and_then(|t| t.as_str()),
+            Some("input_text" | "output_text" | "text")
+        )
+    });
+    if !has_media {
+        return Ok(Value::String(join_text_parts(parts)));
     }
-
-    let openai_parts: Vec<Value> = parts
-        .iter()
-        .filter_map(|part| match part.get("type").and_then(|t| t.as_str()) {
-            Some("input_text" | "output_text" | "text") => Some(json!({
-                "type": "text",
-                "text": part.get("text").and_then(|t| t.as_str()).unwrap_or_default(),
-            })),
-            Some("input_image") => Some(json!({
+    let mut out = Vec::with_capacity(parts.len());
+    for part in parts {
+        let converted = match part.get("type").and_then(|t| t.as_str()) {
+            Some("input_text" | "output_text" | "text") => json!({
+                "type": "text", "text": part.get("text").and_then(|t| t.as_str()).unwrap_or_default(),
+            }),
+            Some("input_image") => json!({
                 "type": "image_url",
-                "image_url": {
-                    "url": part.get("image_url").and_then(|u| u.as_str()).unwrap_or_default(),
-                },
-            })),
-            _ => None,
-        })
-        .collect();
-    Value::Array(openai_parts)
+                "image_url": { "url": part.get("image_url").and_then(|u| u.as_str()).unwrap_or_default() },
+            }),
+            Some("input_audio") => json!({
+                "type": "input_audio", "input_audio": part.get("input_audio").cloned().unwrap_or(Value::Null),
+            }),
+            Some("input_file") => json!({
+                "type": "input_file", "file_data": part.get("file_data").cloned().unwrap_or_default(),
+                "file_url": part.get("file_url").cloned().unwrap_or_default(),
+            }),
+            Some(kind) => bail!("unsupported Responses content part type {kind:?}"),
+            None => bail!("Responses content part is missing a string `type`"),
+        };
+        out.push(converted);
+    }
+    Ok(Value::Array(out))
 }
 
 /// Join the text of a Responses content-part array with newlines.
@@ -116,10 +122,10 @@ fn output_content(output: Option<&Value>) -> Value {
 
 /// Append the canonical messages for one `input` item.
 ///
-/// Returns `false` for items this surface cannot express as a chat-completions
-/// message (reasoning items, server-side tool calls); the caller counts those
-/// so it can log one summary line instead of one per item.
-fn push_input_item(item: &Value, messages: &mut Vec<Message>) -> bool {
+/// Returns an error for items this stateless surface cannot represent (for
+/// example reasoning or server-side tool calls), so they are never silently
+/// removed from an agent request.
+fn push_input_item(item: &Value, messages: &mut Vec<Message>) -> Result<()> {
     let kind = item
         .get("type")
         .and_then(|t| t.as_str())
@@ -127,8 +133,8 @@ fn push_input_item(item: &Value, messages: &mut Vec<Message>) -> bool {
     match kind {
         "message" => {
             let role = item.get("role").and_then(|r| r.as_str()).unwrap_or("user");
-            messages.push(Message::new(role, message_content(item.get("content"))));
-            true
+            messages.push(Message::new(role, message_content(item.get("content"))?));
+            Ok(())
         }
         // A freeform `custom` tool call and a function call both become a
         // chat-completions function tool call; the reverse mapping happens on
@@ -149,7 +155,7 @@ fn push_input_item(item: &Value, messages: &mut Vec<Message>) -> bool {
                 msg.extra = json!({ "tool_calls": [encoded] });
                 messages.push(msg);
             }
-            true
+            Ok(())
         }
         "function_call_output" | "custom_tool_call_output" => {
             let mut msg = Message::new("tool", output_content(item.get("output")));
@@ -157,9 +163,9 @@ fn push_input_item(item: &Value, messages: &mut Vec<Message>) -> bool {
                 "tool_call_id": item.get("call_id").and_then(|c| c.as_str()).unwrap_or_default(),
             });
             messages.push(msg);
-            true
+            Ok(())
         }
-        _ => false,
+        _ => bail!("unsupported Responses input item type {kind:?}"),
     }
 }
 
@@ -272,44 +278,39 @@ fn convert_tool(tool: &Value) -> Vec<Value> {
     }
 }
 
-/// Translate the Responses `tools` array, warning once about any kind that has
-/// no chat-completions equivalent.
-fn convert_tools(tools: &[Value]) -> Vec<Value> {
+/// Convert function/custom Responses tools into the canonical function-tool
+/// shape. Unsupported server-side tools are rejected explicitly so they are
+/// never silently removed from an agent request.
+fn convert_tools(tools: &[Value]) -> Result<Vec<Value>> {
     let mut converted = Vec::new();
-    let mut dropped = Vec::new();
     for tool in tools {
-        let kind = tool.get("type").and_then(|t| t.as_str()).unwrap_or("");
         let entries = convert_tool(tool);
         if entries.is_empty() {
-            dropped.push(kind.to_string());
-        } else {
-            converted.extend(entries);
+            let kind = tool
+                .get("type")
+                .and_then(|t| t.as_str())
+                .unwrap_or("unknown");
+            bail!("Responses tool type {kind:?} is not replayable through this gateway");
         }
+        converted.extend(entries);
     }
-    if !dropped.is_empty() {
-        warn!(
-            dropped = %dropped.join(", "),
-            "dropping Responses tools with no chat-completions equivalent; \
-             the upstream provider cannot serve them"
-        );
-    }
-    converted
+    Ok(converted)
 }
 
-/// Request fields the Responses API defines that have no chat-completions
-/// equivalent. They are parked under [`RESPONSES_KEY`] rather than forwarded,
-/// because a strict provider rejects unknown parameters.
-const RESPONSES_ONLY_FIELDS: [&str; 10] = [
-    "store",
-    "include",
-    "reasoning",
-    "prompt_cache_key",
-    "stream_options",
-    "service_tier",
-    "client_metadata",
-    "text",
-    "access_programs",
+/// Canonical fields that are deliberately translated rather than parked under
+/// the Responses-only namespace. Every other top-level field is retained for a
+/// Responses-compatible destination.
+const RESPONSES_CANONICAL_FIELDS: [&str; 10] = [
+    "model",
+    "input",
+    "instructions",
+    "tools",
+    "tool_choice",
+    "parallel_tool_calls",
+    "temperature",
+    "top_p",
     "max_output_tokens",
+    "stream",
 ];
 
 impl InboundAdapter for ResponsesAdapter {
@@ -332,31 +333,23 @@ impl InboundAdapter for ResponsesAdapter {
                 messages.push(Message::text("system", instructions));
             }
         }
+        // Every input item must be representable in the canonical transcript;
+        // push_input_item returns an error for an unsupported item.
 
-        let mut skipped = 0usize;
         match body.get("input") {
             // The API also accepts a bare string as the whole input.
             Some(Value::String(text)) => messages.push(Message::text("user", text.clone())),
             Some(Value::Array(items)) => {
                 for item in items {
-                    if !push_input_item(item, &mut messages) {
-                        skipped += 1;
-                    }
+                    push_input_item(item, &mut messages)?;
                 }
             }
             _ => {}
         }
-        if skipped > 0 {
-            debug!(
-                skipped,
-                "skipping Responses input items with no chat-completions equivalent \
-                 (reasoning items and server-side tool calls are not replayable here)"
-            );
-        }
 
         let mut extra = Map::new();
         if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
-            let converted = convert_tools(tools);
+            let converted = convert_tools(tools)?;
             if !converted.is_empty() {
                 extra.insert("tools".to_string(), Value::Array(converted));
             }
@@ -366,6 +359,9 @@ impl InboundAdapter for ResponsesAdapter {
                 extra.insert(key.to_string(), value.clone());
             }
         }
+        if let Some(text) = body.get("text") {
+            extra.insert("response_format".to_string(), text.clone());
+        }
         // `max_output_tokens` is the Responses spelling of `max_tokens`.
         if let Some(max) = body.get("max_output_tokens") {
             extra.insert("max_tokens".to_string(), max.clone());
@@ -374,9 +370,19 @@ impl InboundAdapter for ResponsesAdapter {
         // Responses-only fields are parked out of the way for the outbound
         // adapters to strip.
         let mut reserved = Map::new();
-        for key in RESPONSES_ONLY_FIELDS {
+        if let Some(tools) = body.get("tools") {
+            reserved.insert("tools".to_string(), tools.clone());
+        }
+        for key in RESPONSES_CANONICAL_FIELDS {
             if let Some(value) = body.get(key) {
-                reserved.insert(key.to_string(), value.clone());
+                if key != "model" && key != "input" && key != "instructions" && key != "stream" {
+                    reserved.insert(key.to_string(), value.clone());
+                }
+            }
+        }
+        for (key, value) in body.as_object().into_iter().flat_map(|obj| obj.iter()) {
+            if !RESPONSES_CANONICAL_FIELDS.contains(&key.as_str()) {
+                reserved.insert(key.clone(), value.clone());
             }
         }
         if !reserved.is_empty() {
@@ -390,11 +396,27 @@ impl InboundAdapter for ResponsesAdapter {
             // client, so streaming is the safe default on this surface.
             stream: body.get("stream").and_then(|s| s.as_bool()).unwrap_or(true),
             extra: Value::Object(extra),
+            request_id: None,
         })
     }
-    fn render_response(&self, resp: &CanonicalResponse) -> Value {
+    fn render_response(&self, resp: &CanonicalResponse) -> anyhow::Result<Value> {
         let id = response_id(&resp.id);
         let mut output = Vec::new();
+        for part in &resp.media {
+            let value = match part {
+                ContentPart::Text(text) => message_item(text, &id),
+                ContentPart::Image { url } => {
+                    json!({ "type": "message", "role": "assistant", "content": [{ "type": "output_image", "url": url }] })
+                }
+                ContentPart::Audio { url }
+                | ContentPart::Video { url }
+                | ContentPart::File { url } => {
+                    json!({ "type": "message", "role": "assistant", "content": [{ "type": "output_file", "url": url }] })
+                }
+            };
+            output.push(value);
+        }
+
         if !resp.text.is_empty() {
             output.push(message_item(&resp.text, &id));
         }
@@ -402,7 +424,7 @@ impl InboundAdapter for ResponsesAdapter {
             output.push(function_call_item(call, index));
         }
 
-        json!({
+        Ok(json!({
             "id": id,
             "object": "response",
             "created_at": now_secs(),
@@ -413,7 +435,7 @@ impl InboundAdapter for ResponsesAdapter {
             "tool_choice": "auto",
             "tools": [],
             "usage": usage_json(resp.prompt_tokens, resp.completion_tokens),
-        })
+        }))
     }
 
     fn render_stream_event(&self, ev: &StreamEvent, id: &str) -> Option<String> {

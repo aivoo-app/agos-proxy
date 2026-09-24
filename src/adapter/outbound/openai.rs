@@ -18,8 +18,8 @@ use super::normalize_base;
 use crate::domain::ProviderKind;
 use crate::router::Target;
 use crate::translator::{
-    CanonicalResponse, ChatRequest, CompletionRequest, EmbeddingRequest, StreamEvent, ToolCall,
-    ToolCallDelta,
+    CanonicalResponse, ChatRequest, CompletionRequest, ContentPart, EmbeddingRequest, StreamEvent,
+    ToolCall, ToolCallDelta,
 };
 
 /// Body keys the pipeline adds for its own bookkeeping and must never forward
@@ -53,6 +53,9 @@ pub fn build_upstream_request(
         format!("Bearer {}", target.provider.auth_token),
     );
     headers.insert("Content-Type".to_string(), "application/json".to_string());
+    if let Some(request_id) = &chat_req.request_id {
+        headers.insert("X-Request-ID".to_string(), request_id.clone());
+    }
 
     // The body uses the model ID from the route entry, not the caller's
     // model string.
@@ -169,11 +172,14 @@ fn parse_stream_tool_calls(v: &serde_json::Value) -> Vec<ToolCallDelta> {
 /// it in its own format.
 pub fn parse_canonical(bytes: &[u8]) -> Result<CanonicalResponse> {
     let v: serde_json::Value = serde_json::from_slice(bytes).context("parsing response")?;
-    let text = v
-        .pointer("/choices/0/message/content")
-        .and_then(|t| t.as_str())
-        .unwrap_or_default()
-        .to_string();
+    let content = v.pointer("/choices/0/message/content");
+    let text = content
+        .map(|value| match value {
+            serde_json::Value::String(text) => text.clone(),
+            serde_json::Value::Array(_) => crate::translator::content_text(value),
+            _ => String::new(),
+        })
+        .unwrap_or_default();
     let finish_reason = v
         .pointer("/choices/0/finish_reason")
         .and_then(|t| t.as_str())
@@ -204,7 +210,63 @@ pub fn parse_canonical(bytes: &[u8]) -> Result<CanonicalResponse> {
         prompt_tokens,
         completion_tokens,
         tool_calls: parse_tool_calls(&v),
+        media: parse_output_media(&v),
     })
+}
+/// Recover canonical non-text output parts emitted by an OpenAI-compatible
+/// provider. Older chat APIs expose output media in the assistant message's
+/// `audio` field; retain it when present so native inbound surfaces can render
+/// it rather than reducing the answer to text.
+pub fn parse_output_media(value: &serde_json::Value) -> Vec<ContentPart> {
+    let mut media = Vec::new();
+    let message = value.pointer("/choices/0/message");
+    if let Some(parts) = message
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+    {
+        for part in parts {
+            let kind = part
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let url = match kind {
+                "image_url" => part.pointer("/image_url/url").and_then(|v| v.as_str()),
+                "audio_url" => part.pointer("/audio_url/url").and_then(|v| v.as_str()),
+                "video_url" => part.pointer("/video_url/url").and_then(|v| v.as_str()),
+                "file" => part.pointer("/file/file_url").and_then(|v| v.as_str()),
+                _ => None,
+            };
+            if let Some(url) = url {
+                media.push(match kind {
+                    "image_url" => ContentPart::Image {
+                        url: url.to_string(),
+                    },
+                    "audio_url" => ContentPart::Audio {
+                        url: url.to_string(),
+                    },
+                    "video_url" => ContentPart::Video {
+                        url: url.to_string(),
+                    },
+                    "file" => ContentPart::File {
+                        url: url.to_string(),
+                    },
+                    _ => unreachable!(),
+                });
+            }
+        }
+    }
+    if let Some(audio) = message.and_then(|m| m.get("audio")) {
+        if let Some(data) = audio.get("data").and_then(|v| v.as_str()) {
+            let format = audio
+                .get("format")
+                .and_then(|v| v.as_str())
+                .unwrap_or("wav");
+            media.push(ContentPart::Audio {
+                url: format!("data:audio/{format};base64,{data}"),
+            });
+        }
+    }
+    media
 }
 
 /// Decode a single OpenAI-style SSE `data:` payload into a [`StreamEvent`].
@@ -225,6 +287,7 @@ pub fn parse_stream_chunk(data: &str) -> Option<StreamEvent> {
             ..Default::default()
         });
     }
+
     let v: serde_json::Value = serde_json::from_str(trimmed).ok()?;
     let delta = v
         .pointer("/choices/0/delta/content")
@@ -456,6 +519,27 @@ mod tests {
     }
 
     #[test]
+    fn cross_protocol_rejects_responses_only_state() {
+        let target = dummy_target();
+        let mut req = ChatRequest {
+            model: "prog/route".into(),
+            messages: vec![Message::text("user", "hi")],
+            stream: false,
+            extra: serde_json::json!({ "agos_responses": { "store": true } }),
+            request_id: None,
+        };
+        let err =
+            crate::adapter::outbound::build_upstream_request(&target, &req, false).unwrap_err();
+        assert!(err.to_string().contains("Responses field"));
+        req.extra = serde_json::json!({
+            "temperature": 0.2,
+            "agos_responses": { "temperature": 0.2 }
+        });
+        let (_, _, body) = build_upstream_request(&target, &req, false).unwrap();
+        assert_eq!(body["temperature"], 0.2);
+    }
+
+    #[test]
     fn upstream_request_uses_route_model_and_auth_header() {
         let target = dummy_target();
         let chat_req = ChatRequest {
@@ -463,8 +547,10 @@ mod tests {
             messages: vec![Message::text("user", "hi")],
             stream: false,
             extra: serde_json::Value::Null,
+            request_id: Some("req-test-123".into()),
         };
         let (url, headers, body) = build_upstream_request(&target, &chat_req, false).unwrap();
+        assert_eq!(headers.get("X-Request-ID").unwrap(), "req-test-123");
         assert_eq!(url, "https://api.example.com/v1/chat/completions");
         assert_eq!(headers.get("Authorization").unwrap(), "Bearer sk-secret");
         assert_eq!(headers.get("X-Custom").unwrap(), "yes");
@@ -626,6 +712,7 @@ mod tests {
                 "agos_responses": { "store": false, "include": ["reasoning.encrypted_content"] },
                 "economy_escalate": true
             }),
+            request_id: None,
         };
         let (_, _, body) = build_upstream_request(&target, &chat_req, true).unwrap();
         assert!(body.get("agos_responses").is_none());

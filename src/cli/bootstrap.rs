@@ -157,6 +157,12 @@ pub struct CapabilitiesSpec {
     #[serde(default)]
     pub vision: bool,
     #[serde(default)]
+    pub audio: bool,
+    #[serde(default)]
+    pub video: bool,
+    #[serde(default)]
+    pub files: bool,
+    #[serde(default)]
     pub json_mode: bool,
     /// Maximum context window in tokens; `None` if unknown.
     #[serde(default)]
@@ -169,6 +175,9 @@ fn default_capabilities() -> CapabilitiesSpec {
     CapabilitiesSpec {
         tools: false,
         vision: false,
+        audio: false,
+        video: false,
+        files: false,
         json_mode: false,
         max_context: None,
     }
@@ -326,6 +335,9 @@ fn seed(
                     RouteCapabilities {
                         tools: model_spec.capabilities.tools,
                         vision: model_spec.capabilities.vision,
+                        audio: model_spec.capabilities.audio,
+                        video: model_spec.capabilities.video,
+                        files: model_spec.capabilities.files,
                         json_mode: model_spec.capabilities.json_mode,
                         max_context: model_spec.capabilities.max_context,
                     },
@@ -346,9 +358,9 @@ fn seed(
             [profile, proxy, route] => (*profile, *proxy, *route),
             _ => anyhow::bail!("route reference {route_ref:?} must be <proxy>/<route> or <profile>/<proxy>/<route>"),
         };
-        let owner = store
-            .get_profile_by_name(profile_name)?
-            .with_context(|| format!("route reference {route_ref:?}: no profile {profile_name:?}"))?;
+        let owner = store.get_profile_by_name(profile_name)?.with_context(|| {
+            format!("route reference {route_ref:?}: no profile {profile_name:?}")
+        })?;
         let owner_proxy = store
             .get_proxy_named(owner.id.as_str(), proxy_name)?
             .with_context(|| format!("route reference {route_ref:?}: no proxy {proxy_name:?}"))?;

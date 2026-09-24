@@ -53,6 +53,8 @@ struct CompletionRequest {
     stream: bool,
     #[serde(default)]
     echo: bool,
+    #[serde(skip)]
+    request_id: Option<String>,
 }
 
 /// OpenAI embeddings request (passthrough).
@@ -60,10 +62,16 @@ struct CompletionRequest {
 struct EmbeddingRequest {
     model: String,
     input: serde_json::Value,
+    #[serde(skip)]
+    request_id: Option<String>,
 }
 
 pub async fn chat_completions(State(state): State<AppState>, req: Request) -> Response {
     let (parts, body) = req.into_parts();
+    let request_id = parts
+        .extensions
+        .get::<super::middleware::RequestId>()
+        .map(|id| id.0.clone());
     let profile_id = match parts.extensions.get::<String>() {
         Some(id) => id.clone(),
         None => return bad_request("unauthenticated"),
@@ -84,8 +92,11 @@ pub async fn chat_completions(State(state): State<AppState>, req: Request) -> Re
     };
     let needs = crate::router::RequestNeeds::from_body(&body_value);
     let escalate_body = crate::router::wants_escalation(&body_value);
-    let chat_req: ChatRequest = match serde_json::from_value(body_value) {
-        Ok(r) => r,
+    let chat_req: ChatRequest = match serde_json::from_value::<ChatRequest>(body_value) {
+        Ok(mut r) => {
+            r.request_id = request_id;
+            r
+        }
         Err(e) => return bad_request(format!("invalid request body: {e}")),
     };
     if chat_req.stream {
@@ -106,6 +117,10 @@ pub async fn chat_completions(State(state): State<AppState>, req: Request) -> Re
 /// through the routing layer with automatic failover.
 pub async fn completions(State(state): State<AppState>, req: Request) -> Response {
     let (parts, body) = req.into_parts();
+    let request_id = parts
+        .extensions
+        .get::<super::middleware::RequestId>()
+        .map(|id| id.0.clone());
     let profile_id = match parts.extensions.get::<String>() {
         Some(id) => id.clone(),
         None => return bad_request("unauthenticated"),
@@ -118,10 +133,14 @@ pub async fn completions(State(state): State<AppState>, req: Request) -> Respons
         Ok(r) => r,
         Err(e) => return bad_request(format!("invalid request body: {e}")),
     };
-    let completion_req: CompletionRequest = match serde_json::from_value(body_value.clone()) {
-        Ok(r) => r,
-        Err(e) => return bad_request(format!("invalid request body: {e}")),
-    };
+    let completion_req: CompletionRequest =
+        match serde_json::from_value::<CompletionRequest>(body_value.clone()) {
+            Ok(mut r) => {
+                r.request_id = request_id;
+                r
+            }
+            Err(e) => return bad_request(format!("invalid request body: {e}")),
+        };
     if completion_req.stream {
         handle_completion_streaming(state, profile_id, completion_req).await
     } else {
@@ -133,6 +152,10 @@ pub async fn completions(State(state): State<AppState>, req: Request) -> Respons
 /// through the routing layer with automatic failover.
 pub async fn embeddings(State(state): State<AppState>, req: Request) -> Response {
     let (parts, body) = req.into_parts();
+    let request_id = parts
+        .extensions
+        .get::<super::middleware::RequestId>()
+        .map(|id| id.0.clone());
     let profile_id = match parts.extensions.get::<String>() {
         Some(id) => id.clone(),
         None => return bad_request("unauthenticated"),
@@ -145,10 +168,14 @@ pub async fn embeddings(State(state): State<AppState>, req: Request) -> Response
         Ok(r) => r,
         Err(e) => return bad_request(format!("invalid request body: {e}")),
     };
-    let embedding_req: EmbeddingRequest = match serde_json::from_value(body_value) {
-        Ok(r) => r,
-        Err(e) => return bad_request(format!("invalid request body: {e}")),
-    };
+    let embedding_req: EmbeddingRequest =
+        match serde_json::from_value::<EmbeddingRequest>(body_value) {
+            Ok(mut r) => {
+                r.request_id = request_id;
+                r
+            }
+            Err(e) => return bad_request(format!("invalid request body: {e}")),
+        };
     handle_embeddings(state, profile_id, embedding_req).await
 }
 
@@ -251,7 +278,16 @@ async fn handle_non_streaming(
                 let started = std::time::Instant::now();
                 let outcome = outbound::forward_non_streaming(&client, &target, &req).await;
                 let latency_ms = started.elapsed().as_millis() as i64;
-                log_attempt(&store, &profile_id, &target, false, &outcome, latency_ms).await;
+                log_attempt(
+                    &store,
+                    &profile_id,
+                    &target,
+                    false,
+                    &outcome,
+                    latency_ms,
+                    req.request_id.as_deref(),
+                )
+                .await;
                 outcome
             }
         },
@@ -420,6 +456,7 @@ pub(crate) async fn log_attempt(
     streamed: bool,
     outcome: &Result<Vec<u8>, anyhow::Error>,
     latency_ms: i64,
+    request_id: Option<&str>,
 ) {
     let (success, status_code, error_message, prompt_tokens, completion_tokens, cached) =
         match outcome {
@@ -438,11 +475,13 @@ pub(crate) async fn log_attempt(
     let profile_id = profile_id.to_string();
     let entry_id = target.entry.id;
     let model_id = target.entry.model_id.clone();
+    let request_id = request_id.map(str::to_string);
     // `spawn_blocking` is awaited so tests and shutdown observe the write;
     // failures are still non-fatal to the request itself.
     let _ = tokio::task::spawn_blocking(move || {
         store.record_usage(crate::storage::NewUsage {
             profile_id,
+            request_id,
             route_entry_id: entry_id,
             model_id,
             streamed,
@@ -523,6 +562,7 @@ async fn handle_streaming(
                         prompt_tokens,
                         completion_tokens,
                         cached_prompt_tokens,
+                        chat_req.request_id.clone(),
                     )
                     .await;
                     return sse_response_from_completion(&completion);
@@ -544,6 +584,7 @@ async fn handle_streaming(
                         status,
                         message,
                         started_at.elapsed().as_millis() as i64,
+                        chat_req.request_id.clone(),
                     )
                     .await;
                     continue;
@@ -575,6 +616,7 @@ async fn handle_streaming(
                         String::from_utf8_lossy(&bytes)
                     ),
                     started_at.elapsed().as_millis() as i64,
+                    chat_req.request_id.clone(),
                 )
                 .await;
                 continue;
@@ -588,6 +630,7 @@ async fn handle_streaming(
                     None,
                     format!("upstream failed: {e}"),
                     started_at.elapsed().as_millis() as i64,
+                    chat_req.request_id.clone(),
                 )
                 .await;
                 continue;
@@ -601,6 +644,7 @@ async fn handle_streaming(
                     None,
                     "upstream timeout".to_string(),
                     started_at.elapsed().as_millis() as i64,
+                    chat_req.request_id.clone(),
                 )
                 .await;
                 continue;
@@ -640,6 +684,7 @@ async fn handle_streaming(
                     Some(code.unwrap_or(502) as i32),
                     format!("upstream in-band error: {message}"),
                     started_at.elapsed().as_millis() as i64,
+                    chat_req.request_id.clone(),
                 )
                 .await;
                 continue;
@@ -652,6 +697,7 @@ async fn handle_streaming(
                     None,
                     msg,
                     started_at.elapsed().as_millis() as i64,
+                    chat_req.request_id.clone(),
                 )
                 .await;
                 continue;
@@ -664,6 +710,7 @@ async fn handle_streaming(
                     Some(504),
                     "upstream stalled before sending any stream data".to_string(),
                     started_at.elapsed().as_millis() as i64,
+                    chat_req.request_id.clone(),
                 )
                 .await;
                 continue;
@@ -676,6 +723,7 @@ async fn handle_streaming(
                     None,
                     format!("stream error: {e}"),
                     started_at.elapsed().as_millis() as i64,
+                    chat_req.request_id.clone(),
                 )
                 .await;
                 continue;
@@ -711,6 +759,7 @@ async fn handle_streaming(
         tx,
         store.clone(),
         profile_id,
+        chat_req.request_id.clone(),
     ));
 
     let body = axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
@@ -859,6 +908,7 @@ async fn fail_stream_attempt(
     status_code: Option<i32>,
     message: String,
     latency_ms: i64,
+    request_id: Option<String>,
 ) {
     log_stream_outcome(
         store.clone(),
@@ -871,6 +921,7 @@ async fn fail_stream_attempt(
         None,
         None,
         None,
+        request_id,
     )
     .await;
     let _ = crate::router::apply_failure_action(
@@ -895,10 +946,12 @@ async fn log_stream_outcome(
     prompt_tokens: Option<i64>,
     completion_tokens: Option<i64>,
     cached_prompt_tokens: Option<i64>,
+    request_id: Option<String>,
 ) {
     let result = tokio::task::spawn_blocking(move || {
         store.record_usage(crate::storage::NewUsage {
             profile_id,
+            request_id,
             route_entry_id: target.entry.id,
             model_id: target.entry.model_id.clone(),
             streamed: true,
@@ -937,6 +990,7 @@ async fn pump_stream(
     tx: tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
     store: Arc<Store>,
     profile_id: String,
+    request_id: Option<String>,
 ) {
     use crate::domain::ProviderKind;
 
@@ -1070,6 +1124,7 @@ async fn pump_stream(
                 status_code,
                 message,
                 latency_ms,
+                request_id.clone(),
             )
             .await;
         }
@@ -1085,6 +1140,7 @@ async fn pump_stream(
                 prompt_tokens.map(|t| t as i64),
                 completion_tokens.map(|t| t as i64),
                 cached_prompt_tokens.map(|t| t as i64),
+                request_id,
             )
             .await;
         }
@@ -1156,7 +1212,12 @@ async fn forward_responses_attempt(
         .and_then(|u| u.get("input_tokens_details"))
         .and_then(|d| d.get("cached_tokens"))
         .and_then(|t| t.as_i64());
-    Ok((completion, prompt_tokens, completion_tokens, cached_prompt_tokens))
+    Ok((
+        completion,
+        prompt_tokens,
+        completion_tokens,
+        cached_prompt_tokens,
+    ))
 }
 
 /// Wrap a full chat-completion answer into a minimal OpenAI SSE stream so
@@ -1284,6 +1345,7 @@ async fn handle_completion(
                         format!("Bearer {}", target.provider.auth_token),
                     )
                     .header("Content-Type", "application/json")
+                    .header("X-Request-ID", req.request_id.clone().unwrap_or_default())
                     .json(&body)
                     .send()
                     .await
@@ -1311,6 +1373,7 @@ async fn handle_completion(
                     false,
                     &outcome,
                     started.elapsed().as_millis() as i64,
+                    req.request_id.as_deref(),
                 )
                 .await;
                 outcome
@@ -1393,6 +1456,10 @@ async fn handle_completion_streaming(
                     format!("Bearer {}", target.provider.auth_token),
                 )
                 .header("Content-Type", "application/json")
+                .header(
+                    "X-Request-ID",
+                    completion_req.request_id.clone().unwrap_or_default(),
+                )
                 .json(&body)
                 .send(),
         )
@@ -1427,6 +1494,7 @@ async fn handle_completion_streaming(
                             Some(code.unwrap_or(502) as i32),
                             format!("upstream in-band error: {message}"),
                             started_at.elapsed().as_millis() as i64,
+                            completion_req.request_id.clone(),
                         )
                         .await;
                         continue;
@@ -1439,6 +1507,7 @@ async fn handle_completion_streaming(
                             None,
                             msg,
                             started_at.elapsed().as_millis() as i64,
+                            completion_req.request_id.clone(),
                         )
                         .await;
                         continue;
@@ -1451,6 +1520,7 @@ async fn handle_completion_streaming(
                             Some(504),
                             "upstream stalled before sending any stream data".to_string(),
                             started_at.elapsed().as_millis() as i64,
+                            completion_req.request_id.clone(),
                         )
                         .await;
                         continue;
@@ -1471,6 +1541,7 @@ async fn handle_completion_streaming(
                         String::from_utf8_lossy(&bytes)
                     ),
                     started_at.elapsed().as_millis() as i64,
+                    completion_req.request_id.clone(),
                 )
                 .await;
             }
@@ -1483,6 +1554,7 @@ async fn handle_completion_streaming(
                     None,
                     format!("upstream failed: {e}"),
                     started_at.elapsed().as_millis() as i64,
+                    completion_req.request_id.clone(),
                 )
                 .await;
             }
@@ -1495,6 +1567,7 @@ async fn handle_completion_streaming(
                     None,
                     "upstream timeout".to_string(),
                     started_at.elapsed().as_millis() as i64,
+                    completion_req.request_id.clone(),
                 )
                 .await;
             }
@@ -1531,6 +1604,7 @@ async fn handle_completion_streaming(
         tx,
         store,
         profile_id,
+        completion_req.request_id.clone(),
     ));
 
     let body = axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
@@ -1597,6 +1671,7 @@ async fn handle_embeddings(
                         format!("Bearer {}", target.provider.auth_token),
                     )
                     .header("Content-Type", "application/json")
+                    .header("X-Request-ID", req.request_id.clone().unwrap_or_default())
                     .json(&body)
                     .send()
                     .await
@@ -1624,6 +1699,7 @@ async fn handle_embeddings(
                     false,
                     &outcome,
                     started.elapsed().as_millis() as i64,
+                    req.request_id.as_deref(),
                 )
                 .await;
                 outcome
@@ -1765,6 +1841,7 @@ mod economy_tests {
             messages: vec![crate::translator::Message::text("user", text)],
             stream: false,
             extra: serde_json::Value::Null,
+            request_id: None,
         }
     }
 
@@ -1880,6 +1957,7 @@ mod economy_tests {
                 code,
                 message.into(),
                 1,
+                None,
             )
             .await;
             let entries = store.route_entries(route.id).unwrap();

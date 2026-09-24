@@ -185,6 +185,9 @@ model that cannot actually serve it.
 |---------------|--------|----------------------------------------------------|
 | `tools`       | bool   | Supports tool / function calling.                  |
 | `vision`      | bool   | Supports image (vision) input.                     |
+| `audio`       | bool   | Supports audio input.                              |
+| `video`       | bool   | Supports video input.                              |
+| `files`       | bool   | Supports generic file/PDF input.                   |
 | `json_mode`   | bool   | Supports structured JSON output.                   |
 | `max_context` | Option | Maximum context window in tokens; `None` if unknown.|
 
@@ -198,6 +201,7 @@ Written by the server on every completion attempt and surfaced through
 |--------------------|--------|------------------------------------------------|
 | `id`               | i64    | Auto-increment primary key.                    |
 | `profile_id`       | String | Owning profile.                                |
+| `request_id`       | Option | Stable `X-Request-ID` shared by failover attempts. |
 | `route_entry_id`   | i64    | The route entry that handled (or tried) this.  |
 | `model_id`         | String | Model string used.                             |
 | `streamed`         | bool   | Whether the request was streaming.             |
@@ -225,10 +229,10 @@ Aggregate usage per model over a window: calls, failures, latency, tokens.
 ## Request lifecycle
 
 1. A caller sends `POST /v1/chat/completions` with
-   `Authorization: Bearer <profile_uid>` and
+   `Authorization: Bearer <profile_uid>`, an optional `X-Request-ID`, and
    `model: "Programmer/php-developer-3.5-flash"`.
-2. The server authenticates the UID, resolves it to a profile, then resolves
-   the `proxy/route` string to a route.
+2. The server propagates the request id (or creates one), authenticates the UID,
+   resolves it to a profile, then resolves the `proxy/route` string to a route.
 3. The route's model chain is filtered to healthy, enabled entries (and, when
    the request needs it, to entries with the required capabilities).
 4. Models are tried in order. Each attempt has a configurable timeout.
@@ -238,31 +242,34 @@ Aggregate usage per model over a window: calls, failures, latency, tokens.
    immediately — the caller perceives extra latency, not a failed request.
 7. Only if the whole chain is exhausted does the route return an error.
 
-### Multimodal (vision) requests
+### Multimodal and agentic requests
 
-Image parts survive the whole pipeline. The canonical request keeps message
-content as raw JSON — plain text as a string, multimodal content as the OpenAI
-parts array (`text` / `image_url` entries). From there each outbound adapter
-rebuilds its native shape:
+The canonical request preserves message order and per-message tool fields. Text,
+image, audio, video, and file parts are represented as ordered content parts;
+tool definitions, assistant `tool_calls`, and tool-result messages remain
+available to every adapter. Each outbound adapter then emits its provider's
+native representation:
 
-| Upstream kind   | Image encoding                                                        |
-|-----------------|-----------------------------------------------------------------------|
-| OpenAI/custom   | Parts array passed through untouched.                                 |
-| Anthropic       | `{"type":"image","source":{"type":"url"…}}` for `http(s)` references; `{"type":"image","source":{"type":"base64",…}}` for `data:` URLs. |
-| Google          | `{"fileData":{mimeType,fileUri}}` for `http(s)` references; `{"inlineData":{mimeType,data}}` for `data:` URLs. |
+| Upstream kind | Native representation |
+|---------------|-----------------------|
+| OpenAI/custom | Original chat-completions parts and tool fields pass through. |
+| Responses     | `input` message items, `function_call` / `function_call_output`, `input_image`, `input_audio`, `input_file`, and `text.format`. |
+| Anthropic     | `image` / `document` blocks plus `tool_use` / `tool_result` blocks. |
+| Google        | `inlineData` / `fileData`, `functionCall`, and `functionResponse` parts. |
 
-The Anthropic and Gemini inbound surfaces accept their native image shapes
-(Anthropic `image` blocks, Gemini `inlineData`/`fileData` parts — camelCase and
-snake_case both) and normalize them into the same canonical parts array.
+System/developer instructions and roleplay prompts are preserved. Tool calls are
+also decoded and rendered in streaming responses on every supported native
+surface. A destination that has no native representation for a known feature
+returns a capability-skip error, allowing failover to a compatible route entry;
+unknown content/tool objects are rejected instead of being silently discarded.
+Provider-specific Responses fields are restored when the selected destination is
+itself Responses-compatible.
 
-Limitations: `system` prompts and `systemInstruction` stay text-only (images
-there are dropped, the upstreams do not accept them); OpenAI's
-`image_url.detail` has no Anthropic/Gemini analogue and is dropped; Google
-`fileData` requires a publicly resolvable URL, with the MIME type inferred
-from the file extension (`image/jpeg` default).
-
-Text-only requests are unaffected: their content remains a plain JSON string
-through every adapter, byte-identical to pre-vision behavior.
+The route capability flags (`tools`, `vision`, `audio`, `video`, `files`, and
+`json_mode`) are evaluated before selection, so a request is sent only to an
+entry configured for its required modality. Upstream capability refusals clear
+only the matching capability when the provider explicitly says the model lacks
+it; they do not mark an otherwise healthy key offline.
 
 ## Health and circuit breaking
 

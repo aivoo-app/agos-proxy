@@ -361,8 +361,14 @@ mod tests {
         };
         let mut a = body_for("continuing the same conversation");
         let mut b = body_for("a completely different follow-up");
-        assert_eq!(apply(ProviderKind::OpenAI, PromptCachePolicy::Auto, &mut a), 1);
-        assert_eq!(apply(ProviderKind::OpenAI, PromptCachePolicy::Auto, &mut b), 1);
+        assert_eq!(
+            apply(ProviderKind::OpenAI, PromptCachePolicy::Auto, &mut a),
+            1
+        );
+        assert_eq!(
+            apply(ProviderKind::OpenAI, PromptCachePolicy::Auto, &mut b),
+            1
+        );
         // Same prefix, different tail: one shard.
         assert_eq!(a["prompt_cache_key"], b["prompt_cache_key"]);
         assert!(a["prompt_cache_key"].as_str().unwrap().starts_with("agos-"));
@@ -386,12 +392,18 @@ mod tests {
             "prompt_cache_key": "client-chose-this",
             "messages": [{"role": "user", "content": "hi"}]
         });
-        assert_eq!(apply(ProviderKind::OpenAI, PromptCachePolicy::Auto, &mut body), 0);
+        assert_eq!(
+            apply(ProviderKind::OpenAI, PromptCachePolicy::Auto, &mut body),
+            0
+        );
         assert_eq!(body["prompt_cache_key"], json!("client-chose-this"));
 
         // Nothing but a model name: there is no prefix to key on.
         let mut empty = json!({ "model": "gpt-4o", "messages": [] });
-        assert_eq!(apply(ProviderKind::OpenAI, PromptCachePolicy::Auto, &mut empty), 0);
+        assert_eq!(
+            apply(ProviderKind::OpenAI, PromptCachePolicy::Auto, &mut empty),
+            0
+        );
         assert!(empty.get("prompt_cache_key").is_none());
     }
 
@@ -420,7 +432,10 @@ mod tests {
             "cachedContent": "caches/abc"
         });
         let before = body.clone();
-        assert_eq!(apply(ProviderKind::Google, PromptCachePolicy::Auto, &mut body), 0);
+        assert_eq!(
+            apply(ProviderKind::Google, PromptCachePolicy::Auto, &mut body),
+            0
+        );
         assert_eq!(body, before);
     }
 }

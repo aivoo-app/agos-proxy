@@ -6,7 +6,7 @@
 
 use crate::adapter::inbound::InboundAdapter;
 use crate::adapter::ApiKind;
-use crate::translator::{CanonicalResponse, ChatRequest, StreamEvent};
+use crate::translator::{CanonicalResponse, ChatRequest, ContentPart, StreamEvent};
 
 /// OpenAI inbound surface.
 pub struct OpenAiAdapter;
@@ -20,14 +20,68 @@ impl InboundAdapter for OpenAiAdapter {
         Ok(serde_json::from_value(body.clone())?)
     }
 
-    fn render_response(&self, resp: &CanonicalResponse) -> serde_json::Value {
-        serde_json::json!({
+    fn render_response(&self, resp: &CanonicalResponse) -> anyhow::Result<serde_json::Value> {
+        let mut message = serde_json::json!({ "role": "assistant", "content": resp.text });
+        let mut content = Vec::new();
+        if !resp.text.is_empty() {
+            content.push(serde_json::json!({ "type": "text", "text": resp.text }));
+        }
+        let mut audio_written = false;
+        for part in &resp.media {
+            match part {
+                ContentPart::Audio { url } => {
+                    if let Some(data) = crate::translator::parse_data_url(url) {
+                        if audio_written {
+                            anyhow::bail!(
+                                "OpenAI response can contain only one inline audio output"
+                            );
+                        }
+                        message["audio"] = serde_json::json!({
+                            "data": data.data,
+                            "format": data.mime.trim_start_matches("audio/")
+                        });
+                        audio_written = true;
+                    } else {
+                        content.push(
+                            serde_json::json!({ "type": "audio_url", "audio_url": { "url": url } }),
+                        );
+                    }
+                }
+                ContentPart::Image { .. }
+                | ContentPart::Video { .. }
+                | ContentPart::File { .. }
+                | ContentPart::Text(_) => {
+                    content.push(crate::translator::content_part_to_chat_json(part));
+                }
+            }
+        }
+        if !content.is_empty() {
+            if content.len() == 1 && content[0]["type"] == "text" {
+                message["content"] = content[0]["text"].clone();
+            } else {
+                message["content"] = serde_json::Value::Array(content);
+            }
+        }
+        if !resp.tool_calls.is_empty() {
+            message["tool_calls"] = serde_json::Value::Array(
+                resp.tool_calls
+                    .iter()
+                    .map(|call| {
+                        serde_json::json!({
+                            "id": call.wire_id(), "type": "function",
+                            "function": { "name": call.name, "arguments": call.arguments }
+                        })
+                    })
+                    .collect(),
+            );
+        }
+        Ok(serde_json::json!({
             "id": resp.id,
             "object": "chat.completion",
             "model": resp.model,
             "choices": [{
                 "index": 0,
-                "message": { "role": "assistant", "content": resp.text },
+                "message": message,
                 "finish_reason": resp.finish_reason,
             }],
             "usage": {
@@ -35,7 +89,7 @@ impl InboundAdapter for OpenAiAdapter {
                 "completion_tokens": resp.completion_tokens,
                 "total_tokens": resp.total_tokens(),
             },
-        })
+        }))
     }
 
     fn render_stream_event(&self, ev: &StreamEvent, id: &str) -> Option<String> {
@@ -44,6 +98,17 @@ impl InboundAdapter for OpenAiAdapter {
             delta.insert(
                 "content".to_string(),
                 serde_json::Value::String(ev.delta.clone()),
+            );
+        }
+        if !ev.tool_call_deltas.is_empty() {
+            delta.insert(
+                "tool_calls".to_string(),
+                serde_json::Value::Array(ev.tool_call_deltas.iter().map(|call| serde_json::json!({
+                    "index": call.index,
+                    "id": call.id,
+                    "type": "function",
+                    "function": { "name": call.name, "arguments": call.arguments_delta },
+                })).collect()),
             );
         }
         let payload = serde_json::json!({

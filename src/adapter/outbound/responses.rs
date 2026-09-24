@@ -7,16 +7,17 @@
 //! to recover the assistant text, which is reshaped into a standard
 //! chat-completion response.
 //!
-//! v1 scope (see the build plan): streaming requests are served from the
-//! non-streamed answer; tool calls, structured outputs, and vision requests
-//! are rejected with an error so the router can fail over to a capable entry.
+//! The adapter translates ordered messages, tool definitions/history, media,
+//! structured output, and Responses-native fields without flattening them into
+//! text. Responses-only destinations reject features they cannot represent so
+//! the router can fail over to a compatible entry.
 
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
 
 use super::normalize_base;
 use crate::router::Target;
-use crate::translator::{content_has_image, content_text, ChatRequest, Message};
+use crate::translator::{parse_content_parts, parse_data_url, ChatRequest, ContentPart, Message};
 
 /// Marker for adapter-side capability rejections (tools/vision/JSON/stream).
 /// `execute_with_failover`/`demote_status_for` treat these as client-side
@@ -42,87 +43,230 @@ pub fn build_headers(target: &Target) -> BTreeMap<String, String> {
     headers
 }
 
-/// Translate a chat-completions request into a Responses request.
-///
-/// System messages are extracted into the dedicated `instructions` field;
-/// user/assistant turns are joined into the `input` string. `temperature`,
-/// `top_p` and `max_tokens`/`max_completion_tokens` are forwarded
-/// (`max_*` becomes `max_output_tokens`).
-///
-/// Returns an error if the request uses features not supported by this adapter
-/// (tools, tool_choice, response_format, images), so the router can fail over
-/// to a capable entry instead of silently dropping them.
+/// Translate the canonical request into an ordered Responses input list.
+/// Tool definitions, tool history, media, structured output, and roleplay are
+/// mapped to native Responses values; no user turn is flattened into text.
 pub fn translate_request(chat_req: &ChatRequest, model_id: &str) -> Result<serde_json::Value> {
-    let mut instructions = String::new();
-    let mut input = String::new();
-
-    for message in &chat_req.messages {
-        let text = message_text(message);
-        if message.role == "system" {
-            if !instructions.is_empty() {
-                instructions.push('\n');
-            }
-            instructions.push_str(&text);
-        } else {
-            if !input.is_empty() {
-                input.push('\n');
-            }
-            input.push_str(&message.role);
-            input.push_str(": ");
-            input.push_str(&text);
-        }
-    }
-
-    // Streaming is served from the non-streamed answer by the handler;
-    // we just ignore the stream flag and make a non-streaming request.
-    let _ = chat_req.stream;
     let extra = &chat_req.extra;
-    if extra.get("tools").is_some_and(|v| !v.is_null()) {
-        bail!("{ADAPTER_CAPABILITY_SKIP}: tools/function calling not supported by openai_responses adapter; use a tools-capable upstream");
-    }
-    if extra.get("tool_choice").is_some_and(|v| !v.is_null()) {
-        bail!("{ADAPTER_CAPABILITY_SKIP}: tool_choice not supported by openai_responses adapter; use a tools-capable upstream");
-    }
-    if extra.get("response_format").is_some_and(|v| !v.is_null()) {
-        bail!("{ADAPTER_CAPABILITY_SKIP}: response_format (JSON mode) not supported by openai_responses adapter; use a json-mode-capable upstream");
-    }
-    // Check for images in any message content.
+    let reserved = extra.get("agos_responses");
+    let mut instructions = Vec::<String>::new();
+    let mut input = Vec::<serde_json::Value>::new();
+
     for message in &chat_req.messages {
-        if content_has_image(&message.content) {
-            bail!("{ADAPTER_CAPABILITY_SKIP}: image (vision) input not supported by openai_responses adapter; use a vision-capable upstream");
+        if matches!(message.role.as_str(), "system" | "developer") {
+            let text = plain_text(message)?;
+            if !text.trim().is_empty() {
+                instructions.push(text);
+            }
+            continue;
+        }
+        if message.role == "tool" {
+            input.push(serde_json::json!({
+                "type": "function_call_output",
+                "call_id": message.extra.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or_default(),
+                "output": message.content,
+            }));
+            continue;
+        }
+        let calls = message.extra.get("tool_calls").and_then(|v| v.as_array());
+        if !message.content.is_null() {
+            input.push(serde_json::json!({
+                "type": "message",
+                "role": message.role,
+                "content": responses_content(message)?,
+            }));
+        }
+        if let Some(calls) = calls {
+            for call in calls {
+                input.push(responses_function_call(call)?);
+            }
         }
     }
 
     let mut body = serde_json::json!({
         "model": model_id,
         "input": input,
+        "stream": false,
     });
-    let obj = body.as_object_mut().expect("json object");
+    let obj = body.as_object_mut().expect("JSON object");
     if !instructions.is_empty() {
-        obj.insert(
-            "instructions".to_string(),
-            serde_json::Value::String(instructions),
-        );
+        obj.insert("instructions".into(), instructions.join("\n\n").into());
     }
-    for key in ["temperature", "top_p"] {
-        if let Some(v) = extra.get(key) {
-            obj.insert(key.to_string(), v.clone());
+    if let Some(tools) = tools_for_responses(reserved, extra)? {
+        obj.insert("tools".into(), tools);
+    }
+    for key in [
+        "tool_choice",
+        "parallel_tool_calls",
+        "temperature",
+        "top_p",
+        "top_logprobs",
+        "truncation",
+        "user",
+        "service_tier",
+    ] {
+        if let Some(value) = extra.get(key).filter(|v| !v.is_null()) {
+            obj.insert(key.into(), value.clone());
         }
     }
-    // The newer `max_completion_tokens` wins when both are present.
     for key in ["max_completion_tokens", "max_tokens"] {
-        if let Some(v) = extra.get(key).filter(|v| !v.is_null()) {
-            obj.insert("max_output_tokens".to_string(), v.clone());
+        if let Some(value) = extra.get(key).filter(|v| !v.is_null()) {
+            obj.insert("max_output_tokens".into(), value.clone());
             break;
+        }
+    }
+    if let Some(format) = extra.get("response_format").filter(|v| !v.is_null()) {
+        obj.insert(
+            "text".into(),
+            serde_json::json!({ "format": responses_text_format(format) }),
+        );
+    }
+    // Responses-native fields collected from a Responses client are restored
+    // only when the selected destination actually speaks Responses.
+    if let Some(fields) = reserved.and_then(|v| v.as_object()) {
+        for (key, value) in fields {
+            if matches!(key.as_str(), "tools" | "max_output_tokens" | "text") {
+                continue;
+            }
+            obj.entry(key.clone()).or_insert_with(|| value.clone());
         }
     }
     Ok(body)
 }
 
-/// Extract the plain-text content of a message: a JSON string as-is, or the
-/// concatenated `text` entries of an OpenAI parts array.
-fn message_text(message: &Message) -> String {
-    content_text(&message.content)
+fn plain_text(message: &Message) -> Result<String> {
+    let parts = parse_content_parts(&message.content)
+        .map_err(|e| anyhow::anyhow!("{ADAPTER_CAPABILITY_SKIP}: invalid content: {e}"))?;
+    if parts
+        .iter()
+        .any(|part| !matches!(part, ContentPart::Text(_)))
+    {
+        bail!("{ADAPTER_CAPABILITY_SKIP}: Responses instructions/system content must be text-only");
+    }
+    Ok(parts
+        .into_iter()
+        .filter_map(|part| match part {
+            ContentPart::Text(t) => Some(t),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+fn responses_content(message: &Message) -> Result<serde_json::Value> {
+    match parse_content_parts(&message.content)
+        .map_err(|e| anyhow::anyhow!("{ADAPTER_CAPABILITY_SKIP}: invalid content: {e}"))?
+    {
+        parts if parts.len() == 1 && matches!(parts[0], ContentPart::Text(_)) => Ok(
+            serde_json::Value::String(match parts.into_iter().next().unwrap() {
+                ContentPart::Text(t) => t,
+                _ => unreachable!(),
+            }),
+        ),
+        parts => {
+            let output: Vec<serde_json::Value> = parts
+                .into_iter()
+                .map(responses_content_part)
+                .collect::<Result<_>>()?;
+            Ok(serde_json::Value::Array(output))
+        }
+    }
+}
+
+fn responses_content_part(part: ContentPart) -> Result<serde_json::Value> {
+    match part {
+        ContentPart::Text(text) => Ok(serde_json::json!({ "type": "input_text", "text": text })),
+        ContentPart::Image { url } => {
+            Ok(serde_json::json!({ "type": "input_image", "image_url": url }))
+        }
+        ContentPart::Audio { url } => {
+            let data = parse_data_url(&url)
+                .filter(|d| d.mime.starts_with("audio/"))
+                .ok_or_else(|| anyhow::anyhow!("{ADAPTER_CAPABILITY_SKIP}: Responses audio input requires inline base64 audio"))?;
+            let format = data.mime.trim_start_matches("audio/");
+            Ok(
+                serde_json::json!({ "type": "input_audio", "input_audio": { "data": data.data, "format": format } }),
+            )
+        }
+        ContentPart::Video { .. } => {
+            bail!("{ADAPTER_CAPABILITY_SKIP}: the Responses API has no standard video content part")
+        }
+        ContentPart::File { url } => {
+            let value = if let Some(data) = parse_data_url(&url) {
+                serde_json::json!({ "type": "input_file", "file_data": data.data })
+            } else {
+                serde_json::json!({ "type": "input_file", "file_url": url })
+            };
+            Ok(value)
+        }
+    }
+}
+
+fn responses_function_call(call: &serde_json::Value) -> Result<serde_json::Value> {
+    let name = call
+        .pointer("/function/name")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if name.is_empty() {
+        bail!("tool call is missing function.name");
+    }
+    let call_id = call.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+    Ok(serde_json::json!({
+        "type": "function_call",
+        "id": call_id,
+        "call_id": call_id,
+        "name": name,
+        "arguments": call.pointer("/function/arguments").and_then(|v| v.as_str()).unwrap_or("{}"),
+        "status": "completed",
+    }))
+}
+
+fn tools_for_responses(
+    reserved: Option<&serde_json::Value>,
+    extra: &serde_json::Value,
+) -> Result<Option<serde_json::Value>> {
+    if let Some(tools) = reserved.and_then(|v| v.get("tools")) {
+        return Ok(Some(tools.clone()));
+    }
+    let Some(tools) = extra.get("tools").and_then(|v| v.as_array()) else {
+        return Ok(None);
+    };
+    let mut converted = Vec::with_capacity(tools.len());
+    for tool in tools {
+        match tool.get("type").and_then(|v| v.as_str()) {
+            Some("function") => {
+                let function = tool
+                    .get("function")
+                    .ok_or_else(|| anyhow::anyhow!("function tool is missing `function`"))?;
+                converted.push(serde_json::json!({
+                    "type": "function",
+                    "name": function.get("name").cloned().unwrap_or_default(),
+                    "description": function.get("description").cloned().unwrap_or_default(),
+                    "parameters": function.get("parameters").cloned().unwrap_or(serde_json::json!({ "type": "object", "properties": {} })),
+                    "strict": function.get("strict").cloned().unwrap_or(serde_json::Value::Bool(false)),
+                }));
+            }
+            Some(other) => bail!("tool type {other:?} has no Responses function mapping"),
+            None => bail!("tool is missing a string `type`"),
+        }
+    }
+    Ok(Some(serde_json::Value::Array(converted)))
+}
+
+fn responses_text_format(format: &serde_json::Value) -> serde_json::Value {
+    match format.get("type").and_then(|v| v.as_str()) {
+        Some("json_schema") => {
+            let schema = format.get("json_schema").cloned().unwrap_or_default();
+            serde_json::json!({
+                "type": "json_schema",
+                "name": schema.get("name").cloned().unwrap_or_default(),
+                "description": schema.get("description").cloned(),
+                "schema": schema.get("schema").cloned().unwrap_or_default(),
+                "strict": schema.get("strict").cloned().unwrap_or(serde_json::Value::Bool(false)),
+            })
+        }
+        _ => serde_json::json!({ "type": "json_object" }),
+    }
 }
 
 /// Walk a Responses reply and reshape it into a chat-completion response.
@@ -139,24 +283,53 @@ pub fn translate_response(resp: &serde_json::Value, model_id: &str) -> Result<se
         .context("responses body missing `output` array")?;
 
     let mut text = String::new();
+    let mut tool_calls = Vec::new();
     for item in output {
-        if item.get("type").and_then(|t| t.as_str()) != Some("message") {
-            continue;
-        }
-        let Some(parts) = item.get("content").and_then(|c| c.as_array()) else {
-            continue;
-        };
-        for part in parts {
-            let kind = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            if kind == "output_text" || kind == "text" {
-                if let Some(s) = part.get("text").and_then(|t| t.as_str()) {
-                    text.push_str(s);
+        match item.get("type").and_then(|t| t.as_str()) {
+            Some("message") => {
+                if let Some(parts) = item.get("content").and_then(|c| c.as_array()) {
+                    for part in parts {
+                        let kind = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                        if matches!(kind, "output_text" | "text" | "refusal") {
+                            if let Some(value) = part.get("text").and_then(|t| t.as_str()) {
+                                text.push_str(value);
+                            }
+                        }
+                    }
                 }
             }
+            Some("function_call" | "custom_tool_call") => {
+                let call_id = item
+                    .get("call_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let arguments =
+                    if item.get("type").and_then(|v| v.as_str()) == Some("custom_tool_call") {
+                        item.get("input")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("{}")
+                            .to_string()
+                    } else {
+                        item.get("arguments")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("{}")
+                            .to_string()
+                    };
+                tool_calls.push(serde_json::json!({
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": item.get("name").and_then(|v| v.as_str()).unwrap_or_default(),
+                        "arguments": arguments,
+                    }
+                }));
+            }
+            _ => {}
         }
     }
-    if text.trim().is_empty() {
-        bail!("responses output carried no assistant text");
+    if text.trim().is_empty() && tool_calls.is_empty() {
+        bail!("responses output carried no assistant text or tool calls");
     }
 
     let id = resp
@@ -183,6 +356,15 @@ pub fn translate_response(resp: &serde_json::Value, model_id: &str) -> Result<se
         .get("usage")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
+    let mut message = serde_json::json!({ "role": "assistant", "content": text });
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = serde_json::Value::Array(tool_calls.clone());
+    }
+    let finish_reason = if tool_calls.is_empty() {
+        "stop"
+    } else {
+        "tool_calls"
+    };
     Ok(serde_json::json!({
         "id": id,
         "object": "chat.completion",
@@ -190,8 +372,8 @@ pub fn translate_response(resp: &serde_json::Value, model_id: &str) -> Result<se
         "model": model,
         "choices": [{
             "index": 0,
-            "message": { "role": "assistant", "content": text },
-            "finish_reason": "stop",
+            "message": message,
+            "finish_reason": finish_reason,
         }],
         "usage": usage,
     }))
@@ -279,58 +461,62 @@ mod tests {
         .expect("translate");
         assert_eq!(body["model"], "responses-model");
         assert_eq!(body["instructions"], "be terse");
-        assert_eq!(body["input"], "user: hi");
+        assert_eq!(
+            body["input"],
+            serde_json::json!([{
+                "type": "message", "role": "user", "content": "hi"
+            }])
+        );
         assert_eq!(body["temperature"], 0.5);
         assert_eq!(body["max_output_tokens"], 128);
     }
 
     #[test]
-    fn request_rejects_tools() {
-        let err = translate_request(
+    fn request_maps_tools_to_responses_function_tools() {
+        let body = translate_request(
             &chat(serde_json::json!({
-                "tools": [{ "type": "function" }],
+                "tools": [{ "type": "function", "function": { "name": "shell", "parameters": { "type": "object" } } }],
+                "tool_choice": "required",
             })),
             "responses-model",
         )
-        .expect_err("tools should be rejected");
-        assert!(err.to_string().contains("tools"));
+        .expect("translate");
+        assert_eq!(body["tools"][0]["name"], "shell");
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(body["tool_choice"], "required");
     }
 
     #[test]
-    fn request_rejects_tool_choice() {
-        let err = translate_request(
-            &chat(serde_json::json!({
-                "tool_choice": "auto",
-            })),
+    fn request_preserves_tool_choice() {
+        let body = translate_request(
+            &chat(serde_json::json!({ "tool_choice": "auto" })),
             "responses-model",
         )
-        .expect_err("tool_choice should be rejected");
-        assert!(err.to_string().contains("tool_choice"));
+        .expect("translate");
+        assert_eq!(body["tool_choice"], "auto");
     }
 
     #[test]
-    fn request_rejects_response_format() {
-        let err = translate_request(
+    fn request_maps_response_format_to_responses_text_format() {
+        let body = translate_request(
             &chat(serde_json::json!({
                 "response_format": { "type": "json_object" },
             })),
             "responses-model",
         )
-        .expect_err("response_format should be rejected");
-        assert!(err.to_string().contains("response_format"));
+        .expect("translate");
+        assert_eq!(body["text"]["format"]["type"], "json_object");
     }
 
     #[test]
-    fn request_rejects_images() {
+    fn request_maps_images_to_responses_input_image() {
         let mut req = chat(serde_json::json!({}));
-        // Add an image to the user message
         req.messages[1].content = serde_json::json!([
             { "type": "text", "text": "what is this" },
             { "type": "image_url", "image_url": { "url": "https://x/cat.png" } }
         ]);
-        let err =
-            translate_request(&req, "responses-model").expect_err("images should be rejected");
-        assert!(err.to_string().contains("vision") || err.to_string().contains("image"));
+        let body = translate_request(&req, "responses-model").expect("translate");
+        assert_eq!(body["input"][0]["content"][1]["type"], "input_image");
     }
 
     #[test]

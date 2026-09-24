@@ -159,10 +159,11 @@ fn recent(store: &crate::storage::Store, profile: Option<String>, limit: u32) ->
             _ => "-".to_string(),
         };
         println!(
-            "  [{}] {} model={} {} latency={}ms tokens={}",
+            "  [{}] {} model={} request_id={} {} latency={}ms tokens={}",
             when,
             if r.streamed { "stream" } else { "direct" },
             r.model_id,
+            r.request_id.as_deref().unwrap_or("-"),
             outcome,
             r.latency_ms,
             tokens

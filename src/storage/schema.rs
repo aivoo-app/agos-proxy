@@ -121,6 +121,7 @@ pub const SCHEMA_HEAD: &str = "
         profile_id    TEXT NOT NULL,
         route_entry_id INTEGER NOT NULL REFERENCES route_entries(id) ON DELETE CASCADE,
         model_id      TEXT NOT NULL,
+        request_id    TEXT,
         streamed      INTEGER NOT NULL DEFAULT 0,
         success       INTEGER NOT NULL,
         status_code   INTEGER,
@@ -222,6 +223,11 @@ pub fn migrate_columns(conn: &rusqlite::Connection) -> anyhow::Result<()> {
     // than defaulted so history logged before this column existed stays
     // distinguishable from a genuine zero-cache-read call.
     ensure_column(conn, "usage_log", "cached_prompt_tokens", "INTEGER")?;
+    ensure_column(conn, "usage_log", "request_id", "TEXT")?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_usage_request ON usage_log(request_id, created_at)",
+        [],
+    )?;
 
     // Normalize any route entry status tags that are no longer valid in the
     // current enum (e.g. deprecated "draining") so the store can be read without

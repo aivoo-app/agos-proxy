@@ -54,26 +54,26 @@ codex --profile agos
 
 | Codex sends | AGOS does |
 |---|---|
-| `input[]` message items | Flattens into chat-completions `messages` |
-| `instructions` | Becomes the `system` message |
-| `tools[]` (function) | Forwards as chat-completions `tools` |
-| `function_call_output` items | Becomes `role: "tool"` messages with `tool_call_id` |
-| `store`, `reasoning`, `include`, `prompt_cache_key`, … | Stripped (no chat-completions equivalent) — never forwarded upstream |
+| `input[]` message items | Preserved as ordered canonical messages, then translated to the selected provider's native input shape |
+| `instructions` | Becomes the `system` message / Responses `instructions` |
+| `tools[]` (function/custom) | Translated to native tool definitions for OpenAI, Responses, Anthropic, or Google |
+| `function_call_output` items | Becomes a tool-result message and is translated back to the selected provider's native tool-result shape |
+| `store`, `reasoning`, `include`, `prompt_cache_key`, … | Restored only for a Responses-compatible upstream; never sent to a strict chat provider |
 | Upstream text delta | `response.output_text.delta` |
-| Upstream `tool_calls` | `function_call` output items; `arguments` stays a JSON string |
+| Upstream tool call | `function_call` output item; `arguments` stays a JSON string |
 | End of upstream stream | `response.output_item.done` items + `response.completed` (with usage) |
 
-Reasoning items in the input are dropped with a debug log: AGOS's upstreams are
-stateless chat-completions, so chain-of-thought cannot be replayed.
+Input items that require server-side Responses state and cannot be represented
+by a stateless destination are rejected explicitly; the proxy never drops them
+quietly. Send the full replayable conversation in `input` (Codex does).
 
 ## 4. Limitations
 
-- **No server-side state**: `store` and `previous_response_id` are ignored;
-  the client must send the full conversation in `input` (Codex does).
-- **Tools only on OpenAI-compatible upstreams**: a failover to an Anthropic or
-  Gemini entry keeps the text path but does not yet translate tool
-  definitions/calls into those APIs' native tool formats.
-- **Long turns**: the per-attempt timeout (`AGOS_ATTEMPT_TIMEOUT`, default
+- **Provider-native feature boundaries:** a request is sent only to a route
+  entry that declares the required tools/media/JSON capability. A provider may
+  still reject a particular payload; that attempt is logged and failover tries
+  the next compatible entry.
+- **Long turns:** the per-attempt timeout (`AGOS_ATTEMPT_TIMEOUT`, default
   120 s) and the request body cap (5 MB) apply; very long agentic sessions
   that exceed them will surface as upstream errors.
 

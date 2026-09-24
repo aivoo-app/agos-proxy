@@ -16,6 +16,8 @@
 //! per-surface inbound adapters and [`crate::adapter::outbound`] for the
 //! per-provider outbound adapters built on top of these types.
 
+use serde::de::Error as _;
+
 /// An OpenAI chat completions request.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ChatRequest {
@@ -23,6 +25,12 @@ pub struct ChatRequest {
     pub messages: Vec<Message>,
     #[serde(default)]
     pub stream: bool,
+    /// Stable caller/proxy correlation id. It is deliberately not serialized
+    /// into provider payloads; the outbound layer forwards it as `X-Request-ID`
+    /// and the usage log stores it as attempt metadata instead.
+    #[serde(skip)]
+    pub request_id: Option<String>,
+
     #[serde(flatten)]
     pub extra: serde_json::Value,
 }
@@ -67,14 +75,19 @@ impl Message {
 /// (Anthropic blocks, Google parts) without re-parsing the OpenAI wire format
 /// themselves. Plain-text-only content still flows through [`content_text`],
 /// which is built on the same parts.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ContentPart {
     /// A plain text segment.
     Text(String),
-    /// An image, referenced either by an `http(s)://` URL or by a
-    /// `data:<mime>[;base64],<payload>` data URL. Both live verbatim in
-    /// `url`; see [`parse_data_url`] to split the data-URL form.
+    /// An image reference (`http(s)` or `data:` URL).
     Image { url: String },
+    /// An audio reference. OpenAI inline audio is normalized to a `data:` URL so
+    /// every adapter sees one representation.
+    Audio { url: String },
+    /// A video reference.
+    Video { url: String },
+    /// A generic file reference (for example a PDF).
+    File { url: String },
 }
 
 /// A decoded `data:` URL: the MIME type from the header and the (base64)
@@ -92,77 +105,199 @@ pub struct DataUrl {
 pub fn parse_data_url(url: &str) -> Option<DataUrl> {
     let rest = url.strip_prefix("data:")?;
     let (header, payload) = rest.split_once(',')?;
-    let header = header.strip_suffix(";base64").unwrap_or(header);
-    let mime = if header.is_empty() {
-        "application/octet-stream".to_string()
-    } else {
-        header.to_string()
-    };
+    let _header = header.strip_suffix(";base64").unwrap_or(header);
+    let mime = url
+        .strip_prefix("data:")
+        .and_then(|rest| rest.split_once(','))
+        .map(|(header, _)| header.trim_end_matches(";base64"))
+        .filter(|header| !header.is_empty())
+        .unwrap_or("application/octet-stream");
     Some(DataUrl {
-        mime,
+        mime: mime.to_string(),
         data: payload.to_string(),
     })
 }
 
-/// Best-effort MIME type for an image URL, inferred from the file extension.
-/// Google's `fileData` part requires an explicit MIME type and the OpenAI wire
-/// format does not carry one, so unknown extensions fall back to `image/jpeg`.
+/// Best-effort MIME type for a media URL, inferred from its extension.
+/// Google's `fileData` part requires an explicit MIME type and canonical media
+/// references do not always carry one, so unknown extensions use a conservative
+/// type for the declared modality.
+pub fn infer_media_mime(kind: &ContentPart, url: &str) -> &'static str {
+    let path = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .to_ascii_lowercase();
+    let extension = [
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".mp3", ".wav", ".ogg", ".mp4", ".webm", ".mov",
+        ".pdf",
+    ]
+    .into_iter()
+    .find(|ext| path.ends_with(ext))
+    .unwrap_or("");
+    match extension {
+        ".png" => "image/png",
+        ".jpg" | ".jpeg" => "image/jpeg",
+        ".gif" => "image/gif",
+        ".webp" => "image/webp",
+        ".mp3" => "audio/mpeg",
+        ".wav" => "audio/wav",
+        ".ogg" => "audio/ogg",
+        ".mp4" => "video/mp4",
+        ".webm" => "video/webm",
+        ".mov" => "video/quicktime",
+        ".pdf" => "application/pdf",
+        _ => match kind {
+            ContentPart::Image { .. } => "image/jpeg",
+            ContentPart::Audio { .. } => "audio/mpeg",
+            ContentPart::Video { .. } => "video/mp4",
+            ContentPart::File { .. } => "application/octet-stream",
+            ContentPart::Text(_) => "text/plain",
+        },
+    }
+}
+
+/// Backwards-compatible image MIME inference.
 pub fn infer_image_mime(url: &str) -> &'static str {
-    // Strip any query string / fragment before matching the extension.
-    let path = url.split(['?', '#']).next().unwrap_or(url);
-    let lower = path.to_ascii_lowercase();
-    if lower.ends_with(".png") {
-        "image/png"
-    } else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
-        "image/jpeg"
-    } else if lower.ends_with(".gif") {
-        "image/gif"
-    } else if lower.ends_with(".webp") {
-        "image/webp"
-    } else {
-        "image/jpeg"
+    infer_media_mime(
+        &ContentPart::Image {
+            url: url.to_string(),
+        },
+        url,
+    )
+}
+
+/// Strictly parse canonical content parts. Unlike [`content_parts`], this
+/// rejects unknown object/part types instead of silently omitting them.
+pub fn parse_content_parts(
+    content: &serde_json::Value,
+) -> Result<Vec<ContentPart>, serde_json::Error> {
+    let serde_json::Value::String(text) = content else {
+        if content.is_null() {
+            return Ok(Vec::new());
+        }
+        let serde_json::Value::Array(parts) = content else {
+            return Err(content_error(
+                "message content must be a string, array, or null",
+            ));
+        };
+        return parts.iter().map(parse_content_part).collect();
+    };
+    Ok(vec![ContentPart::Text(text.clone())])
+}
+
+fn parse_content_part(part: &serde_json::Value) -> Result<ContentPart, serde_json::Error> {
+    let kind = part
+        .get("type")
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| serde_json::Error::custom("content part is missing a string `type`"))?;
+    match kind {
+        "text" | "input_text" | "output_text" => Ok(ContentPart::Text(
+            part.get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        )),
+        "image_url" | "input_image" => Ok(ContentPart::Image {
+            url: media_url(part, "image_url")?,
+        }),
+        "audio_url" => Ok(ContentPart::Audio {
+            url: media_url(part, "audio_url")?,
+        }),
+        "video_url" => Ok(ContentPart::Video {
+            url: media_url(part, "video_url")?,
+        }),
+        "input_audio" => {
+            let audio = part
+                .get("input_audio")
+                .ok_or_else(|| content_error("input_audio is missing `input_audio`"))?;
+            let data = audio
+                .get("data")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| content_error("input_audio is missing base64 `data`"))?;
+            let format = audio
+                .get("format")
+                .and_then(|v| v.as_str())
+                .unwrap_or("mpeg");
+            let url = format!("data:audio/{format};base64,{data}");
+            Ok(ContentPart::Audio { url })
+        }
+        "file" | "input_file" => {
+            let url = part
+                .get("file")
+                .and_then(|v| media_url(v, "file").ok())
+                .or_else(|| {
+                    part.get("file_data")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                })
+                .or_else(|| {
+                    part.get("file_url")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                })
+                .ok_or_else(|| content_error("file/input_file needs file_data or file_url"))?;
+            Ok(ContentPart::File { url })
+        }
+        other => Err(content_error(&format!(
+            "unsupported content part type {other:?}"
+        ))),
     }
 }
 
-/// Extract the ordered content parts of a message content value.
-///
-/// A plain string becomes a single [`ContentPart::Text`]. The OpenAI parts
-/// array contributes its `text` and `image_url` entries in order; parts of
-/// any other type are ignored. Non-string, non-array content (null, objects)
-/// yields no parts.
-pub fn content_parts(content: &serde_json::Value) -> Vec<ContentPart> {
-    match content {
-        serde_json::Value::String(s) => vec![ContentPart::Text(s.clone())],
-        serde_json::Value::Array(parts) => parts
-            .iter()
-            .filter_map(|p| match p.get("type").and_then(|t| t.as_str()) {
-                Some("text") => p
-                    .get("text")
-                    .and_then(|t| t.as_str())
-                    .map(|t| ContentPart::Text(t.to_string())),
-                Some("image_url") => Some(ContentPart::Image {
-                    url: image_part_url(p),
-                }),
-                _ => None,
-            })
-            .collect(),
-        _ => Vec::new(),
-    }
+fn content_error(message: &str) -> serde_json::Error {
+    serde_json::Error::custom(message)
 }
 
-/// The URL of an OpenAI `image_url` part. The wire format nests it under
-/// `image_url.url`, but a bare string
-/// (`{"type": "image_url", "image_url": "https://…"}`) is accepted defensively.
-fn image_part_url(part: &serde_json::Value) -> String {
-    match part.get("image_url") {
-        Some(serde_json::Value::String(s)) => s.clone(),
-        Some(v) => v
+fn media_url(part: &serde_json::Value, key: &str) -> Result<String, serde_json::Error> {
+    let value = part
+        .get(key)
+        .ok_or_else(|| content_error(&format!("content part is missing `{key}`")))?;
+    match value {
+        serde_json::Value::String(url) => Ok(url.clone()),
+        serde_json::Value::Object(_) if key == "file" => value
+            .get("file_url")
+            .or_else(|| value.get("file_data"))
+            .and_then(|url| url.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| content_error("file must carry `file_url` or `file_data`")),
+        serde_json::Value::Object(_) => value
             .get("url")
-            .and_then(|u| u.as_str())
-            .unwrap_or_default()
-            .to_string(),
-        None => String::new(),
+            .or_else(|| value.get("file_url"))
+            .or_else(|| value.get("file_data"))
+            .and_then(|url| url.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| content_error(&format!("`{key}` must carry a URL or inline data"))),
+        _ => Err(content_error(&format!(
+            "`{key}` must be a string or object"
+        ))),
     }
+}
+
+/// Render one canonical media part as an OpenAI chat content part.
+pub fn content_part_to_chat_json(part: &ContentPart) -> serde_json::Value {
+    match part {
+        ContentPart::Text(text) => serde_json::json!({ "type": "text", "text": text }),
+        ContentPart::Image { url } => {
+            serde_json::json!({ "type": "image_url", "image_url": { "url": url } })
+        }
+        ContentPart::Audio { url } => {
+            serde_json::json!({ "type": "audio_url", "audio_url": { "url": url } })
+        }
+        ContentPart::Video { url } => {
+            serde_json::json!({ "type": "video_url", "video_url": { "url": url } })
+        }
+        ContentPart::File { url } => {
+            serde_json::json!({ "type": "file", "file": { "file_url": url } })
+        }
+    }
+}
+
+/// Extract the known ordered content parts of a message. Malformed/unknown
+/// parts are omitted; cross-protocol adapters use [`parse_content_parts`] so
+/// they can reject those parts instead of losing them.
+pub fn content_parts(content: &serde_json::Value) -> Vec<ContentPart> {
+    parse_content_parts(content).unwrap_or_default()
 }
 
 /// Whether the message content carries any image part.
@@ -172,14 +307,27 @@ pub fn content_has_image(content: &serde_json::Value) -> bool {
         .any(|p| matches!(p, ContentPart::Image { .. }))
 }
 
+/// Whether the message carries audio, video, or file input.
+pub fn content_has_non_image_media(content: &serde_json::Value) -> bool {
+    content_parts(content).iter().any(|p| {
+        matches!(
+            p,
+            ContentPart::Audio { .. } | ContentPart::Video { .. } | ContentPart::File { .. }
+        )
+    })
+}
+
 /// Extract the plain-text portion of a message content value. Multimodal
-/// (array) content contributes its `text` parts; image parts are dropped.
+/// (array) content contributes its `text` parts; media parts are omitted.
 pub fn content_text(content: &serde_json::Value) -> String {
     content_parts(content)
         .into_iter()
         .filter_map(|p| match p {
             ContentPart::Text(t) => Some(t),
-            ContentPart::Image { .. } => None,
+            ContentPart::Image { .. }
+            | ContentPart::Audio { .. }
+            | ContentPart::Video { .. }
+            | ContentPart::File { .. } => None,
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -231,16 +379,9 @@ pub fn parse_usage_tokens(body: &[u8]) -> UsageTokens {
         .and_then(|t| t.as_i64());
     UsageTokens {
         prompt_tokens: get(&["prompt_tokens", "input_tokens", "promptTokenCount"]),
-        completion_tokens: get(&[
-            "completion_tokens",
-            "output_tokens",
-            "candidatesTokenCount",
-        ]),
-        cached_prompt_tokens: get(&[
-            "cache_read_input_tokens",
-            "cachedContentTokenCount",
-        ])
-        .or(openai_cached),
+        completion_tokens: get(&["completion_tokens", "output_tokens", "candidatesTokenCount"]),
+        cached_prompt_tokens: get(&["cache_read_input_tokens", "cachedContentTokenCount"])
+            .or(openai_cached),
     }
 }
 
@@ -261,6 +402,9 @@ pub struct CanonicalResponse {
     /// assistant turn that only calls tools carries an empty `text`.
     #[serde(default)]
     pub tool_calls: Vec<ToolCall>,
+    /// Non-text output parts returned by a multimodal provider.
+    #[serde(default)]
+    pub media: Vec<ContentPart>,
 }
 
 impl CanonicalResponse {
@@ -551,7 +695,7 @@ mod tests {
             {"type": "text", "text": "what is this"},
             {"type": "image_url", "image_url": {"url": "https://x/cat.png"}},
             {"type": "text", "text": "answer briefly"},
-            // Unknown part types are ignored.
+            // Audio is now a first-class canonical part.
             {"type": "input_audio", "input_audio": {"data": "..."}}
         ]);
         assert_eq!(
@@ -562,6 +706,9 @@ mod tests {
                     url: "https://x/cat.png".into()
                 },
                 ContentPart::Text("answer briefly".into()),
+                ContentPart::Audio {
+                    url: "data:audio/mpeg;base64,...".into()
+                },
             ]
         );
     }

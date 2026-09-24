@@ -4,16 +4,17 @@
 //! Google's `generateContent` API. Reference:
 //! https://ai.google.dev/api/generate-content
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
-use anyhow::{Context as _, Result};
+use anyhow::{bail, Context as _, Result};
 
 use super::normalize_base;
 use crate::domain::ProviderKind;
 use crate::router::Target;
 use crate::translator::{
-    content_parts, content_text, infer_image_mime, parse_data_url, ChatRequest, ContentPart,
+    infer_media_mime, parse_content_parts, parse_data_url, ChatRequest, ContentPart,
 };
+pub const ADAPTER_CAPABILITY_SKIP: &str = "adapter capability skip";
 
 /// Build the upstream URL for a Google request. The API key goes in the query
 /// string, so the target's auth token is appended there.
@@ -55,61 +56,108 @@ fn google_role(role: &str) -> &'static str {
 /// image parts yields ordered parts: text parts keep their `text` field and
 /// image parts become `fileData` (`http(s)://` references) or `inlineData`
 /// (`data:` URLs).
-fn google_parts(content: &serde_json::Value) -> Vec<serde_json::Value> {
-    let has_image = content_parts(content)
-        .iter()
-        .any(|p| matches!(p, ContentPart::Image { .. }));
-    if !has_image {
-        return vec![serde_json::json!({ "text": content_text(content) })];
-    }
-
-    content_parts(content)
-        .into_iter()
-        .map(|p| match p {
+fn google_parts(content: &serde_json::Value) -> Result<Vec<serde_json::Value>> {
+    let parts = parse_content_parts(content)
+        .map_err(|e| anyhow::anyhow!("{ADAPTER_CAPABILITY_SKIP}: invalid content: {e}"))?;
+    let mut out = Vec::with_capacity(parts.len());
+    for part in parts {
+        out.push(match part {
             ContentPart::Text(text) => serde_json::json!({ "text": text }),
-            ContentPart::Image { url } => image_part(&url),
-        })
-        .collect()
-}
-
-/// Map one canonical image onto a Google content part. A `data:` URL is split
-/// into its MIME type and base64 payload; anything else is passed as a
-/// `fileData` URI (which requires a publicly resolvable URL) with the MIME
-/// type inferred from the file extension.
-fn image_part(url: &str) -> serde_json::Value {
-    if let Some(data) = parse_data_url(url) {
-        return serde_json::json!({
-            "inlineData": { "mimeType": data.mime, "data": data.data },
+            ContentPart::Image { url } => {
+                media_part(&ContentPart::Image { url: url.clone() }, &url)
+            }
+            ContentPart::Audio { url } => {
+                media_part(&ContentPart::Audio { url: url.clone() }, &url)
+            }
+            ContentPart::Video { url } => {
+                media_part(&ContentPart::Video { url: url.clone() }, &url)
+            }
+            ContentPart::File { url } => media_part(&ContentPart::File { url: url.clone() }, &url),
         });
     }
-    serde_json::json!({
-        "fileData": { "mimeType": infer_image_mime(url), "fileUri": url },
-    })
+    if out.is_empty() {
+        out.push(serde_json::json!({ "text": "" }));
+    }
+    Ok(out)
+}
+
+fn media_part(kind: &ContentPart, url: &str) -> serde_json::Value {
+    if let Some(data) = parse_data_url(url) {
+        return serde_json::json!({ "inlineData": { "mimeType": data.mime, "data": data.data } });
+    }
+    serde_json::json!({ "fileData": { "mimeType": infer_media_mime(kind, url), "fileUri": url } })
 }
 
 /// Translate an OpenAI chat request into a Google generateContent body.
-pub fn translate_request(chat_req: &ChatRequest) -> serde_json::Value {
+pub fn translate_request(chat_req: &ChatRequest) -> Result<serde_json::Value> {
     let mut system_parts: Vec<serde_json::Value> = Vec::new();
     let mut contents = Vec::new();
+    let mut tool_names = HashMap::<String, String>::new();
+    for msg in &chat_req.messages {
+        if let Some(calls) = msg.extra.get("tool_calls").and_then(|v| v.as_array()) {
+            for call in calls {
+                if let (Some(id), Some(name)) = (
+                    call.get("id").and_then(|v| v.as_str()),
+                    call.pointer("/function/name").and_then(|v| v.as_str()),
+                ) {
+                    tool_names.insert(id.to_string(), name.to_string());
+                }
+            }
+        }
+    }
 
     for msg in &chat_req.messages {
-        if msg.role == "system" {
-            // systemInstruction is text-only; image parts there are dropped
-            // (see [`google_parts`] for the message-level mapping).
-            system_parts.push(serde_json::json!({ "text": content_text(&msg.content) }));
+        if matches!(msg.role.as_str(), "system" | "developer") {
+            let parts = parse_content_parts(&msg.content)
+                .map_err(|e| anyhow::anyhow!("{ADAPTER_CAPABILITY_SKIP}: invalid content: {e}"))?;
+            if parts
+                .iter()
+                .any(|part| !matches!(part, ContentPart::Text(_)))
+            {
+                bail!("{ADAPTER_CAPABILITY_SKIP}: Google systemInstruction is text-only");
+            }
+            system_parts.push(serde_json::json!({ "text": parts.into_iter().filter_map(|part| match part { ContentPart::Text(t) => Some(t), _ => None }).collect::<Vec<_>>().join("\n") }));
             continue;
         }
-        contents.push(serde_json::json!({
-            "role": google_role(&msg.role),
-            "parts": google_parts(&msg.content),
-        }));
+        if msg.role == "tool" {
+            let call_id = msg
+                .extra
+                .get("tool_call_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let name = msg
+                .extra
+                .get("name")
+                .and_then(|v| v.as_str())
+                .or_else(|| tool_names.get(call_id).map(String::as_str))
+                .unwrap_or("tool");
+            let output = if msg.content.is_object() {
+                msg.content.clone()
+            } else {
+                serde_json::json!({ "output": msg.content })
+            };
+            contents.push(serde_json::json!({ "role": "user", "parts": [{ "functionResponse": { "name": name, "response": output } }] }));
+            continue;
+        }
+        let mut parts = google_parts(&msg.content)?;
+        if let Some(calls) = msg.extra.get("tool_calls").and_then(|v| v.as_array()) {
+            if parts.len() == 1 && parts[0].get("text").and_then(|v| v.as_str()) == Some("") {
+                parts.clear();
+            }
+            for call in calls {
+                parts.push(serde_json::json!({ "functionCall": {
+                    "name": call.pointer("/function/name").and_then(|v| v.as_str()).unwrap_or_default(),
+                    "args": serde_json::from_str::<serde_json::Value>(call.pointer("/function/arguments").and_then(|v| v.as_str()).unwrap_or("{}")).unwrap_or(serde_json::json!({})),
+                }}));
+            }
+        }
+        contents.push(serde_json::json!({ "role": google_role(&msg.role), "parts": parts }));
     }
 
     let mut body = serde_json::json!({ "contents": contents });
     if !system_parts.is_empty() {
         body["systemInstruction"] = serde_json::json!({ "parts": system_parts });
     }
-
     let mut gen_cfg = serde_json::Map::new();
     if let Some(obj) = chat_req.extra.as_object() {
         for (from, to) in [
@@ -118,21 +166,61 @@ pub fn translate_request(chat_req: &ChatRequest) -> serde_json::Value {
             ("top_k", "topK"),
         ] {
             if let Some(v) = obj.get(from) {
-                gen_cfg.insert(to.to_string(), v.clone());
+                gen_cfg.insert(to.into(), v.clone());
             }
         }
         if let Some(v) = obj.get("stop") {
-            gen_cfg.insert("stopSequences".to_string(), v.clone());
+            gen_cfg.insert("stopSequences".into(), v.clone());
         }
-        if let Some(n) = obj.get("max_tokens").and_then(|v| v.as_u64()) {
-            gen_cfg.insert("maxOutputTokens".to_string(), serde_json::Value::from(n));
+        for key in ["max_tokens", "max_completion_tokens"] {
+            if let Some(n) = obj.get(key).and_then(|v| v.as_u64()) {
+                gen_cfg.insert("maxOutputTokens".into(), serde_json::Value::from(n));
+                break;
+            }
+        }
+        if let Some(format) = obj.get("response_format").filter(|v| !v.is_null()) {
+            gen_cfg.insert("responseMimeType".into(), "application/json".into());
+            if let Some(schema) = format.pointer("/json_schema/schema") {
+                gen_cfg.insert("responseSchema".into(), schema.clone());
+            }
         }
     }
     if !gen_cfg.is_empty() {
         body["generationConfig"] = serde_json::Value::Object(gen_cfg);
     }
+    if let Some(tools) = chat_req
+        .extra
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .filter(|v| !v.is_empty())
+    {
+        let declarations: Vec<_> = tools
+            .iter()
+            .map(|tool| {
+                let f = tool.get("function").unwrap_or(tool);
+                serde_json::json!({ "name": f.get("name").cloned().unwrap_or_default(), "description": f.get("description").cloned().unwrap_or_default(), "parameters": f.get("parameters").cloned().unwrap_or(serde_json::json!({ "type": "object", "properties": {} })) })
+            })
+            .collect();
+        body["tools"] = serde_json::json!([{ "functionDeclarations": declarations }]);
+        if let Some(choice) = chat_req.extra.get("tool_choice") {
+            body["toolConfig"] =
+                serde_json::json!({ "functionCallingConfig": google_tool_choice(choice) });
+        }
+    }
+    Ok(body)
+}
 
-    body
+fn google_tool_choice(choice: &serde_json::Value) -> serde_json::Value {
+    let mode = match choice.as_str().unwrap_or("auto") {
+        "none" => "NONE",
+        "required" => "ANY",
+        _ => "AUTO",
+    };
+    let mut config = serde_json::json!({ "mode": mode });
+    if let Some(name) = choice.pointer("/function/name") {
+        config["allowedFunctionNames"] = serde_json::json!([name]);
+    }
+    config
 }
 
 /// Translate a Google generateContent response back into OpenAI format.
@@ -144,21 +232,32 @@ pub fn translate_response(resp: &serde_json::Value, model_id: &str) -> Result<se
         .context("google response missing candidates")?;
 
     let mut text = String::new();
+    let mut tool_calls = Vec::new();
     if let Some(parts) = candidates
-        .get("content")
-        .and_then(|c| c.get("parts"))
+        .pointer("/content/parts")
         .and_then(|p| p.as_array())
     {
         for part in parts {
             if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
                 text.push_str(t);
             }
+            if let Some(call) = part.get("functionCall") {
+                tool_calls.push(serde_json::json!({
+                    "id": call.get("id").cloned().unwrap_or_default(),
+                    "type": "function",
+                    "function": { "name": call.get("name").cloned().unwrap_or_default(), "arguments": call.get("args").map(|v| if v.is_string() { v.clone() } else { serde_json::Value::String(v.to_string()) }).unwrap_or_else(|| serde_json::Value::String("{}".into())) }
+                }));
+            }
         }
+    }
+    if text.trim().is_empty() && tool_calls.is_empty() {
+        bail!("google response carried no assistant text or function calls");
     }
 
     let finish_reason = match candidates.get("finishReason").and_then(|v| v.as_str()) {
         Some("MAX_TOKENS") => "length",
         Some("SAFETY") | Some("RECITATION") => "content_filter",
+        _ if !tool_calls.is_empty() => "tool_calls",
         _ => "stop",
     };
 
@@ -178,7 +277,11 @@ pub fn translate_response(resp: &serde_json::Value, model_id: &str) -> Result<se
         "model": serde_json::Value::String(model_id.to_string()),
         "choices": [{
             "index": 0,
-            "message": { "role": "assistant", "content": text },
+            "message": {
+                "role": "assistant",
+                "content": text,
+                "tool_calls": tool_calls,
+            },
             "finish_reason": finish_reason,
         }],
         "usage": {
@@ -198,17 +301,38 @@ pub fn parse_stream_chunk(data: &str) -> Option<crate::translator::StreamEvent> 
         return None;
     }
     let v: serde_json::Value = serde_json::from_str(trimmed).ok()?;
-    let delta = v
+    let parts = v
         .pointer("/candidates/0/content/parts")
-        .and_then(|p| p.as_array())
-        .map(|parts| {
-            parts
-                .iter()
-                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-                .collect::<Vec<_>>()
-                .join("")
+        .and_then(|p| p.as_array());
+    let delta = parts
+        .iter()
+        .flat_map(|parts| parts.iter())
+        .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+        .collect::<String>();
+    let tool_call_deltas = parts
+        .into_iter()
+        .flat_map(|parts| parts.iter())
+        .enumerate()
+        .filter_map(|(index, part)| {
+            let call = part.get("functionCall")?;
+            Some(crate::translator::ToolCallDelta {
+                index: index as u32,
+                id: call.get("id").and_then(|v| v.as_str()).map(str::to_string),
+                call_id: call.get("id").and_then(|v| v.as_str()).map(str::to_string),
+                name: call
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                arguments_delta: call.get("args").map(|v| {
+                    if v.is_string() {
+                        v.as_str().unwrap_or_default().to_string()
+                    } else {
+                        v.to_string()
+                    }
+                }),
+            })
         })
-        .unwrap_or_default();
+        .collect::<Vec<_>>();
     let finish = v
         .pointer("/candidates/0/finishReason")
         .and_then(|f| f.as_str())
@@ -225,7 +349,12 @@ pub fn parse_stream_chunk(data: &str) -> Option<crate::translator::StreamEvent> 
         .and_then(|t| t.as_u64());
     // Drop pure-metric or empty bookkeeping chunks: only forward events that
     // carry text, a finish reason, or usage worth surfacing.
-    if delta.is_empty() && finish.is_none() && prompt.is_none() && completion.is_none() {
+    if delta.is_empty()
+        && tool_call_deltas.is_empty()
+        && finish.is_none()
+        && prompt.is_none()
+        && completion.is_none()
+    {
         return None;
     }
     let done = finish.is_some();
@@ -234,8 +363,8 @@ pub fn parse_stream_chunk(data: &str) -> Option<crate::translator::StreamEvent> 
         finish_reason: finish,
         prompt_tokens: prompt,
         completion_tokens: completion,
+        tool_call_deltas,
         done,
-        ..Default::default()
     })
 }
 
@@ -303,8 +432,9 @@ mod tests {
             ],
             stream: false,
             extra: serde_json::json!({ "temperature": 0.5, "max_tokens": 128 }),
+            request_id: None,
         };
-        let body = translate_request(&chat);
+        let body = translate_request(&chat).expect("translate");
         assert_eq!(body["systemInstruction"]["parts"][0]["text"], "be terse");
         assert_eq!(body["contents"][0]["role"], "user");
         assert_eq!(body["contents"][1]["role"], "model");
@@ -319,8 +449,9 @@ mod tests {
             messages: vec![Message::text("user", "hi")],
             stream: false,
             extra: serde_json::Value::Null,
+            request_id: None,
         };
-        let body = translate_request(&chat);
+        let body = translate_request(&chat).expect("translate");
         assert_eq!(
             body["contents"][0]["parts"],
             serde_json::json!([{ "text": "hi" }])
@@ -340,8 +471,9 @@ mod tests {
             )],
             stream: false,
             extra: serde_json::Value::Null,
+            request_id: None,
         };
-        let body = translate_request(&chat);
+        let body = translate_request(&chat).expect("translate");
         let parts = &body["contents"][0]["parts"];
         assert_eq!(parts[0]["text"], "what is this");
         assert_eq!(parts[1]["fileData"]["fileUri"], "https://x/cat.png");
@@ -362,8 +494,9 @@ mod tests {
             )],
             stream: false,
             extra: serde_json::Value::Null,
+            request_id: None,
         };
-        let body = translate_request(&chat);
+        let body = translate_request(&chat).expect("translate");
         let parts = &body["contents"][0]["parts"];
         assert_eq!(parts[0]["inlineData"]["mimeType"], "image/jpeg");
         assert_eq!(parts[0]["inlineData"]["data"], "QUJD");
@@ -386,6 +519,33 @@ mod tests {
         assert_eq!(out["usage"]["total_tokens"], 12);
         assert_eq!(out["model"], "google-2.0-flash");
     }
+    #[test]
+    fn tool_definitions_and_history_map_to_native_google_parts() {
+        let mut assistant = Message::new("assistant", serde_json::Value::Null);
+        assistant.extra = serde_json::json!({ "tool_calls": [{
+            "id": "call_1", "type": "function",
+            "function": { "name": "shell", "arguments": r#"{"cmd":"ls"}"# }
+        }] });
+        let mut tool_result = Message::text("tool", "a.txt");
+        tool_result.extra = serde_json::json!({ "tool_call_id": "call_1", "name": "shell" });
+        let req = ChatRequest {
+            model: "prog/route".into(),
+            messages: vec![Message::text("user", "run it"), assistant, tool_result],
+            stream: false,
+            extra: serde_json::json!({ "tools": [{ "type": "function", "function": { "name": "shell", "parameters": { "type": "object" } } }] }),
+            request_id: None,
+        };
+        let body = translate_request(&req).expect("translate");
+        assert_eq!(body["tools"][0]["functionDeclarations"][0]["name"], "shell");
+        assert_eq!(
+            body["contents"][1]["parts"][0]["functionCall"]["name"],
+            "shell"
+        );
+        assert_eq!(
+            body["contents"][2]["parts"][0]["functionResponse"]["name"],
+            "shell"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -403,6 +563,18 @@ mod stream_tests {
         assert_eq!(ev.prompt_tokens, Some(4));
         assert_eq!(ev.completion_tokens, Some(6));
         assert!(ev.done);
+    }
+
+    #[test]
+    fn decodes_function_call_parts() {
+        let ev = parse_stream_chunk(
+            r#"{"candidates":[{"content":{"parts":[{"functionCall":{"name":"shell","args":{"cmd":"ls"}}}]}}]}"#,
+        ).unwrap();
+        assert_eq!(ev.tool_call_deltas[0].name.as_deref(), Some("shell"));
+        assert_eq!(
+            ev.tool_call_deltas[0].arguments_delta.as_deref(),
+            Some("{\"cmd\":\"ls\"}")
+        );
     }
 
     #[test]

@@ -6,12 +6,16 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{Context as _, Result};
+use anyhow::{bail, Context as _, Result};
 
 use super::normalize_base;
 use crate::domain::ProviderKind;
 use crate::router::Target;
-use crate::translator::{content_parts, content_text, parse_data_url, ChatRequest, ContentPart};
+use crate::translator::{parse_content_parts, parse_data_url, ChatRequest, ContentPart};
+
+/// Marker used by the router to distinguish an adapter capability mismatch
+/// from an upstream/provider failure.
+pub const ADAPTER_CAPABILITY_SKIP: &str = "adapter capability skip";
 
 /// Build the upstream URL for an Anthropic request.
 pub fn build_url(target: &Target) -> String {
@@ -31,55 +35,115 @@ pub fn build_headers(target: &Target) -> BTreeMap<String, String> {
 }
 
 /// Translate an OpenAI chat request into an Anthropic messages request.
-pub fn translate_request(chat_req: &ChatRequest, model_id: &str) -> serde_json::Value {
+pub fn translate_request(chat_req: &ChatRequest, model_id: &str) -> Result<serde_json::Value> {
     let mut system_text = String::new();
     let mut messages = Vec::new();
     for msg in &chat_req.messages {
-        if msg.role == "system" {
-            if !system_text.is_empty() {
-                system_text.push('\n');
+        if matches!(msg.role.as_str(), "system" | "developer") {
+            let parts = parse_content_parts(&msg.content)
+                .map_err(|e| anyhow::anyhow!("{ADAPTER_CAPABILITY_SKIP}: invalid content: {e}"))?;
+            if parts
+                .iter()
+                .any(|part| !matches!(part, ContentPart::Text(_)))
+            {
+                bail!("{ADAPTER_CAPABILITY_SKIP}: Anthropic system prompts are text-only");
             }
-            // Anthropic system prompts are text-only; image parts there are
-            // dropped (see [`message_content`] for the message-level mapping).
-            system_text.push_str(&content_text(&msg.content));
-        } else {
-            messages.push(serde_json::json!({
-                "role": msg.role,
-                "content": message_content(&msg.content),
-            }));
+            let text = parts
+                .into_iter()
+                .filter_map(|part| match part {
+                    ContentPart::Text(t) => Some(t),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !text.trim().is_empty() {
+                if !system_text.is_empty() {
+                    system_text.push_str("\n\n");
+                }
+                system_text.push_str(&text);
+            }
+            continue;
         }
+
+        if msg.role == "tool" {
+            messages.push(serde_json::json!({
+                "role": "user",
+                "content": [{ "type": "tool_result", "tool_use_id": msg.extra.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or_default(), "content": msg.content }],
+            }));
+            continue;
+        }
+        let role = if msg.role == "assistant" {
+            "assistant"
+        } else {
+            "user"
+        };
+        let mut content = message_content(&msg.content)?;
+        if let Some(calls) = msg.extra.get("tool_calls").and_then(|v| v.as_array()) {
+            let mut blocks = match content {
+                serde_json::Value::String(text) if !text.is_empty() => {
+                    vec![serde_json::json!({ "type": "text", "text": text })]
+                }
+                serde_json::Value::Array(parts) => parts,
+                _ => Vec::new(),
+            };
+            for call in calls {
+                blocks.push(serde_json::json!({
+                    "type": "tool_use",
+                    "id": call.get("id").and_then(|v| v.as_str()).unwrap_or_default(),
+                    "name": call.pointer("/function/name").and_then(|v| v.as_str()).unwrap_or_default(),
+                    "input": serde_json::from_str::<serde_json::Value>(call.pointer("/function/arguments").and_then(|v| v.as_str()).unwrap_or("{}")).unwrap_or(serde_json::json!({})),
+                }));
+            }
+            content = serde_json::Value::Array(blocks);
+        }
+        messages.push(serde_json::json!({ "role": role, "content": content }));
     }
 
-    let mut body = serde_json::json!({
-        "model": model_id,
-        "max_tokens": 4096,
-        "messages": messages,
-    });
-
+    let mut body =
+        serde_json::json!({ "model": model_id, "max_tokens": 4096, "messages": messages });
     if !system_text.is_empty() {
         body["system"] = serde_json::Value::String(system_text);
     }
-
     if let Some(obj) = chat_req.extra.as_object() {
-        if let Some(v) = obj.get("max_tokens") {
-            body["max_tokens"] = v.clone();
+        for (from, to) in [
+            ("max_tokens", "max_tokens"),
+            ("max_completion_tokens", "max_tokens"),
+            ("temperature", "temperature"),
+            ("top_p", "top_p"),
+            ("top_k", "top_k"),
+            ("stop", "stop_sequences"),
+        ] {
+            if let Some(value) = obj.get(from) {
+                body[to] = value.clone();
+            }
         }
-        if let Some(v) = obj.get("temperature") {
-            body["temperature"] = v.clone();
+        if let Some(tools) = obj
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .filter(|v| !v.is_empty())
+        {
+            body["tools"] = serde_json::Value::Array(tools.iter().map(|tool| {
+                let f = tool.get("function").unwrap_or(tool);
+                serde_json::json!({ "name": f.get("name").cloned().unwrap_or_default(), "description": f.get("description").cloned().unwrap_or_default(), "input_schema": f.get("parameters").cloned().unwrap_or(serde_json::json!({ "type": "object", "properties": {} })) })
+            }).collect());
         }
-        if let Some(v) = obj.get("top_p") {
-            body["top_p"] = v.clone();
+        if let Some(choice) = obj.get("tool_choice") {
+            body["tool_choice"] = anthropic_tool_choice(choice);
         }
-        if let Some(v) = obj.get("stop") {
-            body["stop_sequences"] = v.clone();
+        if let Some(parallel) = obj.get("parallel_tool_calls").and_then(|v| v.as_bool()) {
+            body["tool_choice"]["disable_parallel_tool_use"] = serde_json::Value::Bool(!parallel);
+        }
+        if obj
+            .get("response_format")
+            .is_some_and(|value| !value.is_null())
+        {
+            bail!("{ADAPTER_CAPABILITY_SKIP}: Anthropic has no response_format field; use a Responses/JSON-native entry");
         }
     }
-
     if chat_req.stream {
         body["stream"] = serde_json::Value::Bool(true);
     }
-
-    body
+    Ok(body)
 }
 
 /// Rebuild an Anthropic message `content` value from the canonical content.
@@ -89,28 +153,51 @@ pub fn translate_request(chat_req: &ChatRequest, model_id: &str) -> serde_json::
 /// image parts becomes an ordered block array: text parts map to `text`
 /// blocks and image parts map to `image` blocks — `source.type = "url"` for
 /// `http(s)://` references and `source.type = "base64"` for `data:` URLs.
-fn message_content(content: &serde_json::Value) -> serde_json::Value {
-    let has_image = content_parts(content)
-        .iter()
-        .any(|p| matches!(p, ContentPart::Image { .. }));
-    if !has_image {
-        return serde_json::Value::String(content_text(content));
+fn message_content(content: &serde_json::Value) -> Result<serde_json::Value> {
+    let parts = parse_content_parts(content)
+        .map_err(|e| anyhow::anyhow!("{ADAPTER_CAPABILITY_SKIP}: invalid content: {e}"))?;
+    if parts.len() == 1 {
+        if let ContentPart::Text(text) = &parts[0] {
+            return Ok(serde_json::Value::String(text.clone()));
+        }
     }
-
-    let blocks: Vec<serde_json::Value> = content_parts(content)
-        .into_iter()
-        .map(|p| match p {
+    let mut blocks = Vec::new();
+    for part in parts {
+        blocks.push(match part {
             ContentPart::Text(text) => serde_json::json!({ "type": "text", "text": text }),
             ContentPart::Image { url } => image_block(&url),
-        })
-        .collect();
-    serde_json::Value::Array(blocks)
+            ContentPart::File { url } => document_block(&url),
+            ContentPart::Audio { .. } | ContentPart::Video { .. } => {
+                bail!("{ADAPTER_CAPABILITY_SKIP}: Anthropic messages do not accept audio/video content parts")
+            }
+        });
+    }
+    Ok(serde_json::Value::Array(blocks))
+}
+
+fn document_block(url: &str) -> serde_json::Value {
+    if let Some(data) = parse_data_url(url) {
+        serde_json::json!({ "type": "document", "source": { "type": "base64", "media_type": data.mime, "data": data.data } })
+    } else {
+        serde_json::json!({ "type": "document", "source": { "type": "url", "url": url } })
+    }
 }
 
 /// Map one canonical image onto an Anthropic `image` block. A `data:` URL is
 /// split into its MIME type and base64 payload; anything else is passed as a
 /// URL reference for the provider to resolve (or reject — the failure
 /// classifies the entry and fails over, see `demote_status_for`).
+fn anthropic_tool_choice(choice: &serde_json::Value) -> serde_json::Value {
+    if let Some(name) = choice.pointer("/function/name").and_then(|v| v.as_str()) {
+        return serde_json::json!({ "type": "tool", "name": name });
+    }
+    match choice.as_str().unwrap_or("auto") {
+        "none" => serde_json::json!({ "type": "none" }),
+        "required" => serde_json::json!({ "type": "any" }),
+        _ => serde_json::json!({ "type": "auto" }),
+    }
+}
+
 fn image_block(url: &str) -> serde_json::Value {
     if let Some(data) = parse_data_url(url) {
         return serde_json::json!({
@@ -136,12 +223,25 @@ pub fn translate_response(resp: &serde_json::Value) -> Result<serde_json::Value>
         .context("anthropic response missing content array")?;
 
     let mut text = String::new();
+    let mut tool_calls = Vec::new();
     for block in content {
-        if block.get("type").and_then(|t| t.as_str()) == Some("text") {
-            if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
-                text.push_str(t);
+        match block.get("type").and_then(|t| t.as_str()) {
+            Some("text") => {
+                if let Some(t) = block.get("text").and_then(|t| t.as_str()) { text.push_str(t); }
             }
+            Some("tool_use") => tool_calls.push(serde_json::json!({
+                "id": block.get("id").cloned().unwrap_or_default(),
+                "type": "function",
+                "function": {
+                    "name": block.get("name").cloned().unwrap_or_default(),
+                    "arguments": block.get("input").map(|v| if v.is_string() { v.clone() } else { serde_json::Value::String(v.to_string()) }).unwrap_or_else(|| "{}".into()),
+                }
+            })),
+            _ => {}
         }
+    }
+    if text.trim().is_empty() && tool_calls.is_empty() {
+        bail!("anthropic response carried no assistant text or tool calls");
     }
 
     let usage = resp.get("usage");
@@ -166,16 +266,17 @@ pub fn translate_response(resp: &serde_json::Value) -> Result<serde_json::Value>
         _ => "stop",
     };
 
+    let mut message = serde_json::json!({ "role": "assistant", "content": text });
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = serde_json::Value::Array(tool_calls);
+    }
     Ok(serde_json::json!({
         "id": resp.get("id").cloned().unwrap_or_else(|| serde_json::Value::String("msg_agos".into())),
         "object": "chat.completion",
         "model": resp.get("model").cloned().unwrap_or(serde_json::Value::Null),
         "choices": [{
             "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": text,
-            },
+            "message": message,
             "finish_reason": finish_reason,
         }],
         "usage": {
@@ -197,7 +298,47 @@ pub fn parse_stream_chunk(data: &str) -> Option<crate::translator::StreamEvent> 
     let v: serde_json::Value = serde_json::from_str(trimmed).ok()?;
     let kind = v.get("type").and_then(|t| t.as_str()).unwrap_or_default();
     match kind {
+        "content_block_start"
+            if v.pointer("/content_block/type").and_then(|v| v.as_str()) == Some("tool_use") =>
+        {
+            Some(crate::translator::StreamEvent {
+                tool_call_deltas: vec![crate::translator::ToolCallDelta {
+                    index: v.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                    id: v
+                        .pointer("/content_block/id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    call_id: v
+                        .pointer("/content_block/id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    name: v
+                        .pointer("/content_block/name")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    arguments_delta: None,
+                }],
+                ..Default::default()
+            })
+        }
         "content_block_delta" => {
+            let delta_type = v
+                .pointer("/delta/type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if delta_type == "input_json_delta" {
+                return Some(crate::translator::StreamEvent {
+                    tool_call_deltas: vec![crate::translator::ToolCallDelta {
+                        index: v.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                        arguments_delta: v
+                            .pointer("/delta/partial_json")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                });
+            }
             let delta = v
                 .pointer("/delta/text")
                 .and_then(|t| t.as_str())
@@ -205,10 +346,6 @@ pub fn parse_stream_chunk(data: &str) -> Option<crate::translator::StreamEvent> 
                 .to_string();
             Some(crate::translator::StreamEvent {
                 delta,
-                finish_reason: None,
-                prompt_tokens: None,
-                completion_tokens: None,
-                done: false,
                 ..Default::default()
             })
         }
@@ -267,6 +404,7 @@ mod tests {
             messages,
             stream: false,
             extra: serde_json::Value::Null,
+            request_id: None,
         }
     }
 
@@ -280,7 +418,8 @@ mod tests {
                 Message::text("user", "hi"),
             ]),
             "model-id",
-        );
+        )
+        .expect("translate");
         assert_eq!(body["system"], "be terse");
         assert!(body["messages"][0]["content"].is_string());
         assert_eq!(body["messages"][0]["content"], "hi");
@@ -297,7 +436,8 @@ mod tests {
                 ]),
             )]),
             "model-id",
-        );
+        )
+        .expect("translate");
         let content = &body["messages"][0]["content"];
         assert!(content.is_array());
         assert_eq!(content[0]["type"], "text");
@@ -318,7 +458,8 @@ mod tests {
                 ]),
             )]),
             "model-id",
-        );
+        )
+        .expect("translate");
         let content = &body["messages"][0]["content"];
         assert_eq!(content[0]["type"], "image");
         assert_eq!(content[0]["source"]["type"], "base64");
@@ -326,6 +467,37 @@ mod tests {
         assert_eq!(content[0]["source"]["data"], "QUJD");
         assert_eq!(content[1]["type"], "text");
         assert_eq!(content[1]["text"], "describe");
+    }
+    #[test]
+    fn tool_definitions_and_history_map_to_native_anthropic_blocks() {
+        let mut assistant = Message::new("assistant", serde_json::Value::Null);
+        assistant.extra = serde_json::json!({ "tool_calls": [{
+            "id": "call_1", "type": "function",
+            "function": { "name": "shell", "arguments": r#"{"cmd":"ls"}"# }
+        }] });
+        let mut req = chat(vec![Message::text("user", "run it"), assistant]);
+        req.extra = serde_json::json!({
+            "tools": [{ "type": "function", "function": { "name": "shell", "parameters": { "type": "object" } } }],
+            "tool_choice": "required"
+        });
+        let body = translate_request(&req, "claude").expect("translate");
+        assert_eq!(body["tools"][0]["name"], "shell");
+        assert_eq!(body["tool_choice"]["type"], "any");
+        assert_eq!(body["messages"][1]["content"][0]["type"], "tool_use");
+    }
+
+    #[test]
+    fn response_tool_use_becomes_openai_tool_calls() {
+        let response = serde_json::json!({
+            "id": "msg_1", "content": [{ "type": "tool_use", "id": "call_1", "name": "shell", "input": { "cmd": "ls" } }],
+            "stop_reason": "tool_use", "usage": { "input_tokens": 2, "output_tokens": 3 }
+        });
+        let body = translate_response(&response).expect("translate");
+        assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(
+            body["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "shell"
+        );
     }
 }
 
@@ -342,6 +514,21 @@ mod stream_tests {
         assert_eq!(ev.delta, "Hello");
         assert!(!ev.done);
         assert!(ev.finish_reason.is_none());
+    }
+
+    #[test]
+    fn decodes_tool_use_start_and_argument_delta() {
+        let start = parse_stream_chunk(
+            r#"{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"call_1","name":"shell"}}"#,
+        ).unwrap();
+        assert_eq!(start.tool_call_deltas[0].name.as_deref(), Some("shell"));
+        let args = parse_stream_chunk(
+            r#"{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"cmd\":"}}"#,
+        ).unwrap();
+        assert_eq!(
+            args.tool_call_deltas[0].arguments_delta.as_deref(),
+            Some("{\"cmd\":")
+        );
     }
 
     #[test]

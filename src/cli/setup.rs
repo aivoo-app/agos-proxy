@@ -368,6 +368,18 @@ fn prompt_capabilities(theme: &ColorfulTheme) -> Result<RouteCapabilities> {
         .with_prompt("Supports image (vision) input?")
         .default(false)
         .interact()?;
+    let audio = Confirm::with_theme(theme)
+        .with_prompt("Supports audio input?")
+        .default(false)
+        .interact()?;
+    let video = Confirm::with_theme(theme)
+        .with_prompt("Supports video input?")
+        .default(false)
+        .interact()?;
+    let files = Confirm::with_theme(theme)
+        .with_prompt("Supports file/PDF input?")
+        .default(false)
+        .interact()?;
     let json_mode = Confirm::with_theme(theme)
         .with_prompt("Supports structured JSON output?")
         .default(false)
@@ -375,6 +387,9 @@ fn prompt_capabilities(theme: &ColorfulTheme) -> Result<RouteCapabilities> {
     Ok(RouteCapabilities {
         tools,
         vision,
+        audio,
+        video,
+        files,
         json_mode,
         max_context: None,
     })
@@ -473,16 +488,21 @@ fn print_proxies(store: &Store, profile: &Profile) -> Result<()> {
                     ModelStatus::Unhealthy => "unhealthy".to_string(),
                     ModelStatus::Disabled => "disabled".to_string(),
                 };
-                let provider = e.provider_id.and_then(|id| store.get_provider(id).ok().flatten());
+                let provider = e
+                    .provider_id
+                    .and_then(|id| store.get_provider(id).ok().flatten());
                 let provider_name = match provider {
                     Some(pr) => pr.name.clone(),
-                    None => if let Some(tid) = e.target_route_id {
-                        store.get_route_by_id(tid)?
-                            .map(|r| format!("→ {}", r.name))
-                            .unwrap_or_else(|| "(unknown)".into())
-                    } else {
-                        "(unknown)".into()
-                    },
+                    None => {
+                        if let Some(tid) = e.target_route_id {
+                            store
+                                .get_route_by_id(tid)?
+                                .map(|r| format!("→ {}", r.name))
+                                .unwrap_or_else(|| "(unknown)".into())
+                        } else {
+                            "(unknown)".into()
+                        }
+                    }
                 };
                 println!(
                     "          - {}  (via {}, priority {}, {status})",

@@ -89,14 +89,19 @@ Anthropic, OpenAI Responses (Codex), and Gemini native endpoints.
 
 ### Added
 
-- **Vision passthrough:** multimodal chat requests (OpenAI parts arrays with
-  `text` + `image_url` entries) now keep their images end to end. The
-  Anthropic outbound adapter maps image parts to `image` blocks (`url` and
-  `base64` sources), the Google adapter maps them to Gemini `fileData` /
-  `inlineData` parts, and the Anthropic and Gemini inbound surfaces accept
-  their native image shapes and normalize them into the canonical parts array.
-  OpenAI/custom upstreams were already lossless and are unchanged; text-only
-  requests serialize byte-identically to before.
+- **Lossless multimodal and agentic translation:** OpenAI chat parts, tool
+  definitions/calls/results, Responses items, Anthropic blocks, and Gemini parts
+  now cross protocol boundaries without silent flattening. Images, audio,
+  video, and files use ordered canonical content; Responses structured output
+  and native fields are preserved on compatible destinations.
+- **Capability-aware media routing:** route entries now declare `audio`, `video`,
+  and `files` in addition to tools, vision, and JSON mode. Unsupported
+  destinations fail over with a capability-skip error instead of returning a
+  lossy 200 response.
+- **Request correlation:** `X-Request-ID` is generated/propagated, echoed,
+  forwarded to upstreams, and stored on every usage attempt for `usage recent`.
+- Tool-call deltas now survive streaming translation on Anthropic, Google, and
+  Responses native surfaces as well as OpenAI.
 - Failover for image-rejecting upstreams: a 4xx whose error message explicitly
   refuses image/vision capability marks the route entry Unhealthy so the next
   chain entry is tried. Other 4xx keep the existing no-demotion behavior.

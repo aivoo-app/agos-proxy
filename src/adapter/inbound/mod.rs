@@ -29,7 +29,7 @@ pub trait InboundAdapter: Send + Sync {
     fn parse_request(&self, body: &serde_json::Value) -> anyhow::Result<ChatRequest>;
 
     /// Render a non-streaming canonical response as a native JSON value.
-    fn render_response(&self, resp: &CanonicalResponse) -> serde_json::Value;
+    fn render_response(&self, resp: &CanonicalResponse) -> anyhow::Result<serde_json::Value>;
 
     /// Render one canonical stream event as a complete native SSE frame
     /// (including framing and the trailing blank line). `None` means the event
@@ -103,6 +103,7 @@ mod tests {
             prompt_tokens: 5,
             completion_tokens: 7,
             tool_calls: Vec::new(),
+            media: Vec::new(),
         }
     }
 
@@ -117,7 +118,7 @@ mod tests {
         let req = r.parse_request(ApiKind::OpenAI, &body).unwrap();
         assert_eq!(req.model, "prog/route");
         assert_eq!(req.messages[0].content, "hi");
-        let out = r.render_response(ApiKind::OpenAI, &canonical());
+        let out = r.render_response(ApiKind::OpenAI, &canonical()).unwrap();
         assert_eq!(out["choices"][0]["message"]["content"], "hello world");
         assert_eq!(out["usage"]["total_tokens"], 12);
     }
@@ -140,7 +141,7 @@ mod tests {
         assert_eq!(req.messages[1].content, "hello");
         assert_eq!(req.extra["stop"], serde_json::json!(["END"]));
 
-        let out = r.render_response(ApiKind::Anthropic, &canonical());
+        let out = r.render_response(ApiKind::Anthropic, &canonical()).unwrap();
         assert_eq!(out["type"], "message");
         assert_eq!(out["content"][0]["text"], "hello world");
         assert_eq!(out["stop_reason"], "end_turn");
@@ -177,7 +178,7 @@ mod tests {
         assert_eq!(req.messages[1].content, "hello");
         assert_eq!(req.extra["max_tokens"], 64);
 
-        let out = r.render_response(ApiKind::Google, &canonical());
+        let out = r.render_response(ApiKind::Google, &canonical()).unwrap();
         assert_eq!(
             out["candidates"][0]["content"]["parts"][0]["text"],
             "hello world"
@@ -209,7 +210,7 @@ mod tests {
             serde_json::Value::Bool(false)
         );
 
-        let out = r.render_response(ApiKind::Responses, &canonical());
+        let out = r.render_response(ApiKind::Responses, &canonical()).unwrap();
         assert_eq!(out["object"], "response");
         assert_eq!(out["output"][0]["content"][0]["text"], "hello world");
         assert_eq!(out["usage"]["total_tokens"], 12);

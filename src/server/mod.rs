@@ -358,7 +358,10 @@ fn collect_provider_health(store: &Store) -> anyhow::Result<Vec<serde_json::Valu
             for route in &routes {
                 for entry in store.route_entries(route.id)? {
                     let provider_name = match entry.provider_id {
-                        Some(id) => store.get_provider(id)?.map(|provider| provider.name).unwrap_or_default(),
+                        Some(id) => store
+                            .get_provider(id)?
+                            .map(|provider| provider.name)
+                            .unwrap_or_default(),
                         None => entry
                             .target_route_id
                             .and_then(|tid| store.get_route_by_id(tid).ok().flatten())

@@ -109,7 +109,11 @@ impl Registry {
     }
 
     /// Render a canonical response as native JSON on the given surface.
-    pub fn render_response(&self, kind: ApiKind, resp: &CanonicalResponse) -> serde_json::Value {
+    pub fn render_response(
+        &self,
+        kind: ApiKind,
+        resp: &CanonicalResponse,
+    ) -> anyhow::Result<serde_json::Value> {
         self.inbound(kind).render_response(resp)
     }
 

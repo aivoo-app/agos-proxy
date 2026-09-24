@@ -35,6 +35,14 @@ curl -H "Authorization: Bearer sk-profile-..." \
 
 Without a valid token, the proxy returns `401 Unauthorized`.
 
+### Request tracking
+
+Every request receives a stable `X-Request-ID`. A caller-supplied ID is reused;
+otherwise AGOS generates a UUID. The ID is echoed on the response, forwarded to
+each upstream attempt, and stored on every usage row so `agos-proxy usage recent`
+can correlate failover attempts with the caller's logs. It is metadata only and
+is never inserted into a provider's JSON payload.
+
 If the token is valid but the profile has been deleted or is otherwise not
 usable, the proxy returns `401` or `403` as appropriate.
 
@@ -93,6 +101,13 @@ Request body (OpenAI-compatible):
   "n": 1
 }
 ```
+
+`messages` may contain ordered `text`, `image_url`, `input_audio`,
+`audio_url`, `video_url`, and `file` / `input_file` parts. `tools`,
+`tool_choice`, assistant `tool_calls`, and `tool` messages are forwarded to
+compatible upstreams and translated to the selected provider's native shape.
+Requests are never silently flattened when a destination cannot represent a
+feature: the route skips that entry and tries another capability-compatible one.
 
 Response shape (non-streaming):
 
@@ -320,10 +335,11 @@ model access.
 ## Request context flow
 
 1. `Authorization` header → profile.
-2. `model` field → route within that profile.
-3. Request body → translated to the chosen provider's shape.
-4. Provider response → passed back to the caller (optionally translated back).
-5. Usage logged against the route entry that handled (or tried) the request.
+2. `X-Request-ID` → stable request correlation id (generated when absent).
+3. `model` field → route within that profile.
+4. Request body → translated to the chosen provider's shape.
+5. Provider response → passed back to the caller (optionally translated back).
+6. Usage and request id logged against the route entry that handled (or tried) the request.
 
 ## Error and failure visibility
 
